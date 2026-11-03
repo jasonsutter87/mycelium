@@ -43,6 +43,18 @@ const setSetting = (k: string, v: string) =>
 
 // ---------------------------------------------------------------- commands
 
+/** Folders left out of every scan. They stay on disk; findings from them just stop counting. */
+function ignore(folders: string[], remove = false) {
+  let list: string[] = JSON.parse(getSetting("ignored") ?? "[]");
+  const given = folders.map((f) => resolve(f));
+  if (given.length) {
+    list = remove ? list.filter((p) => !given.includes(p)) : [...new Set([...list, ...given])];
+    setSetting("ignored", JSON.stringify(list));
+    console.log(c.dim("Takes effect on the next `mycelium scan`."));
+  }
+  console.log(list.length ? list.join("\n") : "Nothing ignored.");
+}
+
 function scan(roots: string[]) {
   const remembered: string[] = JSON.parse(getSetting("roots") ?? "null") ?? [];
   const list = roots.length ? roots.map((r) => resolve(r)) : remembered.length ? remembered : [process.cwd()];
@@ -471,6 +483,7 @@ function splitTarget(t: string): [string, string | undefined] {
 const HELP = `${c.bold("mycelium")}: map every dependency under everything you own; know when a CVE lands in it.
 
   ${c.cyan("scan")} [folders…]      Map projects (a folder of projects, or one project). Remembers the folders.
+  ${c.cyan("ignore")} [folders…]    Leave folders out of every scan (snapshots, backups). No args: list them. \`unignore\` undoes it.
   ${c.cyan("check")}                Query OSV.dev for every package in the graph; print what's new.
   ${c.cyan("report")}               Ranked findings with paths + fix commands.  --top N | --all | --dev | --html [file]
   ${c.cyan("projects")}             Every project: package count, open vulns, exposure, where it lives.
@@ -500,6 +513,8 @@ const HELP = `${c.bold("mycelium")}: map every dependency under everything you o
 try {
 switch (cmd) {
   case "scan": scan(args); break;
+  case "ignore": ignore(args); break;
+  case "unignore": ignore(args, true); break;
   case "check": {
     const fresh = await check();
     console.log(fresh.length ? c.bold(`\n${fresh.length} new finding(s):\n`) : c.green("\nNothing new."));

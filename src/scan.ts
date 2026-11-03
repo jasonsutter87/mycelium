@@ -43,6 +43,13 @@ export interface ProjectScan {
   license: string | null;
 }
 
+// Folders you've told Mycelium to leave out (`mycelium ignore <folder>`): snapshots, backups, throwaway copies.
+let ignored: string[] = [];
+export function setIgnored(paths: string[]) {
+  ignored = paths;
+}
+const isIgnored = (p: string) => ignored.some((i) => p === i || p.startsWith(i + "/"));
+
 /** All files under dir (relative paths), skipping build/dependency folders. */
 function walk(dir: string, root = dir, depth = 0, out: string[] = []): string[] {
   let entries;
@@ -54,7 +61,7 @@ function walk(dir: string, root = dir, depth = 0, out: string[] = []): string[] 
   for (const e of entries) {
     const full = join(dir, e.name);
     if (e.isDirectory()) {
-      if (depth < MAX_DEPTH && !SKIP_DIRS.has(e.name) && (!e.name.startsWith(".") || e.name === ".github" || e.name === ".vercel")) {
+      if (depth < MAX_DEPTH && !isIgnored(full) && !SKIP_DIRS.has(e.name) && (!e.name.startsWith(".") || e.name === ".github" || e.name === ".vercel")) {
         walk(full, root, depth + 1, out);
       }
     } else if (e.isFile()) out.push(relative(root, full));
@@ -244,6 +251,7 @@ export function findProjects(root: string): string[] {
     .filter((e) => e.isDirectory() && !e.name.startsWith(".") && !SKIP_DIRS.has(e.name))
     .map((e) => join(abs, e.name))
     .filter((p) => {
+      if (isIgnored(p)) return false;
       try {
         return statSync(p).isDirectory();
       } catch {
@@ -287,6 +295,8 @@ export function mergeRoots(remembered: string[], added: string[]): string[] {
 
 /** Scan every project under the given roots, save them, and forget projects that were deleted. */
 export function scanRoots(db: DatabaseSync, roots: string[]): ScanSummary[] {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'ignored'").get() as { value: string } | undefined;
+  setIgnored(JSON.parse(row?.value ?? "[]"));
   const out: ScanSummary[] = [];
   for (const root of roots) {
     for (const dir of findProjects(root)) {
@@ -298,7 +308,7 @@ export function scanRoots(db: DatabaseSync, roots: string[]): ScanSummary[] {
     }
   }
   for (const { path } of db.prepare("SELECT path FROM projects").all() as { path: string }[]) {
-    if (roots.some((r) => path === r || path.startsWith(r + "/")) && !existsSync(path)) {
+    if (isIgnored(path) || (roots.some((r) => path === r || path.startsWith(r + "/")) && !existsSync(path))) {
       db.prepare("DELETE FROM projects WHERE path = ?").run(path);
     }
   }
