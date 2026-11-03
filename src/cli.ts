@@ -281,6 +281,90 @@ async function fix(project: string) {
   }
 }
 
+/**
+ * `fix --all`: every project, headless. Refresh → plan → apply (verify + PR) one at a time → summary.
+ * A failure in one project never stops the rest. Writes a JSON report for agents/skills to read.
+ */
+async function fixAll() {
+  const apply = flags.has("--apply");
+  if (!flags.has("--no-refresh")) {
+    const roots = JSON.parse(getSetting("roots") ?? "[]");
+    if (!roots.length) return console.log("Run `mycelium scan <folders>` first.");
+    console.log(c.dim(`refreshing: scanning ${roots.join(", ")}, checking OSV, syncing PRs…`));
+    scanRoots(db, roots);
+    await checkAll(db);
+    const { syncPrs } = await import("./prs.ts");
+    await syncPrs(db);
+  }
+  const allowMajor = flags.has("--major");
+  const only = flagValue("--project")?.split(",");
+  const projects = (db.prepare("SELECT name FROM projects ORDER BY name").all() as { name: string }[])
+    .map((p) => p.name).filter((n) => !only || only.includes(n));
+
+  type Row = { project: string; status: "fixed" | "pr" | "nothing" | "manual-only" | "failed" | "verify-failed" | "planned";
+    autoFixable: number; fixed: string[]; prs: string[]; failed: string[]; manual: number; skippedNotes: string[]; branch: string | null; error?: string };
+  const rows: Row[] = [];
+  for (const name of projects) {
+    let plan: FixPlan;
+    try {
+      plan = planFixes(db, name, { minSeverity: flagValue("--min")?.toUpperCase(), includeDev: flags.has("--dev") });
+    } catch (e) {
+      rows.push({ project: name, status: "failed", autoFixable: 0, fixed: [], prs: [], failed: [], manual: 0, skippedNotes: [], branch: null, error: (e as Error).message });
+      continue;
+    }
+    const auto = plan.fixes.filter((f) => f.strategy !== "manual" && (allowMajor || !f.breaking));
+    const manual = plan.fixes.length - auto.length;
+    const row: Row = { project: name, status: "nothing", autoFixable: auto.length, fixed: [], prs: [], failed: [], manual, skippedNotes: [], branch: null };
+    rows.push(row);
+    if (!plan.fixes.length) continue;
+    if (!auto.length) { row.status = "manual-only"; continue; }
+    if (!apply) {
+      row.status = "planned";
+      console.log(`${c.bold(name.padEnd(28))} ${c.green(`${auto.length} auto`)}${manual ? c.dim(` · ${manual} manual`) : ""}  ${c.dim(auto.map((f) => `${f.name} ${f.from}→${f.to}`).join(", ").slice(0, 120))}`);
+      continue;
+    }
+    console.log(`\n${c.bold(`── ${name}`)} ${c.dim(`(${auto.length} auto-fixable)`)}`);
+    try {
+      const r = applyFixes(db, plan, { allowMajor, verify: !flags.has("--no-verify"), pr: !flags.has("--no-pr") });
+      for (const l of r.log) console.log(c.dim("   " + l.split("\n")[0]));
+      row.fixed = r.fixed;
+      row.prs = r.prs.map((p) => p.url);
+      row.failed = r.failed.map((f) => `${f.fix.name}: ${f.error.split("\n")[0]}`);
+      row.skippedNotes = [...new Set(r.skipped.filter((s) => /open PR|already fixed|worktree of a repo|not present/.test(s.reason)).map((s) => `${s.fix.name}: ${s.reason}`))];
+      row.branch = r.branch;
+      const verifyFailed = r.verify.some((v) => !v.ok && !v.preexisting);
+      row.status = row.prs.length ? "pr" : verifyFailed && r.committed ? "verify-failed" : r.fixed.length ? "fixed" : row.failed.length ? "failed" : "nothing";
+      if (r.log.some((l) => l.startsWith("✗ PR not opened"))) row.error = r.log.filter((l) => l.startsWith("✗ PR not opened")).join("; ");
+    } catch (e) {
+      row.status = "failed";
+      row.error = (e as Error).message.split("\n")[0];
+      console.log(c.red(`   ✗ ${row.error}`));
+    }
+  }
+
+  if (apply) {
+    await checkAll(db);
+    const { syncPrs } = await import("./prs.ts");
+    await syncPrs(db);
+  }
+  const acted = rows.filter((r) => r.status !== "nothing");
+  console.log(c.bold(`\n${apply ? "Fix-all summary" : "Fix-all plan (dry run; add --apply)"}`));
+  const icon: Record<Row["status"], string> = { pr: "⇪", fixed: "✓", "verify-failed": "✗", failed: "✗", "manual-only": "·", planned: "→", nothing: "✓" };
+  for (const r of acted) {
+    const detail = r.status === "pr" ? r.prs.join(" ") : r.status === "manual-only" ? `${r.manual} need a human` : r.status === "planned" ? `${r.autoFixable} auto` :
+      r.status === "verify-failed" ? `build/test broke: branch ${r.branch} kept, no PR` : r.status === "fixed" ? `committed on ${r.branch} (no PR${r.error ? ": " + r.error : ""})` :
+      r.error ?? r.failed.join("; ") ?? "";
+    console.log(`${icon[r.status]} ${r.project.padEnd(28)} ${r.status.padEnd(14)} ${c.dim(detail.slice(0, 200))}`);
+  }
+  const clean = rows.length - acted.length;
+  console.log(c.dim(`\n${clean} project(s) had nothing to fix.`));
+  const dir = join(homedir(), ".mycelium");
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, `fix-all-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
+  writeFileSync(file, JSON.stringify({ apply, allowMajor, at: new Date().toISOString(), rows }, null, 2));
+  console.log(c.dim(`report: ${file}`));
+}
+
 async function auditCmd() {
   if (!flags.has("--offline")) await enrich(db, (s) => console.log(c.dim(s)));
   const project = flagValue("--project");
@@ -371,6 +455,8 @@ const HELP = `${c.bold("mycelium")}: map every dependency under everything you o
   ${c.cyan("fix")} <project>        Plan fixes (dry). --apply commits them to a new branch via a separate worktree
                        (your folder is never touched); --verify runs build/test, --pr pushes + opens a
                        GitHub PR, --major allows major bumps, --min high, --only pkg1,pkg2
+  ${c.cyan("fix --all")}            Every project, headless: refresh, then plan (dry) or --apply: build/test + PR per
+                       repo, one at a time. --major | --min high | --project a,b | --no-pr | --no-verify
   ${c.cyan("prs")}                  Mycelium's PRs: open / merged, and whether a safe pull is possible.
   ${c.cyan("pull")} <project>       Fast-forward a merged fix into your folder (only when safe), then rescan.
   ${c.cyan("serve")} [--port 4747] Local report with Fix buttons at http://mycelium.localhost:4747
@@ -424,7 +510,7 @@ switch (cmd) {
     if (r.pulled.length) { await checkAll(db); await syncPrs(db); console.log(c.dim("rescanned + re-checked")); }
     break;
   }
-  case "fix": args[0] ? await fix(args[0]) : console.log("usage: mycelium fix <project> [--apply] [--verify] [--pr] [--major] [--min high] [--only a,b]"); break;
+  case "fix": flags.has("--all") ? await fixAll() : args[0] ? await fix(args[0]) : console.log("usage: mycelium fix <project> [--apply] [--verify] [--pr] [--major] [--min high] [--only a,b]"); break;
   case "mcp": await import("./mcp.ts"); break;
   case "serve":
     if (flags.has("--install")) installServe(Number(flagValue("--port") ?? 4747));

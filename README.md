@@ -153,6 +153,17 @@ mycelium fix storefront --apply --verify --pr    # ...and open a GitHub PR
 Major version bumps are skipped unless you pass `--major` (or tick the box). Anything that can't be
 fixed safely is reported as manual, with the reason (for example *"pinned by tauri-plugin-updater"*).
 
+### Everything at once
+
+```sh
+mycelium fix --all                 # refresh + dry plan for every project
+mycelium fix --all --apply         # build/test + PR per repo, one project at a time
+```
+
+`--major`, `--min high`, `--project a,b`, `--no-pr` and `--no-verify` all work here. A failure in one project
+doesn't stop the rest. A JSON report is written to `~/.mycelium/fix-all-<time>.json`. Re-running is safe:
+already-merged fixes and fixes in an open PR are skipped. The `/fix-all-deps` Claude Code skill wraps this.
+
 ### After you merge
 
 ```sh
@@ -191,6 +202,7 @@ MCP tools: `mycelium_scan`, `mycelium_check`, `mycelium_projects`, `mycelium_fin
 | `why <pkg[@ver]>` | How it got into each project (`a → b → c`). `--project name` |
 | `infra` | Hosts, domains, images and actions. `--all` |
 | `fix <project>` | Plan fixes (dry by default). `--apply` `--verify` `--pr` `--major` `--min high` `--only a,b` |
+| `fix --all` | Every project, headless: refresh, then plan, or `--apply` (verify + PR each). |
 | `prs` | Sync Mycelium's PRs from GitHub. |
 | `pull <project>` | Fast-forward a project after its PR is merged. |
 | `serve` | Live dashboard. `--port 4747` `--install` `--uninstall` |
