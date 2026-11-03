@@ -1,0 +1,25 @@
+{
+  "name": "mycelium",
+  "version": "0.8.0",
+  "description": "Map every dependency under every project you own — code, infra, hosts, domains — and get alerted when a new CVE lands anywhere in the graph.",
+  "type": "module",
+  "bin": {
+    "mycelium": "bin/mycelium"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --no-warnings=ExperimentalWarning --test test/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "yaml": "^2.6.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.3"
+  }
+}

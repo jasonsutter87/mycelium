@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Resolve symlinks so `npm link` / ~/bin symlinks work.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+exec node --experimental-strip-types --no-warnings=ExperimentalWarning "$DIR/../src/cli.ts" "$@"
