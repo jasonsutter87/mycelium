@@ -215,11 +215,23 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
   // 2. Every touched repo gets a throwaway git worktree on a new branch, cut from whatever you have checked out.
   //    Your working folder is never touched: uncommitted work doesn't block fixes, and you never end up on our branch.
   const repoOf = new Map<string, string>(); // absolute component dir -> repo root
-  for (const fx of todo) {
+  for (let i = todo.length - 1; i >= 0; i--) {
+    const fx = todo[i];
     const dir = join(fx.projectPath, dirname(fx.component));
-    const root = git(dir, ["rev-parse", "--show-toplevel"]);
-    if (!root) throw new Error(`${dir} is not in a git repo. Fixes need git so they can be reviewed and undone.`);
-    repoOf.set(dir, root);
+    const root = existsSync(dir) ? git(dir, ["rev-parse", "--show-toplevel"]) : null;
+    if (root) {
+      repoOf.set(dir, root);
+      continue;
+    }
+    // One stray folder (a backup copy, an unversioned experiment) shouldn't block every other repo in the project.
+    res.skipped.push({ fix: fx, reason: `${relative(fx.projectPath, dir) || dir} isn't in a git repo: fixes need git so they can be reviewed and undone` });
+    todo.splice(i, 1);
+  }
+  const noGit = [...new Set(res.skipped.filter((s) => s.reason.includes("isn't in a git repo")).map((s) => s.reason.split(" isn't")[0]))];
+  if (noGit.length) log(`skipping ${noGit.length} folder(s) that aren't in git: ${noGit.join(", ")}`);
+  if (!todo.length) {
+    log("Nothing left to apply: every fixable folder is outside git.");
+    return res;
   }
   res.repos = [...new Set(repoOf.values())];
   const branch = `mycelium/fix-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "")}`;
