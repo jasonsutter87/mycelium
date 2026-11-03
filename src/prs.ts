@@ -1,5 +1,6 @@
 // Closing the loop on PRs Mycelium opened: which findings each PR fixes, whether it's merged,
-// and whether pulling it into your folder is safe. Never pulls on its own; `pull` is an explicit action.
+// and whether pulling it into your folder is safe. Pulls only when asked: `pull`, or `fix --all` fast-forwarding
+// default branches before it plans (pullBases).
 
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -231,6 +232,79 @@ function mergesCleanly(repo: string, file: string, theirsRev: string): boolean {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+/** GitHub's default branch for `repo` ("main"/"master"), or null if origin has none (no remote, or an empty repo). */
+export function defaultBranch(repo: string): string | null {
+  const local = git(repo, ["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"]); // "origin/main"
+  if (local?.startsWith("origin/")) return local.slice(7);
+  const sym = git(repo, ["ls-remote", "--symref", "origin", "HEAD"])?.match(/^ref: refs\/heads\/(\S+)\s+HEAD/m);
+  if (sym) return sym[1];
+  for (const b of ["main", "master"]) if (git(repo, ["ls-remote", "--exit-code", "--heads", "origin", b])) return b;
+  return null;
+}
+
+/**
+ * Before a fix run: bring each repo's default branch up to date with GitHub, so the scan sees fixes that were
+ * already merged and doesn't plan (or PR) them again. Fast-forward only: unpushed commits, conflicting edits or
+ * an in-progress merge leave that repo alone and say why. Never rebases, never merges, never switches branches.
+ */
+export async function pullBases(db: DatabaseSync, log: (s: string) => void = () => {}, only?: Set<string>): Promise<{ pulled: string[]; refused: string[] }> {
+  const res = { pulled: [] as string[], refused: [] as string[] };
+  const repos = await reposOf(db);
+  const done = new Set<string>();
+  const targets: { repo: string; base: string; projects: string[] }[] = [];
+  // Folders that are worktrees of one repo share a git dir: pull once, rescan every project in any of them.
+  const commonOf = new Map<string, string>();
+  for (const repo of repos.keys()) commonOf.set(repo, git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]) ?? repo);
+  for (const [repo, entries] of repos) {
+    if (only && !entries.some((e) => only.has(e.projectPath))) continue;
+    const common = commonOf.get(repo)!;
+    if (done.has(common)) continue;
+    done.add(common);
+    if (!git(repo, ["remote", "get-url", "origin"])) continue; // nothing to pull from
+    const base = defaultBranch(repo);
+    const projects = [...repos].filter(([r]) => commonOf.get(r) === common).flatMap(([, es]) => es.map((e) => e.projectPath));
+    if (base) targets.push({ repo, base, projects });
+  }
+  await pool(targets, 8, async ({ repo, base }) => void (await run("git", repo, ["fetch", "-q", "origin", base])));
+  const rescan = new Set<string>();
+  for (const { repo, base, projects } of targets) {
+    const name = basename(repo);
+    const before = res.pulled.length;
+    if (!git(repo, ["rev-parse", "--verify", "-q", `origin/${base}`])) continue;
+    const holder = worktreeOn(repo, base);
+    if (!holder) {
+      // Not checked out anywhere: move the branch ref itself, only if it's strictly behind.
+      if (!git(repo, ["rev-parse", "--verify", "-q", `refs/heads/${base}`])) continue;
+      const ahead = Number(git(repo, ["rev-list", "--count", `origin/${base}..refs/heads/${base}`]) ?? 0);
+      const behind = Number(git(repo, ["rev-list", "--count", `refs/heads/${base}..origin/${base}`]) ?? 0);
+      if (!behind) continue;
+      if (ahead) res.refused.push(`${name}: local ${base} has ${ahead} unpushed commit(s)`);
+      else if (git(repo, ["update-ref", `refs/heads/${base}`, `origin/${base}`, `refs/heads/${base}`]) === null) res.refused.push(`${name}: couldn't fast-forward ${base}`);
+      else res.pulled.push(`${name}: ${base} +${behind}`);
+      continue;
+    }
+    const behind = Number(git(holder, ["rev-list", "--count", `HEAD..origin/${base}`]) ?? 0);
+    if (!behind) continue;
+    const check = pullCheck(holder, base);
+    if (!check.ready || check.mode !== "ff") {
+      res.refused.push(`${name}: ${check.reason ?? `your ${base} has unpushed commits: pull it yourself`}`);
+      continue;
+    }
+    try {
+      execFileSync("git", ["merge", "--ff-only", "-q", "--autostash", `origin/${base}`], { cwd: holder, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      res.pulled.push(`${name}: ${base} +${behind}`);
+    } catch (e: any) {
+      res.refused.push(`${name}: ${String(e.stderr ?? e.message).split("\n")[0]}`);
+    }
+    if (res.pulled.length > before) projects.forEach((p) => rescan.add(p));
+  }
+  // The scan reads your folders: anything that moved gets re-read now, so the plan matches what's on main.
+  for (const p of rescan) if (existsSync(p)) saveProject(db, scanProject(p));
+  for (const p of res.pulled) log(`⬇ pulled ${p}`);
+  for (const r of res.refused) log(`· not pulled ${r}`);
+  return res;
 }
 
 /** The ⬇ Pull button: re-check safety, then fast-forward (or rebase unpushed commits), keeping uncommitted edits. */

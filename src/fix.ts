@@ -10,10 +10,11 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { findings, type Finding } from "./graph.ts";
 import { compareVersions, severityRank } from "./osv.ts";
+import { defaultBranch } from "./prs.ts";
 import { scanProject } from "./scan.ts";
 
 export type Strategy =
@@ -175,6 +176,8 @@ export interface ApplyResult {
   verify: { dir: string; command: string; ok: boolean; output: string; preexisting?: boolean }[];
   committed: boolean;
   prs: { repo: string; url: string; base: string }[];
+  /** Repos that got a committed branch but can't get a PR (no GitHub remote, empty repo, push denied, duplicate branch). */
+  noPr: string[];
   log: string[];
 }
 
@@ -188,7 +191,7 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
     }
   };
   plan = { ...plan, projectPath: real(plan.projectPath), fixes: plan.fixes.map((f) => ({ ...f, projectPath: real(f.projectPath) })) };
-  const res: ApplyResult = { branch: null, repos: [], applied: [], skipped: [], failed: [], fixed: [], stillVulnerable: [], verify: [], committed: false, prs: [], log: [] };
+  const res: ApplyResult = { branch: null, repos: [], applied: [], skipped: [], failed: [], fixed: [], stillVulnerable: [], verify: [], committed: false, prs: [], noPr: [], log: [] };
   const log = (s: string) => res.log.push(s);
 
   // 1. Decide what we'll touch.
@@ -242,18 +245,27 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
     return res;
   }
 
-  const wt = new Map<string, { path: string; base: string; target: string; branch: string }>();
+  const wt = new Map<string, { path: string; base: string; target: string; branch: string; reused?: string }>();
   const committedRepos: string[] = []; // repo -> worktree
   try {
     const prTargets = new Map<string, string>(), dropRepos = new Set<string>();
+    const noPr = new Map<string, string>(); // repo -> why it can't get a PR (fix still lands on a local branch)
     for (const repo of res.repos) {
       const current = git(repo, ["branch", "--show-current"]) || git(repo, ["rev-parse", "HEAD"])!;
       // `base` = what the fix is cut from and compared against; `target` = the branch a PR goes into.
       // For a PR they must be the same branch on GitHub. Cutting from a local-only branch while the PR targets
       // main means main never looks fixed from here, and every click opens the same PR again.
       let base = current, target = current, start = "HEAD";
-      if (opts.pr) {
-        target = /^[0-9a-f]{40}$/.test(current) || !git(repo, ["ls-remote", "--heads", "origin", current]) ? defaultBranch(repo) : current;
+      // No GitHub to PR into (no remote, not GitHub, empty repo): still fix it on a local branch, just no PR.
+      const remote = opts.pr ? git(repo, ["remote", "get-url", "origin"]) : null;
+      const def = remote && /github\.com[:/]/.test(remote) ? defaultBranch(repo) : null;
+      if (opts.pr && !def) {
+        const why = !remote ? "no git remote" : !/github\.com[:/]/.test(remote) ? `origin isn't GitHub (${remote})` : "the GitHub repo has no branches yet (push one first)";
+        noPr.set(repo, `${relative(plan.projectPath, repo) || basename(repo)}: ${why}`);
+        log(`no PR possible for ${relative(plan.projectPath, repo) || basename(repo)}: ${why}. Fixing on a local branch from ${current}`);
+      }
+      if (opts.pr && def) {
+        target = /^[0-9a-f]{40}$/.test(current) || !git(repo, ["ls-remote", "--heads", "origin", current]) ? def : current;
         if (git(repo, ["fetch", "-q", "origin", target]) === null || !git(repo, ["rev-parse", "--verify", "-q", `origin/${target}`])) {
           throw new Error(`couldn't fetch origin/${target} from GitHub`);
         }
@@ -318,15 +330,17 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
     };
 
     // 3. Apply, grouped by lockfile so each one is re-resolved once.
+    const legacyPeers = new Set<string>(); // component dirs (your paths) whose npm tree only resolves with --legacy-peer-deps
     const byComponent = new Map<string, PlannedFix[]>();
     for (const fx of todo) byComponent.set(fx.component, [...(byComponent.get(fx.component) ?? []), fx]);
     for (const [component, fxs] of byComponent) {
       const dir = inWorktree(join(plan.projectPath, dirname(component)));
-      const { ok, failed } = applyComponent(dir, component.split("/").pop()!, fxs, log);
+      const { ok, failed, legacy } = applyComponent(dir, component.split("/").pop()!, fxs, log);
+      if (legacy) legacyPeers.add(join(plan.projectPath, dirname(component)));
       res.applied.push(...ok);
       for (const f of failed) {
         res.failed.push(f);
-        log(`✗ ${f.fix.name}: ${f.error.split("\n")[0]}`);
+        log(`✗ ${f.fix.name}: ${errLine(f.error)}`);
       }
     }
 
@@ -349,11 +363,12 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
         const env: Record<string, string> = existsSync(join(repo, "target")) ? { CARGO_TARGET_DIR: join(repo, "target") } : {};
         // JS projects: install dependencies from the new lockfile first (the fix step only touched the lockfile).
         if (existsSync(join(dir, "package.json"))) {
-          const inst = installCommand(dir);
+          const legacy = legacyPeers.has(absDir);
+          const inst = installCommand(dir, legacy);
           const r = run(inst[0], inst.slice(1), dir, 15 * 60_000);
           if (!r.ok) {
             const entry: ApplyResult["verify"][number] = { dir: absDir, command: inst.join(" "), ok: false, output: r.output.slice(-3000) };
-            entry.preexisting = failsOnBase(repo, wt.get(repo)!.base, relative(repo, absDir), inst, env, log);
+            entry.preexisting = failsOnBase(repo, wt.get(repo)!.base, relative(repo, absDir), inst, env, log, legacy);
             res.verify.push(entry);
             log(`${entry.preexisting ? "≈" : "✗"} ${inst.join(" ")}${entry.preexisting ? " (fails the same way before the fix: an environment issue, not this change)" : ""}`);
             continue; // can't build without dependencies
@@ -366,7 +381,7 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
           const entry: ApplyResult["verify"][number] = { dir: absDir, command: cmd.join(" "), ok: r.ok, output: r.output.slice(-3000) };
           if (!r.ok) {
             // Did it already fail before the upgrade? Run the same command on the base branch to find out.
-            entry.preexisting = failsOnBase(repo, wt.get(repo)!.base, relative(repo, absDir), cmd, env, log);
+            entry.preexisting = failsOnBase(repo, wt.get(repo)!.base, relative(repo, absDir), cmd, env, log, legacyPeers.has(absDir));
           }
           res.verify.push(entry);
           log(`${r.ok ? "✓" : entry.preexisting ? "≈" : "✗"} ${cmd.join(" ")}${entry.preexisting ? " (fails the same way on " + wt.get(repo)!.base + ": pre-existing, not caused by this fix)" : ""}`);
@@ -383,22 +398,33 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
       const msg = `mycelium: upgrade ${res.fixed.length} vulnerable package(s)${verifyFailed ? " [build failing]" : ""}\n\n${res.fixed.map((f) => `- ${f}`).join("\n")}`;
       gitOrThrow(path, ["commit", "-q", "-m", msg]);
       committedRepos.push(repo);
-      log(`committed on ${b}`);
+      // Same change already sitting on an earlier, never-PR'd mycelium branch? Reuse that one instead of
+      // piling up identical branches run after run.
+      const twin = sameChangeBranch(repo, b, wt.get(repo)!.base);
+      if (twin) {
+        wt.get(repo)!.reused = twin;
+        log(`same change as your existing branch ${twin}: reusing it instead of keeping ${b}`);
+      } else log(`committed on ${b}`);
     }
     res.committed = committedRepos.length > 0;
 
     // 7. Optional PR into the branch you were on. Never merges; never PRs a failing build.
     if (opts.pr && verifyFailed) log("build/test failed: branch kept for you to fix, but no PR opened");
+    if (opts.pr) for (const repo of committedRepos) if (noPr.has(repo)) res.noPr.push(noPr.get(repo)!);
     if (opts.pr && !verifyFailed) {
-      for (const repo of committedRepos) {
+      for (const repo of committedRepos.filter((r) => !noPr.has(r))) {
+        const w = wt.get(repo)!;
         try {
-          res.prs.push(openPr(repo, wt.get(repo)!.branch, wt.get(repo)!.target, plan, res, log, wt.get(repo)!.path));
+          res.prs.push(openPr(repo, w.reused ?? w.branch, w.target, plan, res, log, w.reused ? repo : w.path));
         } catch (e) {
-          log(`✗ PR not opened for ${repo}: ${(e as Error).message.split("\n")[0]}`);
+          const why = errLine((e as Error).message);
+          res.noPr.push(`${relative(plan.projectPath, repo) || basename(repo)}: ${why}`);
+          log(`✗ PR not opened for ${repo}: ${why}`);
         }
       }
     }
 
+    res.branch = [...new Set(committedRepos.map((r) => wt.get(r)!.reused ?? wt.get(r)!.branch))].join(", ") || null;
     if (!committedRepos.length) {
       res.branch = null;
       log("nothing changed: no branch left behind");
@@ -408,7 +434,7 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
       git(repo, ["worktree", "remove", "--force", path]);
       rmSync(tempRoot(path), { recursive: true, force: true }); // symlinks to sibling folders are unlinked, not followed
       // Only after the worktree is gone can its branch be deleted (git refuses while it's checked out).
-      if (!committedRepos.includes(repo)) git(repo, ["branch", "-D", b]);
+      if (!committedRepos.includes(repo) || wt.get(repo)!.reused) git(repo, ["branch", "-D", b]);
     }
   }
   return res;
@@ -459,7 +485,7 @@ export function prBody(plan: FixPlan, res: Pick<ApplyResult, "applied" | "stillV
     lines.push("", "### Not fixed in this PR", "");
     for (const s of res.stillVulnerable) lines.push(`- \`${s}\`: the package manager kept the old version (a parent pins it)`);
     for (const s of res.skipped.filter((s) => inRepo(s.fix))) lines.push(`- \`${s.fix.name}\` ${s.fix.from}: ${s.reason}`);
-    for (const f of res.failed.filter((f) => inRepo(f.fix))) lines.push(`- \`${f.fix.name}\` ${f.fix.from}: ${f.error.split("\n")[0]}`);
+    for (const f of res.failed.filter((f) => inRepo(f.fix))) lines.push(`- \`${f.fix.name}\` ${f.fix.from}: ${errLine(f.error)}`);
   }
   lines.push("", "### Verification", "");
   if (!res.verify.length) lines.push("Build/test was not run. Please run the app before merging.");
@@ -474,11 +500,11 @@ export function prBody(plan: FixPlan, res: Pick<ApplyResult, "applied" | "stillV
 function applyComponent(dir: string, lock: string, fxs: PlannedFix[], log: (s: string) => void): {
   ok: PlannedFix[];
   failed: { fix: PlannedFix; error: string }[];
+  legacy?: boolean;
 } {
   if (fxs[0].ecosystem === "npm") {
     try {
-      applyNpm(dir, lock, fxs, log);
-      return { ok: fxs, failed: [] };
+      return { ok: fxs, failed: [], legacy: applyNpm(dir, lock, fxs, log) };
     } catch (e) {
       const error = (e as Error).message.slice(0, 2000);
       return { ok: [], failed: fxs.map((fix) => ({ fix, error })) };
@@ -506,9 +532,11 @@ function explain(fx: PlannedFix, raw: string): string {
   return raw;
 }
 
-function applyNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string) => void) {
+/** Returns true when the lockfile had to be resolved with --legacy-peer-deps (the project already needed it). */
+function applyNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string) => void): boolean {
   {
     const pkgPath = join(dir, "package.json");
+    const original = { pkg: safeRead(pkgPath), lock: safeRead(join(dir, lock)) };
     const manifest = readJson(pkgPath);
     if (!manifest) throw new Error(`no package.json in ${dir}`);
     const manager = lock === "pnpm-lock.yaml" ? "pnpm" : lock === "yarn.lock" ? "yarn" : "npm";
@@ -523,6 +551,7 @@ function applyNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string)
         target[key] = `^${fx.to}`;
       }
     }
+    alignLockstep(dir, lock, manifest, fxs, log);
     writeFileSync(pkgPath, JSON.stringify(manifest, null, detectIndent(pkgPath)) + "\n");
     log(`edited ${pkgPath}`);
     // Re-resolve the lockfile only: no node_modules, no install scripts, no native builds (sharp, better-sqlite3 …).
@@ -532,9 +561,96 @@ function applyNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string)
       : manager === "pnpm" ? ["install", "--lockfile-only", "--ignore-scripts"]
       : yarnBerry(dir) ? ["install", "--mode=update-lockfile"]
       : ["install", "--ignore-scripts", "--non-interactive"];
-    runOrThrow(manager, args, dir);
-    log(`${manager}: lockfile updated in ${dir}`);
+    const first = run(manager, args, dir);
+    if (first.ok) {
+      log(`${manager}: lockfile updated in ${dir}`);
+      return false;
+    }
+    // Peer conflict: was the project already living with one before we touched it (lockfile made with
+    // --legacy-peer-deps)? Then resolve the same way it always has. If the conflict is new, it's ours: fail.
+    if (manager === "npm" && /ERESOLVE/.test(first.output) && original.pkg && original.lock && strictResolveFails(dir, original.pkg, original.lock)) {
+      const second = run(manager, [...args, "--legacy-peer-deps"], dir);
+      if (second.ok) {
+        log(`npm: lockfile updated with --legacy-peer-deps (the project's existing tree already has peer conflicts: ${errLine("x:\n" + first.output).slice(3)})`);
+        return true;
+      }
+      throw new Error(`${manager} ${args.join(" ")} --legacy-peer-deps failed:\n${second.output.slice(-1500)}`);
+    }
+    throw new Error(`${manager} ${args.join(" ")} failed:\n${first.output.slice(-1500)}`);
   }
+}
+
+/** Does the untouched package.json + lockfile already fail strict peer resolution? (Checked in a temp copy.) */
+function strictResolveFails(dir: string, pkg: string, lock: string): boolean {
+  const tmp = mkdtempSync(join(tmpdir(), "mycelium-peer-"));
+  try {
+    writeFileSync(join(tmp, "package.json"), pkg);
+    writeFileSync(join(tmp, "package-lock.json"), lock);
+    const rc = safeRead(join(dir, ".npmrc"));
+    if (rc) writeFileSync(join(tmp, ".npmrc"), rc);
+    const r = run("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], tmp);
+    return !r.ok && /ERESOLVE/.test(r.output);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Scoped families released in lockstep (@angular/*, @nestjs/*, @babel/* …) peer-depend on each other's exact version,
+ * so bumping some members and not the rest can't resolve (npm ERESOLVE). For every bumped direct dependency, move its
+ * scope-mates that are locked at the same version to the same target, if that version exists for them.
+ */
+export function alignLockstep(dir: string, lock: string, manifest: any, fxs: PlannedFix[], log: (s: string) => void) {
+  const FIELDS = ["dependencies", "devDependencies", "optionalDependencies"];
+  const locked = lockedVersions(dir, lock);
+  const families = new Map<string, { to: string; members: Set<string> }>();
+  for (const fx of fxs) {
+    if (fx.strategy !== "bump-direct" || !fx.name.startsWith("@") || !fx.to) continue;
+    const key = `${fx.name.split("/")[0]}|${fx.from}`;
+    const fam = families.get(key) ?? { to: fx.to, members: new Set<string>() };
+    if (compareVersions(fx.to, fam.to) > 0) fam.to = fx.to;
+    fam.members.add(fx.name);
+    families.set(key, fam);
+  }
+  for (const [key, fam] of families) {
+    const [scope, from] = key.split("|");
+    const mates = FIELDS.flatMap((f) => Object.keys(manifest[f] ?? {}))
+      .filter((n) => n.startsWith(scope + "/") && !fam.members.has(n) && locked.get(n) === from);
+    const moved: string[] = [];
+    for (const n of mates) {
+      // Only if that exact release exists for this package; otherwise leave it and let npm say what's wrong.
+      const has = run("npm", ["view", `${n}@${fam.to}`, "version"], dir, 60_000);
+      if (!has.ok || !has.output.trim()) continue;
+      moved.push(n);
+    }
+    for (const n of [...fam.members, ...moved]) {
+      const field = FIELDS.find((f) => manifest[f]?.[n]);
+      if (field) manifest[field][n] = `^${fam.to}`;
+    }
+    if (moved.length) log(`kept ${scope}/* in lockstep at ^${fam.to}: also moved ${moved.join(", ")}`);
+  }
+}
+
+/** Top-level installed versions from a lockfile (npm package-lock v2/v3, pnpm importers['.']). */
+function lockedVersions(dir: string, lock: string): Map<string, string> {
+  const out = new Map<string, string>();
+  const text = safeRead(join(dir, lock));
+  if (!text) return out;
+  if (lock === "package-lock.json") {
+    try {
+      for (const [k, v] of Object.entries<any>(JSON.parse(text).packages ?? {})) {
+        const m = k.match(/^node_modules\/((?:@[^/]+\/)?[^/]+)$/);
+        if (m && v?.version) out.set(m[1], v.version);
+      }
+    } catch {
+      /* unreadable lockfile: no alignment */
+    }
+  } else if (lock === "pnpm-lock.yaml") {
+    const importers = text.split(/^importers:\s*$/m)[1]?.split(/^\S/m)[0] ?? "";
+    const dot = importers.split(/^  \.:\s*$/m)[1]?.split(/^  \S/m)[0] ?? "";
+    for (const m of dot.matchAll(/^      '?([^'\s:]+)'?:\n        specifier: [^\n]+\n        version: (\d[^(\s]*)/gm)) out.set(m[1], m[2]);
+  }
+  return out;
 }
 
 function applyOne(dir: string, lock: string, fx: PlannedFix) {
@@ -596,10 +712,10 @@ function applyOne(dir: string, lock: string, fx: PlannedFix) {
 const yarnBerry = (dir: string) => (safeRead(join(dir, "yarn.lock")) ?? "").includes("__metadata:");
 
 /** Clean install from the lockfile, per package manager. */
-function installCommand(dir: string): string[] {
+function installCommand(dir: string, legacyPeers = false): string[] {
   if (existsSync(join(dir, "pnpm-lock.yaml"))) return ["pnpm", "install", "--frozen-lockfile"];
   if (existsSync(join(dir, "yarn.lock"))) return yarnBerry(dir) ? ["yarn", "install", "--immutable"] : ["yarn", "install", "--frozen-lockfile"];
-  return ["npm", "ci", "--no-audit", "--no-fund"];
+  return ["npm", "ci", "--no-audit", "--no-fund", ...(legacyPeers ? ["--legacy-peer-deps"] : [])];
 }
 
 /** Out-of-repo path dependencies (`path = "../../murmur/core"`, `"file:../lib"`), as paths relative to the repo root. */
@@ -659,21 +775,52 @@ function tempRoot(path: string): string {
   return dirname(p) === p ? dirname(path) : p;
 }
 
-function defaultBranch(repo: string): string {
-  const r = run("gh", ["repo", "view", "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name"], repo, 60_000);
-  if (!r.ok || !r.output.trim()) throw new Error(`gh: couldn't find the default branch: ${r.output.trim()}`);
-  return r.output.trim();
+/** A different local mycelium/fix-* branch carrying exactly the same change (by patch-id) as `branch` on `base`. */
+function sameChangeBranch(repo: string, branch: string, base: string): string | null {
+  const id = (from: string, to: string) => {
+    const diff = run("git", ["diff", from, to], repo, 60_000);
+    if (!diff.ok || !diff.output.trim()) return null;
+    try {
+      return execFileSync("git", ["patch-id", "--stable"], { cwd: repo, input: diff.output, encoding: "utf8", maxBuffer: 256 << 20 }).split(" ")[0] || null;
+    } catch {
+      return null;
+    }
+  };
+  const mine = id(base, branch);
+  if (!mine) return null;
+  const others = (git(repo, ["for-each-ref", "--format=%(refname:short)", "refs/heads/mycelium/fix-*"]) ?? "").split("\n").filter((b) => b && b !== branch);
+  for (const o of others.reverse()) {
+    const mb = git(repo, ["merge-base", base, o]);
+    if (mb && id(mb, o) === mine) return o;
+  }
+  return null;
+}
+
+/**
+ * One readable line from a multi-line command error: the headline plus the line that says why.
+ * "npm install … failed:" alone tells you nothing; "… failed: Conflicting peer dependency: @angular/core@21.2.26" does.
+ */
+export function errLine(msg: string): string {
+  const lines = msg.split("\n").map((l) => l.trim()).filter(Boolean);
+  const head = (lines[0] ?? "").replace(/:$/, "");
+  const rest = lines.slice(1).filter((l) => !/^npm (warn|WARN)\b/.test(l));
+  const priority = [/Conflicting peer dependency/i, /ERR_PNPM_\w+/, /No matching version|ETARGET|E404|notarget/i, /Permission .* denied|returned error: \d+|rejected|denied/i,
+    /^(fatal|error)[: ]/i, /npm error code \w+/i, /error/i];
+  let why: string | undefined;
+  for (const re of priority) if ((why = rest.find((l) => re.test(l)))) break;
+  why ??= rest[0];
+  return why ? `${head}: ${why.replace(/^npm error\s*/i, "").replace(/^remote:\s*/, "")}`.slice(0, 400) : head;
 }
 
 /** Runs `cmd` in a throwaway worktree of the base branch. true = it fails there too (pre-existing). */
-function failsOnBase(repo: string, base: string, relDir: string, cmd: string[], env: Record<string, string>, log: (s: string) => void): boolean {
+function failsOnBase(repo: string, base: string, relDir: string, cmd: string[], env: Record<string, string>, log: (s: string) => void, legacyPeers = false): boolean {
   const path = worktreeDir(repo, "mycelium-base-");
   try {
     if (!git(repo, ["worktree", "add", "--detach", path, base])) return false;
     const dir = join(path, relDir);
     log(`checking whether \`${cmd.join(" ")}\` already fails on ${base}…`);
     if (existsSync(join(dir, "package.json"))) {
-      const install = installCommand(dir);
+      const install = installCommand(dir, legacyPeers);
       const installed = run(install[0], install.slice(1), dir, 15 * 60_000).ok;
       // Checking the install itself: failing here too means it was already broken before the fix.
       if (install.join(" ") === cmd.join(" ")) return !installed;
