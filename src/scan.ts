@@ -277,6 +277,14 @@ export interface ScanSummary {
   warnings: string[];
 }
 
+/**
+ * Remembered roots plus newly scanned ones. Nested roots are kept on purpose: scanning Companies sees werbosLLM as
+ * one project, while scanning werbosLLM itself is what finds the projects inside it (beacon, glasshouse …).
+ */
+export function mergeRoots(remembered: string[], added: string[]): string[] {
+  return [...new Set([...remembered, ...added])];
+}
+
 /** Scan every project under the given roots, save them, and forget projects that were deleted. */
 export function scanRoots(db: DatabaseSync, roots: string[]): ScanSummary[] {
   const out: ScanSummary[] = [];

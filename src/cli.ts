@@ -3,10 +3,10 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, relative, resolve } from "node:path";
 import { DB_PATH, openDb } from "./db.ts";
-import { scanRoots } from "./scan.ts";
-import { applyFixes, planFixes, type ApplyResult, type FixPlan } from "./fix.ts";
+import { mergeRoots, scanRoots } from "./scan.ts";
+import { applyFixes, errLine, planFixes, type ApplyResult, type FixPlan } from "./fix.ts";
 import { audit, CATEGORY_LABEL } from "./audit.ts";
 import { enrich } from "./depsdev.ts";
 import { severityRank } from "./osv.ts";
@@ -44,8 +44,11 @@ const setSetting = (k: string, v: string) =>
 // ---------------------------------------------------------------- commands
 
 function scan(roots: string[]) {
-  const list = roots.length ? roots.map((r) => resolve(r)) : JSON.parse(getSetting("roots") ?? "null") ?? [process.cwd()];
-  setSetting("roots", JSON.stringify(list));
+  const remembered: string[] = JSON.parse(getSetting("roots") ?? "null") ?? [];
+  const list = roots.length ? roots.map((r) => resolve(r)) : remembered.length ? remembered : [process.cwd()];
+  // Scanning one folder adds it to what's remembered; it never replaces it. (`scan werbosLLM` once used to shrink
+  // every later `fix --all` refresh down to that one folder, so the rest were planned from stale scans.)
+  setSetting("roots", JSON.stringify(mergeRoots(remembered, list)));
   const scanned = scanRoots(db, list);
   for (const s of scanned) {
     console.log(`${c.green("●")} ${c.bold(s.name.padEnd(28))} ${String(s.packages).padStart(5)} pkgs  ${c.cyan(s.exposure.padEnd(11))} ${c.dim(s.ecosystems.join(", ") || "—")}`);
@@ -249,7 +252,7 @@ export function printApply(r: ApplyResult) {
   for (const l of r.log) console.log(c.dim(l));
   if (r.fixed.length) console.log(c.green(`\n✓ fixed ${r.fixed.length}:`) + "\n  " + r.fixed.join("\n  "));
   if (r.stillVulnerable.length) console.log(c.yellow(`\n! still vulnerable after apply ${r.stillVulnerable.length}:`) + "\n  " + r.stillVulnerable.join("\n  "));
-  if (r.failed.length) console.log(c.red(`\n✗ failed ${r.failed.length}:`) + "\n  " + r.failed.map((f) => `${f.fix.name}: ${f.error.split("\n")[0]}`).join("\n  "));
+  if (r.failed.length) console.log(c.red(`\n✗ failed ${r.failed.length}:`) + "\n  " + r.failed.map((f) => `${f.fix.name}: ${errLine(f.error)}`).join("\n  "));
   if (r.skipped.length) console.log(c.dim(`\nskipped ${r.skipped.length}: `) + c.dim(r.skipped.map((s) => s.fix.name).join(", ")));
   for (const v of r.verify) {
     if (v.ok) console.log(`${c.green("✓")} ${v.command} ${c.dim(v.dir)}`);
@@ -290,10 +293,18 @@ async function fixAll() {
   if (!flags.has("--no-refresh")) {
     const roots = JSON.parse(getSetting("roots") ?? "[]");
     if (!roots.length) return console.log("Run `mycelium scan <folders>` first.");
+    const { syncPrs, pullBases } = await import("./prs.ts");
+    // Pull GitHub's main/master first (fast-forward only), so fixes already merged there aren't planned or PR'd again.
+    if (!flags.has("--no-pull")) {
+      console.log(c.dim("pulling default branches (fast-forward only)…"));
+      const onlyPaths = flagValue("--project") ? new Set((db.prepare("SELECT name, path FROM projects").all() as { name: string; path: string }[])
+        .filter((p) => flagValue("--project")!.split(",").includes(p.name)).map((p) => p.path)) : undefined;
+      const pulled = await pullBases(db, (s) => console.log(c.dim("   " + s)), onlyPaths);
+      console.log(c.dim(`pulled ${pulled.pulled.length} repo(s)${pulled.refused.length ? `, ${pulled.refused.length} left alone` : ""}`));
+    }
     console.log(c.dim(`refreshing: scanning ${roots.join(", ")}, checking OSV, syncing PRs…`));
     scanRoots(db, roots);
     await checkAll(db);
-    const { syncPrs } = await import("./prs.ts");
     await syncPrs(db);
   }
   const allowMajor = flags.has("--major");
@@ -304,7 +315,14 @@ async function fixAll() {
   type Row = { project: string; status: "fixed" | "pr" | "nothing" | "manual-only" | "failed" | "verify-failed" | "planned";
     autoFixable: number; fixed: string[]; prs: string[]; failed: string[]; manual: number; skippedNotes: string[]; branch: string | null; error?: string };
   const rows: Row[] = [];
-  for (const name of projects) {
+  // One stable progress line per project ("[i/N] name · status · PR urls") so a skill/agent can stream it.
+  const progress = (i: number, r: Row | undefined, name: string) => {
+    const detail = !r ? "" : r.prs.length ? r.prs.join(" ") + (r.error ? ` · ${r.error}` : "") : r.status === "manual-only" ? `${r.manual} need a human` :
+      r.status === "planned" ? `${r.autoFixable} auto` : r.status === "verify-failed" ? `build/test broke, branch ${r.branch} kept` :
+      r.status === "fixed" ? `committed on ${r.branch}${r.error ? ` · ${r.error}` : ", no PR"}` : r.status === "failed" ? (r.error ?? r.failed.join("; ")).slice(0, 160) : "";
+    console.log(`[${i}/${projects.length}] ${name} · ${r?.status ?? "failed"}${detail ? " · " + detail : ""}`);
+  };
+  for (const [idx, name] of projects.entries()) try {
     let plan: FixPlan;
     try {
       plan = planFixes(db, name, { minSeverity: flagValue("--min")?.toUpperCase(), includeDev: flags.has("--dev") });
@@ -323,23 +341,33 @@ async function fixAll() {
       console.log(`${c.bold(name.padEnd(28))} ${c.green(`${auto.length} auto`)}${manual ? c.dim(` · ${manual} manual`) : ""}  ${c.dim(auto.map((f) => `${f.name} ${f.from}→${f.to}`).join(", ").slice(0, 120))}`);
       continue;
     }
-    console.log(`\n${c.bold(`── ${name}`)} ${c.dim(`(${auto.length} auto-fixable)`)}`);
+    console.log(`\n[${idx + 1}/${projects.length}] ${name} · working · ${auto.length} auto-fixable (install/build/test may take minutes)`);
     try {
-      const r = applyFixes(db, plan, { allowMajor, verify: !flags.has("--no-verify"), pr: !flags.has("--no-pr") });
-      for (const l of r.log) console.log(c.dim("   " + l.split("\n")[0]));
+      const r = applyFixes(db, plan, { allowMajor, verify: !flags.has("--no-verify"), pr: !flags.has("--no-pr"),
+        onLog: (l) => console.log(c.dim("   " + l.split("\n")[0])) });
       row.fixed = r.fixed;
       row.prs = r.prs.map((p) => p.url);
-      row.failed = r.failed.map((f) => `${f.fix.name}: ${f.error.split("\n")[0]}`);
+      row.failed = r.failed.map((f) => `${f.fix.name}: ${errLine(f.error)}`);
       row.skippedNotes = [...new Set(r.skipped.filter((s) => /open PR|already fixed|worktree of a repo|not present/.test(s.reason)).map((s) => `${s.fix.name}: ${s.reason}`))];
       row.branch = r.branch;
-      const verifyFailed = r.verify.some((v) => !v.ok && !v.preexisting);
-      row.status = row.prs.length ? "pr" : verifyFailed && r.committed ? "verify-failed" : r.fixed.length ? "fixed" : row.failed.length ? "failed" : "nothing";
-      if (r.log.some((l) => l.startsWith("✗ PR not opened"))) row.error = r.log.filter((l) => l.startsWith("✗ PR not opened")).join("; ");
+      const verifyFailed = r.verifyFailedRepos.length > 0;
+      // Applied but the package manager kept the old version: that's a failure to report, not "nothing".
+      if (!r.fixed.length && r.stillVulnerable.length) row.failed.push(...r.stillVulnerable.map((s) => `${s}: still locked at the vulnerable version after the upgrade`));
+      const human = r.skipped.filter((s) => s.human);
+      row.manual += human.length;
+      row.status = row.prs.length ? "pr" : verifyFailed && r.committed ? "verify-failed" : r.fixed.length ? "fixed" : row.failed.length ? "failed" : human.length ? "manual-only" : "nothing";
+      const notes: string[] = [];
+      if (verifyFailed) notes.push(`build/test broke in ${r.verifyFailedRepos.map((p) => relative(plan.projectPath, p) || basename(p)).join(", ")}: branch kept, no PR`);
+      if (r.noPr.length) notes.push(`no PR: ${r.noPr.join("; ")}`);
+      if (row.status === "failed") notes.push(row.failed.join("; "));
+      if (notes.length) row.error = notes.join(" · ");
     } catch (e) {
       row.status = "failed";
-      row.error = (e as Error).message.split("\n")[0];
+      row.error = errLine((e as Error).message);
       console.log(c.red(`   ✗ ${row.error}`));
     }
+  } finally {
+    progress(idx + 1, rows.find((r) => r.project === name), name);
   }
 
   if (apply) {
@@ -351,8 +379,8 @@ async function fixAll() {
   console.log(c.bold(`\n${apply ? "Fix-all summary" : "Fix-all plan (dry run; add --apply)"}`));
   const icon: Record<Row["status"], string> = { pr: "⇪", fixed: "✓", "verify-failed": "✗", failed: "✗", "manual-only": "·", planned: "→", nothing: "✓" };
   for (const r of acted) {
-    const detail = r.status === "pr" ? r.prs.join(" ") : r.status === "manual-only" ? `${r.manual} need a human` : r.status === "planned" ? `${r.autoFixable} auto` :
-      r.status === "verify-failed" ? `build/test broke: branch ${r.branch} kept, no PR` : r.status === "fixed" ? `committed on ${r.branch} (no PR${r.error ? ": " + r.error : ""})` :
+    const detail = r.status === "pr" ? r.prs.join(" ") + (r.error ? ` · ${r.error}` : "") : r.status === "manual-only" ? `${r.manual} need a human` : r.status === "planned" ? `${r.autoFixable} auto` :
+      r.status === "verify-failed" ? `build/test broke: branch ${r.branch} kept, no PR` : r.status === "fixed" ? `committed on ${r.branch} (${r.error ?? "no PR"})` :
       r.error ?? r.failed.join("; ") ?? "";
     console.log(`${icon[r.status]} ${r.project.padEnd(28)} ${r.status.padEnd(14)} ${c.dim(detail.slice(0, 200))}`);
   }
@@ -455,8 +483,9 @@ const HELP = `${c.bold("mycelium")}: map every dependency under everything you o
   ${c.cyan("fix")} <project>        Plan fixes (dry). --apply commits them to a new branch via a separate worktree
                        (your folder is never touched); --verify runs build/test, --pr pushes + opens a
                        GitHub PR, --major allows major bumps, --min high, --only pkg1,pkg2
-  ${c.cyan("fix --all")}            Every project, headless: refresh, then plan (dry) or --apply: build/test + PR per
-                       repo, one at a time. --major | --min high | --project a,b | --no-pr | --no-verify
+  ${c.cyan("fix --all")}            Every project, headless: fast-forward main/master from GitHub, refresh, then plan
+                       (dry) or --apply: build/test + PR per repo, one at a time.
+                       --major | --min high | --project a,b | --no-pr | --no-verify | --no-pull
   ${c.cyan("prs")}                  Mycelium's PRs: open / merged, and whether a safe pull is possible.
   ${c.cyan("pull")} <project>       Fast-forward a merged fix into your folder (only when safe), then rescan.
   ${c.cyan("serve")} [--port 4747] Local report with Fix buttons at http://mycelium.localhost:4747
