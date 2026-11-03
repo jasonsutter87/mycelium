@@ -3,9 +3,9 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, relative, resolve } from "node:path";
 import { DB_PATH, openDb } from "./db.ts";
-import { scanRoots } from "./scan.ts";
+import { mergeRoots, scanRoots } from "./scan.ts";
 import { applyFixes, errLine, planFixes, type ApplyResult, type FixPlan } from "./fix.ts";
 import { audit, CATEGORY_LABEL } from "./audit.ts";
 import { enrich } from "./depsdev.ts";
@@ -44,8 +44,11 @@ const setSetting = (k: string, v: string) =>
 // ---------------------------------------------------------------- commands
 
 function scan(roots: string[]) {
-  const list = roots.length ? roots.map((r) => resolve(r)) : JSON.parse(getSetting("roots") ?? "null") ?? [process.cwd()];
-  setSetting("roots", JSON.stringify(list));
+  const remembered: string[] = JSON.parse(getSetting("roots") ?? "null") ?? [];
+  const list = roots.length ? roots.map((r) => resolve(r)) : remembered.length ? remembered : [process.cwd()];
+  // Scanning one folder adds it to what's remembered; it never replaces it. (`scan werbosLLM` once used to shrink
+  // every later `fix --all` refresh down to that one folder, so the rest were planned from stale scans.)
+  setSetting("roots", JSON.stringify(mergeRoots(remembered, list)));
   const scanned = scanRoots(db, list);
   for (const s of scanned) {
     console.log(`${c.green("●")} ${c.bold(s.name.padEnd(28))} ${String(s.packages).padStart(5)} pkgs  ${c.cyan(s.exposure.padEnd(11))} ${c.dim(s.ecosystems.join(", ") || "—")}`);
@@ -314,7 +317,7 @@ async function fixAll() {
   const rows: Row[] = [];
   // One stable progress line per project ("[i/N] name · status · PR urls") so a skill/agent can stream it.
   const progress = (i: number, r: Row | undefined, name: string) => {
-    const detail = !r ? "" : r.prs.length ? r.prs.join(" ") : r.status === "manual-only" ? `${r.manual} need a human` :
+    const detail = !r ? "" : r.prs.length ? r.prs.join(" ") + (r.error ? ` · ${r.error}` : "") : r.status === "manual-only" ? `${r.manual} need a human` :
       r.status === "planned" ? `${r.autoFixable} auto` : r.status === "verify-failed" ? `build/test broke, branch ${r.branch} kept` :
       r.status === "fixed" ? `committed on ${r.branch}${r.error ? ` · ${r.error}` : ", no PR"}` : r.status === "failed" ? (r.error ?? r.failed.join("; ")).slice(0, 160) : "";
     console.log(`[${i}/${projects.length}] ${name} · ${r?.status ?? "failed"}${detail ? " · " + detail : ""}`);
@@ -340,17 +343,24 @@ async function fixAll() {
     }
     console.log(`\n[${idx + 1}/${projects.length}] ${name} · working · ${auto.length} auto-fixable (install/build/test may take minutes)`);
     try {
-      const r = applyFixes(db, plan, { allowMajor, verify: !flags.has("--no-verify"), pr: !flags.has("--no-pr") });
-      for (const l of r.log) console.log(c.dim("   " + l.split("\n")[0]));
+      const r = applyFixes(db, plan, { allowMajor, verify: !flags.has("--no-verify"), pr: !flags.has("--no-pr"),
+        onLog: (l) => console.log(c.dim("   " + l.split("\n")[0])) });
       row.fixed = r.fixed;
       row.prs = r.prs.map((p) => p.url);
       row.failed = r.failed.map((f) => `${f.fix.name}: ${errLine(f.error)}`);
       row.skippedNotes = [...new Set(r.skipped.filter((s) => /open PR|already fixed|worktree of a repo|not present/.test(s.reason)).map((s) => `${s.fix.name}: ${s.reason}`))];
       row.branch = r.branch;
-      const verifyFailed = r.verify.some((v) => !v.ok && !v.preexisting);
-      row.status = row.prs.length ? "pr" : verifyFailed && r.committed ? "verify-failed" : r.fixed.length ? "fixed" : row.failed.length ? "failed" : "nothing";
-      if (r.noPr.length) row.error = `no PR: ${r.noPr.join("; ")}`;
-      else if (row.status === "failed") row.error = row.failed.join("; ");
+      const verifyFailed = r.verifyFailedRepos.length > 0;
+      // Applied but the package manager kept the old version: that's a failure to report, not "nothing".
+      if (!r.fixed.length && r.stillVulnerable.length) row.failed.push(...r.stillVulnerable.map((s) => `${s}: still locked at the vulnerable version after the upgrade`));
+      const human = r.skipped.filter((s) => s.human);
+      row.manual += human.length;
+      row.status = row.prs.length ? "pr" : verifyFailed && r.committed ? "verify-failed" : r.fixed.length ? "fixed" : row.failed.length ? "failed" : human.length ? "manual-only" : "nothing";
+      const notes: string[] = [];
+      if (verifyFailed) notes.push(`build/test broke in ${r.verifyFailedRepos.map((p) => relative(plan.projectPath, p) || basename(p)).join(", ")}: branch kept, no PR`);
+      if (r.noPr.length) notes.push(`no PR: ${r.noPr.join("; ")}`);
+      if (row.status === "failed") notes.push(row.failed.join("; "));
+      if (notes.length) row.error = notes.join(" · ");
     } catch (e) {
       row.status = "failed";
       row.error = errLine((e as Error).message);
@@ -369,7 +379,7 @@ async function fixAll() {
   console.log(c.bold(`\n${apply ? "Fix-all summary" : "Fix-all plan (dry run; add --apply)"}`));
   const icon: Record<Row["status"], string> = { pr: "⇪", fixed: "✓", "verify-failed": "✗", failed: "✗", "manual-only": "·", planned: "→", nothing: "✓" };
   for (const r of acted) {
-    const detail = r.status === "pr" ? r.prs.join(" ") : r.status === "manual-only" ? `${r.manual} need a human` : r.status === "planned" ? `${r.autoFixable} auto` :
+    const detail = r.status === "pr" ? r.prs.join(" ") + (r.error ? ` · ${r.error}` : "") : r.status === "manual-only" ? `${r.manual} need a human` : r.status === "planned" ? `${r.autoFixable} auto` :
       r.status === "verify-failed" ? `build/test broke: branch ${r.branch} kept, no PR` : r.status === "fixed" ? `committed on ${r.branch} (${r.error ?? "no PR"})` :
       r.error ?? r.failed.join("; ") ?? "";
     console.log(`${icon[r.status]} ${r.project.padEnd(28)} ${r.status.padEnd(14)} ${c.dim(detail.slice(0, 200))}`);
