@@ -271,7 +271,13 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
         }
       }
     }
-    if (!todo.length) log("everything planned is already gone upstream: nothing to do");
+    if (!todo.length) {
+      const [, w] = [...wt][0];
+      log(w.target && w.base === `origin/${w.target}` && w.target !== (git(res.repos[0], ["branch", "--show-current"]) ?? "")
+        ? `✅ already fixed on GitHub's ${w.target}. Your folder is on ${git(res.repos[0], ["branch", "--show-current"])}, which doesn't have it yet: ` +
+          `merge ${w.target} into it (\`git merge origin/${w.target}\`) or switch to ${w.target}, then Rescan`
+        : `✅ already fixed on ${w.base}: pull (⬇ Pull or \`git pull\`), then Rescan`);
+    }
     res.branch = branch;
     const inWorktree = (absDir: string) => {
       const repo = repoOf.get(absDir)!;
