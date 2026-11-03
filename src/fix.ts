@@ -93,10 +93,19 @@ export function planFixes(db: DatabaseSync, project: string, opts: { minSeverity
       continue;
     }
     if (fixable.length < f.length) base.note = `${f.length - fixable.length} advisory(ies) have no fix yet. `;
+    // A beta/RC isn't a fix you ship: hold it for a human unless you're already on prereleases.
+    if (isPrerelease(to) && !isPrerelease(first.version)) {
+      fixes.push({ ...base, note: base.note + `the only fixed release is a prerelease (${to}): wait for the stable release, or upgrade by hand if you accept a beta` });
+      continue;
+    }
     fixes.push(chooseStrategy(base));
   }
   fixes.sort((a, b) => severityRank(b.severity) - severityRank(a.severity) || a.name.localeCompare(b.name));
   return { project: fixes[0]?.project ?? project, projectPath: row.path, fixes };
+}
+
+export function isPrerelease(v: string): boolean {
+  return /[-.](alpha|beta|rc|cr|pre|preview|dev|snapshot|canary|next|nightly|m|ea)\d*\b/i.test(v) || /\d(a|b|rc)\d+$/i.test(v);
 }
 
 function chooseStrategy(fx: PlannedFix): PlannedFix {
@@ -184,9 +193,17 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
 
   // 1. Decide what we'll touch.
   const todo: PlannedFix[] = [];
+  // Already in an open Mycelium PR? Don't open a second one for the same thing (as of the last PR sync).
+  const inOpenPr = new Map<string, number>();
+  for (const r of db.prepare(`SELECT f.project_path, f.component, f.name, f.version, p.number FROM pr_fixes f
+      JOIN prs p ON p.id = f.pr_id WHERE p.state = 'OPEN'`).all() as any[]) {
+    inOpenPr.set(`${real(r.project_path)}|${r.component}|${r.name}@${r.version}`, r.number);
+  }
   for (const fx of plan.fixes) {
     if (opts.only?.length && !opts.only.includes(fx.name)) continue;
-    if (fx.strategy === "manual") res.skipped.push({ fix: fx, reason: fx.note || "needs a human" });
+    const openPrNo = inOpenPr.get(`${fx.projectPath}|${fx.component}|${fx.name}@${fx.from}`);
+    if (openPrNo && !opts.dryRun) res.skipped.push({ fix: fx, reason: `already fixed in open PR #${openPrNo}: merge or close that one first` });
+    else if (fx.strategy === "manual") res.skipped.push({ fix: fx, reason: fx.note || "needs a human" });
     else if (fx.breaking && !opts.allowMajor) res.skipped.push({ fix: fx, reason: `major bump ${fx.from} → ${fx.to}: rerun with allowMajor after checking the changelog` });
     else todo.push(fx);
   }
@@ -213,23 +230,31 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
     return res;
   }
 
-  const wt = new Map<string, { path: string; base: string }>(); // repo -> worktree
+  const wt = new Map<string, { path: string; base: string; target: string }>(); // repo -> worktree
   try {
     for (const repo of res.repos) {
-      const base = git(repo, ["branch", "--show-current"]) || git(repo, ["rev-parse", "HEAD"])!;
-      // For a PR, cut from GitHub's copy of the branch: a PR built on a stale or unpushed local branch
-      // conflicts, and silently drags your unpushed commits into a "security fix".
-      let start = "HEAD";
-      if (opts.pr && !/^[0-9a-f]{40}$/.test(base) && git(repo, ["fetch", "-q", "origin", base]) !== null && git(repo, ["rev-parse", "--verify", "-q", `origin/${base}`])) {
-        start = `origin/${base}`;
-        const ahead = Number(git(repo, ["rev-list", "--count", `origin/${base}..HEAD`]) ?? 0);
-        const behind = Number(git(repo, ["rev-list", "--count", `HEAD..origin/${base}`]) ?? 0);
-        log(`PR mode: building on origin/${base}` + (ahead ? `. Note: your local ${base} has ${ahead} unpushed commit(s), which are NOT included` : "") +
-          (behind ? `${ahead ? ";" : ". Note:"} it's ${behind} commit(s) behind GitHub` : ""));
+      const current = git(repo, ["branch", "--show-current"]) || git(repo, ["rev-parse", "HEAD"])!;
+      // `base` = what the fix is cut from and compared against; `target` = the branch a PR goes into.
+      // For a PR they must be the same branch on GitHub. Cutting from a local-only branch while the PR targets
+      // main means main never looks fixed from here, and every click opens the same PR again.
+      let base = current, target = current, start = "HEAD";
+      if (opts.pr) {
+        target = /^[0-9a-f]{40}$/.test(current) || !git(repo, ["ls-remote", "--heads", "origin", current]) ? defaultBranch(repo) : current;
+        if (git(repo, ["fetch", "-q", "origin", target]) === null || !git(repo, ["rev-parse", "--verify", "-q", `origin/${target}`])) {
+          throw new Error(`couldn't fetch origin/${target} from GitHub`);
+        }
+        base = start = `origin/${target}`;
+        if (target !== current) log(`PR mode: ${current} isn't on GitHub, so the PR goes into ${target} and is built on origin/${target}`);
+        else {
+          const ahead = Number(git(repo, ["rev-list", "--count", `${start}..HEAD`]) ?? 0);
+          const behind = Number(git(repo, ["rev-list", "--count", `HEAD..${start}`]) ?? 0);
+          log(`PR mode: building on ${start}` + (ahead ? `. Note: your local ${current} has ${ahead} unpushed commit(s), which are NOT included` : "") +
+            (behind ? `${ahead ? ";" : ". Note:"} it's ${behind} commit(s) behind GitHub` : ""));
+        }
       }
       const path = join(mkdtempSync(join(tmpdir(), "mycelium-wt-")), "repo");
       gitOrThrow(repo, ["worktree", "add", "-b", branch, path, start]);
-      wt.set(repo, { path, base });
+      wt.set(repo, { path, base, target });
       log(`working in a separate worktree on ${branch} (from ${start === "HEAD" ? base : start}); your checkout is untouched`);
     }
 
@@ -329,7 +354,7 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
     if (opts.pr && !verifyFailed) {
       for (const repo of committedRepos) {
         try {
-          res.prs.push(openPr(repo, branch, wt.get(repo)!.base, plan, res, log, wt.get(repo)!.path));
+          res.prs.push(openPr(repo, branch, wt.get(repo)!.target, plan, res, log, wt.get(repo)!.path));
         } catch (e) {
           log(`✗ PR not opened for ${repo}: ${(e as Error).message.split("\n")[0]}`);
         }
@@ -352,20 +377,10 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
 }
 
 /** pushFrom: the fix worktree. Pushing from there means pre-push hooks (e.g. "run the build") check the fixed code. */
-function openPr(repo: string, branch: string, from: string, plan: FixPlan, res: ApplyResult, log: (s: string) => void, pushFrom = repo) {
+function openPr(repo: string, branch: string, target: string, plan: FixPlan, res: ApplyResult, log: (s: string) => void, pushFrom = repo) {
   const remote = git(repo, ["remote", "get-url", "origin"]);
   if (!remote || !/github\.com[:/]/.test(remote)) throw new Error(`origin is not a GitHub remote (${remote ?? "none"})`);
-  // Base = the branch you were on, if GitHub has it; else the repo's default branch.
-  let base = /^[0-9a-f]{40}$/.test(from) ? "" : from;
-  if (base && !git(repo, ["ls-remote", "--heads", "origin", base])) {
-    log(`${base} isn't on GitHub yet: targeting the default branch instead`);
-    base = "";
-  }
-  if (!base) {
-    const r = run("gh", ["repo", "view", "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name"], repo, 60_000);
-    if (!r.ok) throw new Error(`gh: ${r.output.trim()}`);
-    base = r.output.trim();
-  }
+  const base = target; // resolved in applyFixes: the same branch the fix was cut from
   const push = run("git", ["push", "-u", "origin", branch], pushFrom, 15 * 60_000);
   if (!push.ok) {
     const hook = /pre-push|hook/i.test(push.output);
@@ -547,6 +562,12 @@ function installCommand(dir: string): string[] {
   if (existsSync(join(dir, "pnpm-lock.yaml"))) return ["pnpm", "install", "--frozen-lockfile"];
   if (existsSync(join(dir, "yarn.lock"))) return yarnBerry(dir) ? ["yarn", "install", "--immutable"] : ["yarn", "install", "--frozen-lockfile"];
   return ["npm", "ci", "--no-audit", "--no-fund"];
+}
+
+function defaultBranch(repo: string): string {
+  const r = run("gh", ["repo", "view", "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name"], repo, 60_000);
+  if (!r.ok || !r.output.trim()) throw new Error(`gh: couldn't find the default branch: ${r.output.trim()}`);
+  return r.output.trim();
 }
 
 /** Runs `cmd` in a throwaway worktree of the base branch. true = it fails there too (pre-existing). */
