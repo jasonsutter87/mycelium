@@ -230,8 +230,10 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
     return res;
   }
 
-  const wt = new Map<string, { path: string; base: string; target: string }>(); // repo -> worktree
+  const wt = new Map<string, { path: string; base: string; target: string; branch: string }>();
+  const committedRepos: string[] = []; // repo -> worktree
   try {
+    const prTargets = new Map<string, string>(), dropRepos = new Set<string>();
     for (const repo of res.repos) {
       const current = git(repo, ["branch", "--show-current"]) || git(repo, ["rev-parse", "HEAD"])!;
       // `base` = what the fix is cut from and compared against; `target` = the branch a PR goes into.
@@ -252,10 +254,29 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
             (behind ? `${ahead ? ";" : ". Note:"} it's ${behind} commit(s) behind GitHub` : ""));
         }
       }
+      // Several folders can be worktrees of one repo. Fixing them all into the same GitHub branch = duplicate PRs.
+      const common = realpathSync(resolve(repo, git(repo, ["rev-parse", "--git-common-dir"]) ?? ".git"));
+      if (opts.pr && prTargets.has(`${common}|${target}`)) {
+        log(`skipping ${relative(plan.projectPath, repo) || repo}: same repo as ${prTargets.get(`${common}|${target}`)}, and its PR into ${target} already covers it`);
+        dropRepos.add(repo);
+        continue;
+      }
+      prTargets.set(`${common}|${target}`, relative(plan.projectPath, repo) || repo);
       const path = worktreeDir(repo, "mycelium-wt-");
-      gitOrThrow(repo, ["worktree", "add", "-b", branch, path, start]);
-      wt.set(repo, { path, base, target });
-      log(`working in a separate worktree on ${branch} (from ${start === "HEAD" ? base : start}); your checkout is untouched`);
+      // Unique per repo: folders that are worktrees of one repo share branch names, and so do two clicks in a minute.
+      let b = branch;
+      for (let n = 2; git(repo, ["rev-parse", "--verify", "-q", `refs/heads/${b}`]); n++) b = `${branch}-${n}`;
+      gitOrThrow(repo, ["worktree", "add", "-b", b, path, start]);
+      wt.set(repo, { path, base, target, branch: b });
+      log(`working in a separate worktree on ${b}${res.repos.length > 1 ? ` in ${relative(plan.projectPath, repo) || "."}` : ""} (from ${start === "HEAD" ? base : start}); your checkout is untouched`);
+    }
+
+    for (let i = todo.length - 1; i >= 0; i--) {
+      const repo = repoOf.get(join(todo[i].projectPath, dirname(todo[i].component)))!;
+      if (dropRepos.has(repo)) {
+        res.skipped.push({ fix: todo[i], reason: `${relative(plan.projectPath, repo)} is a worktree of a repo already being fixed into the same branch` });
+        todo.splice(i, 1);
+      }
     }
 
     // The plan came from your folder; the worktree may differ (e.g. upstream already removed a package).
@@ -271,14 +292,14 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
         }
       }
     }
-    if (!todo.length) {
+    if (!todo.length && wt.size) {
       const [, w] = [...wt][0];
       log(w.target && w.base === `origin/${w.target}` && w.target !== (git(res.repos[0], ["branch", "--show-current"]) ?? "")
         ? `✅ already fixed on GitHub's ${w.target}. Your folder is on ${git(res.repos[0], ["branch", "--show-current"])}, which doesn't have it yet: ` +
           `merge ${w.target} into it (\`git merge origin/${w.target}\`) or switch to ${w.target}, then Rescan`
         : `✅ already fixed on ${w.base}: pull (⬇ Pull or \`git pull\`), then Rescan`);
     }
-    res.branch = branch;
+    res.branch = [...wt.values()].map((w) => w.branch).join(", ");
     const inWorktree = (absDir: string) => {
       const repo = repoOf.get(absDir)!;
       return join(wt.get(repo)!.path, relative(repo, absDir));
@@ -344,14 +365,13 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
 
     // 6. Commit on the fix branch (the worktree is deleted afterwards, so this is how the result survives).
     //    Only tracked files we changed: never `git add -A`.
-    const committedRepos: string[] = [];
-    for (const [repo, { path }] of wt) {
+    for (const [repo, { path, branch: b }] of wt) {
       if (!res.fixed.length || !git(path, ["status", "--porcelain", "--untracked-files=no"])) continue;
       gitOrThrow(path, ["add", "-u"]);
       const msg = `mycelium: upgrade ${res.fixed.length} vulnerable package(s)${verifyFailed ? " [build failing]" : ""}\n\n${res.fixed.map((f) => `- ${f}`).join("\n")}`;
       gitOrThrow(path, ["commit", "-q", "-m", msg]);
       committedRepos.push(repo);
-      log(`committed on ${branch}`);
+      log(`committed on ${b}`);
     }
     res.committed = committedRepos.length > 0;
 
@@ -360,7 +380,7 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
     if (opts.pr && !verifyFailed) {
       for (const repo of committedRepos) {
         try {
-          res.prs.push(openPr(repo, branch, wt.get(repo)!.target, plan, res, log, wt.get(repo)!.path));
+          res.prs.push(openPr(repo, wt.get(repo)!.branch, wt.get(repo)!.target, plan, res, log, wt.get(repo)!.path));
         } catch (e) {
           log(`✗ PR not opened for ${repo}: ${(e as Error).message.split("\n")[0]}`);
         }
@@ -372,11 +392,11 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
       log("nothing changed: no branch left behind");
     }
   } finally {
-    for (const [repo, { path }] of wt) {
+    for (const [repo, { path, branch: b }] of wt) {
       git(repo, ["worktree", "remove", "--force", path]);
       rmSync(tempRoot(path), { recursive: true, force: true }); // symlinks to sibling folders are unlinked, not followed
       // Only after the worktree is gone can its branch be deleted (git refuses while it's checked out).
-      if (!res.committed || res.branch === null) git(repo, ["branch", "-D", branch]);
+      if (!committedRepos.includes(repo)) git(repo, ["branch", "-D", b]);
     }
   }
   return res;
