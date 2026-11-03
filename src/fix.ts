@@ -245,7 +245,7 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
       continue;
     }
     // One stray folder (a backup copy, an unversioned experiment) shouldn't block every other repo in the project.
-    res.skipped.push({ fix: fx, reason: `${relative(fx.projectPath, dir) || dir} isn't in a git repo: fixes need git so they can be reviewed and undone` });
+    res.skipped.push({ fix: fx, human: true, reason: `${relative(fx.projectPath, dir) || dir} isn't in a git repo: fixes need git so they can be reviewed and undone` });
     todo.splice(i, 1);
   }
   const noGit = [...new Set(res.skipped.filter((s) => s.reason.includes("isn't in a git repo")).map((s) => s.reason.split(" isn't")[0]))];
@@ -284,11 +284,17 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
       }
       if (opts.pr && def) {
         target = /^[0-9a-f]{40}$/.test(current) || !git(repo, ["ls-remote", "--heads", "origin", current]) ? def : current;
+        // A branch with nothing beyond the default is already merged: a PR into it would never reach what you ship.
+        if (target !== def && git(repo, ["fetch", "-q", "origin", def, target]) !== null &&
+            git(repo, ["rev-list", "--count", `origin/${def}..origin/${target}`]) === "0") {
+          log(`PR mode: ${target} has nothing that isn't already on ${def}, so the PR goes into ${def}`);
+          target = def;
+        }
         if (git(repo, ["fetch", "-q", "origin", target]) === null || !git(repo, ["rev-parse", "--verify", "-q", `origin/${target}`])) {
           throw new Error(`couldn't fetch origin/${target} from GitHub`);
         }
         base = start = `origin/${target}`;
-        if (target !== current) log(`PR mode: ${current} isn't on GitHub, so the PR goes into ${target} and is built on origin/${target}`);
+        if (target !== current) log(`PR mode: not using ${current}, so the PR goes into ${target} and is built on origin/${target}`);
         else {
           const ahead = Number(git(repo, ["rev-list", "--count", `${start}..HEAD`]) ?? 0);
           const behind = Number(git(repo, ["rev-list", "--count", `HEAD..${start}`]) ?? 0);
@@ -624,6 +630,18 @@ function applyNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string)
       : yarnBerry(dir) ? ["install", "--mode=update-lockfile"]
       : ["install", "--ignore-scripts", "--non-interactive"];
     const first = run(manager, args, dir);
+    if (first.ok && manager === "pnpm") {
+      // pnpm can treat a lockfile as current while it still pins a version the override excludes (vite@7.3.0 under
+      // vite@^7 → ^7.3.7), and neither `install` nor `update` moves it. Only a fresh resolve does. Verify then checks it.
+      const lockPath = join(dir, lock);
+      const stuck = fxs.filter((f) => f.strategy === "override" && pnpmLockHas(safeRead(lockPath) ?? "", f.name, f.from));
+      if (stuck.length) {
+        rmSync(lockPath, { force: true });
+        const fresh = run(manager, args, dir);
+        if (!fresh.ok) fail(`${manager} ${args.join(" ")} (fresh lockfile) failed:\n${fresh.output.slice(-1500)}`);
+        log(`pnpm: regenerated ${lock} from scratch: the override didn't move ${stuck.map((f) => `${f.name}@${f.from}`).join(", ")}, so every package was re-resolved within its range`);
+      }
+    }
     if (first.ok) {
       // After released entries are re-added, npm's lock-only pass can leave their own dependencies out
       // (cityPassport: "Missing: jsonfile@6.2.1 from lock file", so `npm ci` refuses it). A second pass fills them in.
@@ -646,6 +664,11 @@ function applyNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string)
     }
     return fail(`${manager} ${args.join(" ")} failed:\n${first.output.slice(-1500)}`);
   }
+}
+
+/** Is this exact version an entry in a pnpm lockfile? */
+export function pnpmLockHas(text: string, name: string, version: string): boolean {
+  return new RegExp(`^  '?${escapeRe(name)}@${escapeRe(version)}['(:]`, "m").test(text);
 }
 
 /** Does the untouched package.json + lockfile already fail strict peer resolution? (Checked in a temp copy.) */

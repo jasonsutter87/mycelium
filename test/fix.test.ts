@@ -144,3 +144,13 @@ test("ignored folders are left out of a scan, including when nested inside a pro
     setIgnored([]);
   }
 });
+
+test("pnpmLockHas: matches an exact lock entry, not a similar one", async () => {
+  const { pnpmLockHas } = await import("../src/fix.ts");
+  const lock = "packages:\n\n  vite@7.3.0:\n    resolution: {}\n  '@scope/pkg@1.2.3':\n    resolution: {}\nsnapshots:\n\n  rollup@4.1.0(foo@1.0.0):\n    dependencies: {}\n";
+  assert.ok(pnpmLockHas(lock, "vite", "7.3.0"));
+  assert.ok(pnpmLockHas(lock, "@scope/pkg", "1.2.3"));
+  assert.ok(pnpmLockHas(lock, "rollup", "4.1.0"), "snapshot key with peers");
+  assert.ok(!pnpmLockHas(lock, "vite", "7.3.7"));
+  assert.ok(!pnpmLockHas(lock, "foo", "1.0.0"), "a peer in parentheses isn't an entry");
+});
