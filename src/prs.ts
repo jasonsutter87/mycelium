@@ -154,7 +154,8 @@ export function projectPrs(db: DatabaseSync, projectPath: string): PullStatus[] 
       out.push({ pr, needsPull: false, ready: false });
       continue;
     }
-    const pulled = p.merge_oid && git(p.repo, ["merge-base", "--is-ancestor", p.merge_oid, "HEAD"]) !== null;
+    const pulled = p.merge_oid && (git(p.repo, ["merge-base", "--is-ancestor", p.merge_oid, "HEAD"]) !== null ||
+      git(p.repo, ["merge-base", "--is-ancestor", p.merge_oid, `refs/heads/${p.base}`]) !== null);
     if (pulled) continue; // done: nothing to show
     out.push({ pr, needsPull: true, ...pullCheck(p.repo, p.base) });
   }
@@ -193,6 +194,17 @@ function pullCheck(repo: string, base: string): { ready: boolean; reason?: strin
   return { ready: true, mode: ahead ? "rebase" : "ff" };
 }
 
+/** The folder (worktree) of this repo that has `branch` checked out, if any. */
+function worktreeOn(repo: string, branch: string): string | null {
+  const out = git(repo, ["worktree", "list", "--porcelain"]) ?? "";
+  let path = "";
+  for (const line of out.split("\n")) {
+    if (line.startsWith("worktree ")) path = line.slice(9);
+    else if (line === `branch refs/heads/${branch}` && existsSync(path)) return path;
+  }
+  return null;
+}
+
 function mergesCleanly(repo: string, file: string, theirsRev: string): boolean {
   const dir = mkdtempSync(join(tmpdir(), "mycelium-merge-"));
   try {
@@ -222,10 +234,23 @@ export function pullProject(db: DatabaseSync, projectPath: string): { pulled: st
   const res = { pulled: [] as string[], refused: [] as string[] };
   const done = new Set<string>();
   for (const s of projectPrs(db, projectPath).filter((x) => x.needsPull)) {
-    const { repo, base } = s.pr;
-    if (done.has(repo)) continue;
-    done.add(repo);
+    let { repo, base } = s.pr;
+    // Folders that are worktrees of one repo share branches: handle each repo + base once.
+    const common = git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]) ?? repo;
+    if (done.has(`${common}|${base}`)) continue;
+    done.add(`${common}|${base}`);
     git(repo, ["fetch", "-q", "origin", base]);
+    // Is <base> checked out in some folder? Pull there. If not, fast-forward the branch itself, no checkout needed.
+    const holder = worktreeOn(repo, base);
+    if (holder) repo = holder;
+    else if (git(repo, ["rev-parse", "--verify", "-q", `refs/heads/${base}`])) {
+      const ahead = Number(git(repo, ["rev-list", "--count", `origin/${base}..refs/heads/${base}`]) ?? 0);
+      const elsewhere = git(repo, ["branch", "--show-current"]) || "a detached HEAD";
+      if (ahead) res.refused.push(`${basename(repo)}: local ${base} has ${ahead} unpushed commit(s) and isn't checked out anywhere: check it out and pull it yourself`);
+      else if (git(repo, ["fetch", "-q", "origin", `${base}:${base}`]) === null) res.refused.push(`${basename(repo)}: couldn't fast-forward ${base}`);
+      else res.pulled.push(`${basename(repo)}: updated your local ${base} (not checked out in any folder). This folder is on ${elsewhere}: merge ${base} into it when you want the fix there`);
+      continue;
+    }
     const check = pullCheck(repo, base);
     if (!check.ready) {
       res.refused.push(`${basename(repo)}: ${check.reason}`);
