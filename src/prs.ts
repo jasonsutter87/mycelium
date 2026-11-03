@@ -2,6 +2,8 @@
 // and whether pulling it into your folder is safe. Never pulls on its own; `pull` is an explicit action.
 
 import { execFile, execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 
 const execFileP = promisify(execFile);
@@ -159,39 +161,86 @@ export function projectPrs(db: DatabaseSync, projectPath: string): PullStatus[] 
   return out;
 }
 
-/** Is `git merge --ff-only origin/<base>` safe in this folder right now? */
-function pullCheck(repo: string, base: string): { ready: boolean; reason?: string } {
+/**
+ * Can we bring origin/<base> into this folder without anyone resolving conflicts?
+ * - nothing local → fast-forward
+ * - unpushed local commits → rebase them on top, only if git's merge says they don't conflict with the update
+ * - uncommitted edits in files the update touches → stash/re-apply, only if each file merges cleanly
+ * Anything else is refused with the reason. Your edits and commits are never dropped.
+ */
+function pullCheck(repo: string, base: string): { ready: boolean; reason?: string; mode?: "ff" | "rebase" } {
   const branch = git(repo, ["branch", "--show-current"]);
   if (branch !== base) return { ready: false, reason: `you're on ${branch || "a detached HEAD"}; the PR merged into ${base}` };
-  // Uncommitted edits are fine: a fast-forward that would touch an edited file is refused by git itself.
-  if (!git(repo, ["rev-parse", "--verify", "-q", `origin/${base}`])) return { ready: false, reason: `origin/${base} not fetched yet: click Rescan` };
-  const ahead = Number(git(repo, ["rev-list", "--count", `origin/${base}..HEAD`]) ?? 0);
-  if (ahead) return { ready: false, reason: `local ${base} has ${ahead} unpushed commit(s); pull/rebase it yourself` };
-  return { ready: true };
+  const up = `origin/${base}`;
+  if (!git(repo, ["rev-parse", "--verify", "-q", up])) return { ready: false, reason: `${up} not fetched yet: click Rescan` };
+  if (git(repo, ["rev-parse", "-q", "--verify", "REBASE_HEAD"]) || git(repo, ["rev-parse", "-q", "--verify", "MERGE_HEAD"])) {
+    return { ready: false, reason: "a merge or rebase is already in progress here: finish it first" };
+  }
+  const ahead = Number(git(repo, ["rev-list", "--count", `${up}..HEAD`]) ?? 0);
+  // What the folder's committed state will be after the pull.
+  let result = up;
+  if (ahead) {
+    const tree = git(repo, ["merge-tree", "--write-tree", "HEAD", up]); // exits non-zero on conflicts
+    if (!tree) return { ready: false, reason: `your ${ahead} unpushed commit(s) conflict with the update: pull --rebase and resolve it yourself` };
+    result = tree.split("\n")[0];
+  }
+  // Uncommitted edits: each touched file must merge cleanly (yours vs. HEAD vs. the result).
+  const dirty = (git(repo, ["diff", "--name-only", "HEAD"]) ?? "").split("\n").filter(Boolean);
+  const changed = new Set((git(repo, ["diff", "--name-only", "HEAD", result]) ?? "").split("\n").filter(Boolean));
+  for (const f of dirty.filter((f) => changed.has(f))) {
+    if (!mergesCleanly(repo, f, result)) return { ready: false, reason: `your uncommitted edits to ${f} conflict with the update: commit or stash them, then pull` };
+  }
+  return { ready: true, mode: ahead ? "rebase" : "ff" };
 }
 
-/** The ⬇ Pull button: re-check safety, fast-forward only, rescan the project. */
+function mergesCleanly(repo: string, file: string, theirsRev: string): boolean {
+  const dir = mkdtempSync(join(tmpdir(), "mycelium-merge-"));
+  try {
+    const show = (rev: string) => {
+      try {
+        return execFileSync("git", ["show", `${rev}:${file}`], { cwd: repo, stdio: ["ignore", "pipe", "ignore"], maxBuffer: 256 << 20 });
+      } catch {
+        return null;
+      }
+    };
+    const base = show("HEAD"), theirs = show(theirsRev);
+    if (base === null || theirs === null || !existsSync(join(repo, file))) return false;
+    writeFileSync(join(dir, "base"), base);
+    writeFileSync(join(dir, "theirs"), theirs);
+    writeFileSync(join(dir, "mine"), readFileSync(join(repo, file)));
+    execFileSync("git", ["merge-file", "-q", "-p", join(dir, "mine"), join(dir, "base"), join(dir, "theirs")], { stdio: ["ignore", "ignore", "ignore"], maxBuffer: 256 << 20 });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** The ⬇ Pull button: re-check safety, then fast-forward (or rebase unpushed commits), keeping uncommitted edits. */
 export function pullProject(db: DatabaseSync, projectPath: string): { pulled: string[]; refused: string[] } {
   const res = { pulled: [] as string[], refused: [] as string[] };
+  const done = new Set<string>();
   for (const s of projectPrs(db, projectPath).filter((x) => x.needsPull)) {
     const { repo, base } = s.pr;
-    if (res.pulled.includes(repo)) continue;
+    if (done.has(repo)) continue;
+    done.add(repo);
     git(repo, ["fetch", "-q", "origin", base]);
     const check = pullCheck(repo, base);
     if (!check.ready) {
       res.refused.push(`${basename(repo)}: ${check.reason}`);
       continue;
     }
+    const args = check.mode === "rebase" ? ["rebase", "-q", "--autostash", `origin/${base}`] : ["merge", "--ff-only", "-q", "--autostash", `origin/${base}`];
     try {
-      execFileSync("git", ["merge", "--ff-only", "-q", `origin/${base}`], { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
     } catch (e: any) {
-      const why = String(e.stderr ?? "").includes("would be overwritten")
-        ? "the update touches files you've edited and haven't committed; commit or stash them, then pull"
-        : String(e.stderr ?? e.message).split("\n")[0];
-      res.refused.push(`${basename(repo)}: ${why}`);
+      if (check.mode === "rebase") git(repo, ["rebase", "--abort"]); // back to exactly where you were
+      const stashed = (git(repo, ["stash", "list"]) ?? "").includes("autostash");
+      res.refused.push(`${basename(repo)}: ${String(e.stderr ?? e.message).split("\n")[0]}` + (stashed ? " (your uncommitted edits are safe in `git stash list`)" : ""));
       continue;
     }
-    res.pulled.push(repo);
+    res.pulled.push(check.mode === "rebase" ? `${repo} (rebased your unpushed commits on top)` : repo);
   }
   if (res.pulled.length) saveProject(db, scanProject(projectPath));
   return res;
