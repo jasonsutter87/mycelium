@@ -8,9 +8,9 @@
 //   - Success is measured by re-reading the lockfiles, not by trusting that a command exited 0.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { findings, type Finding } from "./graph.ts";
 import { compareVersions, severityRank } from "./osv.ts";
@@ -252,7 +252,7 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
             (behind ? `${ahead ? ";" : ". Note:"} it's ${behind} commit(s) behind GitHub` : ""));
         }
       }
-      const path = join(mkdtempSync(join(tmpdir(), "mycelium-wt-")), "repo");
+      const path = worktreeDir(repo, "mycelium-wt-");
       gitOrThrow(repo, ["worktree", "add", "-b", branch, path, start]);
       wt.set(repo, { path, base, target });
       log(`working in a separate worktree on ${branch} (from ${start === "HEAD" ? base : start}); your checkout is untouched`);
@@ -374,7 +374,7 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
   } finally {
     for (const [repo, { path }] of wt) {
       git(repo, ["worktree", "remove", "--force", path]);
-      rmSync(dirname(path), { recursive: true, force: true });
+      rmSync(tempRoot(path), { recursive: true, force: true }); // symlinks to sibling folders are unlinked, not followed
       // Only after the worktree is gone can its branch be deleted (git refuses while it's checked out).
       if (!res.committed || res.branch === null) git(repo, ["branch", "-D", branch]);
     }
@@ -570,6 +570,63 @@ function installCommand(dir: string): string[] {
   return ["npm", "ci", "--no-audit", "--no-fund"];
 }
 
+/** Out-of-repo path dependencies (`path = "../../murmur/core"`, `"file:../lib"`), as paths relative to the repo root. */
+function outsidePaths(repo: string): string[] {
+  const out = new Set<string>();
+  const walk = (dir: string, depth: number) => {
+    if (depth > 6) return;
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      if (e.isDirectory()) {
+        if (!/^(node_modules|target|\.git|dist|build|\.next)$/.test(e.name)) walk(join(dir, e.name), depth + 1);
+        continue;
+      }
+      if (e.name !== "Cargo.toml" && e.name !== "package.json") continue;
+      const text = readFileSync(join(dir, e.name), "utf8");
+      const re = e.name === "Cargo.toml" ? /\bpath\s*=\s*"([^"]+)"/g : /"(?:file|link|portal):([^"]+)"/g;
+      for (const m of text.matchAll(re)) {
+        const rel = relative(repo, resolve(dir, m[1]));
+        if (rel.startsWith(".." + sep) && existsSync(resolve(dir, m[1]))) out.add(rel);
+      }
+    }
+  };
+  walk(repo, 0);
+  return [...out];
+}
+
+/**
+ * A temp folder for a worktree of `repo`, laid out so sibling path dependencies still resolve:
+ * the worktree sits deep enough that `../murmur/core` stays inside the temp folder, and a symlink there
+ * points at your real sibling folder (read-only use: cargo/npm just need to read its manifests).
+ */
+function worktreeDir(repo: string, prefix: string): string {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  let rels: string[] = [];
+  try {
+    rels = outsidePaths(repo);
+  } catch {
+    /* unreadable tree: just no links */
+  }
+  const ups = (rel: string) => rel.split(sep).findIndex((seg) => seg !== "..");
+  const depth = Math.max(1, ...rels.map(ups));
+  const path = join(root, ...Array(depth - 1).fill("up"), "repo");
+  mkdirSync(dirname(path), { recursive: true });
+  for (const rel of rels) {
+    const n = ups(rel), top = rel.split(sep).slice(0, n + 1).join(sep); // "../../murmur"
+    const link = resolve(path, top);
+    if (!existsSync(link)) {
+      mkdirSync(dirname(link), { recursive: true });
+      symlinkSync(resolve(repo, top), link);
+    }
+  }
+  return path;
+}
+
+function tempRoot(path: string): string {
+  let p = path;
+  while (dirname(p) !== p && !/^mycelium-(wt|base)-/.test(p.split(sep).pop()!)) p = dirname(p);
+  return dirname(p) === p ? dirname(path) : p;
+}
+
 function defaultBranch(repo: string): string {
   const r = run("gh", ["repo", "view", "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name"], repo, 60_000);
   if (!r.ok || !r.output.trim()) throw new Error(`gh: couldn't find the default branch: ${r.output.trim()}`);
@@ -578,7 +635,7 @@ function defaultBranch(repo: string): string {
 
 /** Runs `cmd` in a throwaway worktree of the base branch. true = it fails there too (pre-existing). */
 function failsOnBase(repo: string, base: string, relDir: string, cmd: string[], env: Record<string, string>, log: (s: string) => void): boolean {
-  const path = join(mkdtempSync(join(tmpdir(), "mycelium-base-")), "repo");
+  const path = worktreeDir(repo, "mycelium-base-");
   try {
     if (!git(repo, ["worktree", "add", "--detach", path, base])) return false;
     const dir = join(path, relDir);
@@ -593,7 +650,7 @@ function failsOnBase(repo: string, base: string, relDir: string, cmd: string[], 
     return !run(cmd[0], cmd.slice(1), dir, 15 * 60_000, env).ok;
   } finally {
     git(repo, ["worktree", "remove", "--force", path]);
-    rmSync(dirname(path), { recursive: true, force: true });
+    rmSync(tempRoot(path), { recursive: true, force: true });
   }
 }
 
