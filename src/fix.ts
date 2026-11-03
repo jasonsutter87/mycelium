@@ -117,7 +117,12 @@ function chooseStrategy(fx: PlannedFix): PlannedFix {
     case "npm": {
       const manifest = readJson(join(dir, "package.json"));
       const field = manifest && ["dependencies", "devDependencies", "optionalDependencies"].find((k) => manifest[k]?.[fx.name]);
-      if (fx.direct && field) return { ...fx, strategy: "bump-direct", note: fx.note + `set ${field}.${fx.name} to ^${fx.to}` };
+      // The manifest is the truth: npm refuses to override a package you declare yourself (EOVERRIDE), so a declared
+      // package on the same major line is bumped directly. A declared one on another major means this copy is nested.
+      const declared = field ? String(manifest[field][fx.name]).match(/\d+(\.\d+)*/)?.[0] : undefined;
+      if (field && (fx.direct || (declared && major(declared) === major(fx.from)))) {
+        return { ...fx, direct: true, strategy: "bump-direct", note: fx.note + `set ${field}.${fx.name} to ^${fx.to}` };
+      }
       const key = lock === "yarn.lock" ? fx.name : `${fx.name}@^${major(fx.from)}`;
       return { ...fx, strategy: "override", note: fx.note + `force ${key} → ^${fx.to} (transitive)` };
     }
@@ -580,6 +585,13 @@ function applyNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string)
   {
     const pkgPath = join(dir, "package.json");
     const original = { pkg: safeRead(pkgPath), lock: safeRead(join(dir, lock)) };
+    // A resolve that fails must leave nothing behind: half-edited manifests and released lock entries would
+    // otherwise be committed along with the fixes that did work.
+    const fail = (message: string): never => {
+      if (original.pkg !== null) writeFileSync(pkgPath, original.pkg);
+      if (original.lock !== null) writeFileSync(join(dir, lock), original.lock);
+      throw new Error(message);
+    };
     const manifest = readJson(pkgPath);
     if (!manifest) throw new Error(`no package.json in ${dir}`);
     const manager = lock === "pnpm-lock.yaml" ? "pnpm" : lock === "yarn.lock" ? "yarn" : "npm";
@@ -617,7 +629,7 @@ function applyNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string)
       // (cityPassport: "Missing: jsonfile@6.2.1 from lock file", so `npm ci` refuses it). A second pass fills them in.
       if (manager === "npm" && release.length) {
         const again = run(manager, args, dir);
-        if (!again.ok) throw new Error(`${manager} ${args.join(" ")} (second pass) failed:\n${again.output.slice(-1500)}`);
+        if (!again.ok) fail(`${manager} ${args.join(" ")} (second pass) failed:\n${again.output.slice(-1500)}`);
       }
       log(`${manager}: lockfile updated in ${dir}`);
       return false;
@@ -630,9 +642,9 @@ function applyNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string)
         log(`npm: lockfile updated with --legacy-peer-deps (the project's existing tree already has peer conflicts: ${errLine("x:\n" + first.output).slice(3)})`);
         return true;
       }
-      throw new Error(`${manager} ${args.join(" ")} --legacy-peer-deps failed:\n${second.output.slice(-1500)}`);
+      fail(`${manager} ${args.join(" ")} --legacy-peer-deps failed:\n${second.output.slice(-1500)}`);
     }
-    throw new Error(`${manager} ${args.join(" ")} failed:\n${first.output.slice(-1500)}`);
+    return fail(`${manager} ${args.join(" ")} failed:\n${first.output.slice(-1500)}`);
   }
 }
 

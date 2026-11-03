@@ -123,3 +123,24 @@ test("mergeRoots: scanning a folder adds to the remembered roots, never narrows 
   assert.deepEqual(mergeRoots([C], [C]), [C]);
   assert.deepEqual(mergeRoots([], ["/a"]), ["/a"]);
 });
+
+test("ignored folders are left out of a scan, including when nested inside a project", async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, realpathSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { findProjects, scanProject, setIgnored } = await import("../src/scan.ts");
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "myc-ignore-")));
+  const lock = JSON.stringify({ lockfileVersion: 3, packages: { "": { name: "x" }, "node_modules/left-pad": { version: "1.0.0" } } });
+  for (const d of ["real", "snap"]) {
+    mkdirSync(join(root, d));
+    writeFileSync(join(root, d, "package.json"), JSON.stringify({ name: d }));
+    writeFileSync(join(root, d, "package-lock.json"), lock);
+  }
+  setIgnored([join(root, "snap")]);
+  try {
+    assert.deepEqual(findProjects(root), [join(root, "real")], "not discovered as a project");
+    assert.deepEqual(scanProject(root).components.map((c) => c.path), ["real/package-lock.json"], "not walked inside a parent");
+  } finally {
+    setIgnored([]);
+  }
+});
