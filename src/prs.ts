@@ -169,7 +169,7 @@ export function projectPrs(db: DatabaseSync, projectPath: string): PullStatus[] 
  * - uncommitted edits in files the update touches → stash/re-apply, only if each file merges cleanly
  * Anything else is refused with the reason. Your edits and commits are never dropped.
  */
-function pullCheck(repo: string, base: string): { ready: boolean; reason?: string; mode?: "ff" | "rebase" } {
+function pullCheck(repo: string, base: string): { ready: boolean; reason?: string; mode?: "ff" | "rebase" | "merge" } {
   const branch = git(repo, ["branch", "--show-current"]);
   if (branch !== base) return { ready: false, reason: `you're on ${branch || "a detached HEAD"}; the PR merged into ${base}` };
   const up = `origin/${base}`;
@@ -191,7 +191,11 @@ function pullCheck(repo: string, base: string): { ready: boolean; reason?: strin
   for (const f of dirty.filter((f) => changed.has(f))) {
     if (!mergesCleanly(repo, f, result)) return { ready: false, reason: `your uncommitted edits to ${f} conflict with the update: commit or stash them, then pull` };
   }
-  return { ready: true, mode: ahead ? "rebase" : "ff" };
+  if (!ahead) return { ready: true, mode: "ff" };
+  // Rebase only commits that exist nowhere else. If any are already on GitHub (e.g. on main), rewriting them
+  // would duplicate history, so merge instead.
+  const unpublished = Number(git(repo, ["rev-list", "--count", "HEAD", "--not", "--remotes"]) ?? -1);
+  return { ready: true, mode: unpublished === ahead ? "rebase" : "merge" };
 }
 
 /** The folder (worktree) of this repo that has `branch` checked out, if any. */
@@ -256,16 +260,19 @@ export function pullProject(db: DatabaseSync, projectPath: string): { pulled: st
       res.refused.push(`${basename(repo)}: ${check.reason}`);
       continue;
     }
-    const args = check.mode === "rebase" ? ["rebase", "-q", "--autostash", `origin/${base}`] : ["merge", "--ff-only", "-q", "--autostash", `origin/${base}`];
+    const args = check.mode === "rebase" ? ["rebase", "-q", "--autostash", `origin/${base}`]
+      : check.mode === "merge" ? ["merge", "-q", "--no-edit", "--autostash", `origin/${base}`]
+      : ["merge", "--ff-only", "-q", "--autostash", `origin/${base}`];
     try {
       execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
     } catch (e: any) {
       if (check.mode === "rebase") git(repo, ["rebase", "--abort"]); // back to exactly where you were
+      if (check.mode === "merge") git(repo, ["merge", "--abort"]);
       const stashed = (git(repo, ["stash", "list"]) ?? "").includes("autostash");
       res.refused.push(`${basename(repo)}: ${String(e.stderr ?? e.message).split("\n")[0]}` + (stashed ? " (your uncommitted edits are safe in `git stash list`)" : ""));
       continue;
     }
-    res.pulled.push(check.mode === "rebase" ? `${repo} (rebased your unpushed commits on top)` : repo);
+    res.pulled.push(check.mode === "rebase" ? `${repo} (rebased your unpushed commits on top)` : check.mode === "merge" ? `${repo} (merged; your branch had commits GitHub's ${base} doesn't)` : repo);
   }
   if (res.pulled.length) saveProject(db, scanProject(projectPath));
   return res;
