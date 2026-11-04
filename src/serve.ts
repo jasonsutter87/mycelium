@@ -7,6 +7,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -41,7 +42,8 @@ function loadConfig() {
   const cfg = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : {};
   const e = process.env;
   if (e.GATEKEEP_ISSUER) cfg.auth = { issuer: e.GATEKEEP_ISSUER, clientId: e.GATEKEEP_CLIENT_ID || "mycelium", allowedEmails: (e.GATEKEEP_ALLOWED_EMAILS || "").split(",").map((s) => s.trim()).filter(Boolean) };
-  return { auth: cfg.auth ?? null, baseUrl: (e.MYCELIUM_BASE_URL ?? cfg.baseUrl ?? null) as string | null, host: (e.MYCELIUM_HOST ?? cfg.host ?? "127.0.0.1") as string };
+  const repos = e.MYCELIUM_REPOS_DIR && e.MYCELIUM_REPOS_LIST ? { dir: e.MYCELIUM_REPOS_DIR, list: e.MYCELIUM_REPOS_LIST } : null;
+  return { repos, auth: cfg.auth ?? null, baseUrl: (e.MYCELIUM_BASE_URL ?? cfg.baseUrl ?? null) as string | null, host: (e.MYCELIUM_HOST ?? cfg.host ?? "127.0.0.1") as string };
 }
 
 export function serve(db: DatabaseSync, port: number) {
@@ -202,15 +204,29 @@ export function serve(db: DatabaseSync, port: number) {
       }
       if (p === "/api/refresh") {
         return await run("rescanning everything", async () => {
+          const warnings: string[] = [];
+          // Server clones exist only for Mycelium, so Rescan brings them up to date. Otherwise a merged PR looks
+          // unmerged until the nightly sync. On a laptop these are your working folders: those are never pulled here.
+          if (cfg.repos) {
+            try {
+              await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings=ExperimentalWarning", CLI, "sync", cfg.repos.dir, "--list", cfg.repos.list, "--pull-only"], { timeout: 15 * 60_000, maxBuffer: 1 << 24 });
+            } catch (e: any) {
+              const failed = String(e.stdout ?? "").split("\n").filter((l) => l.includes("✗"));
+              console.error("repo sync:", failed.join("\n") || e.message);
+              warnings.push(failed.length ? `${failed.length} repo(s) couldn't be updated and were scanned as they were.` : "Repos couldn't be updated, so they were scanned as they were.");
+            }
+          }
           scanRoots(db, JSON.parse(setting("roots") ?? "[]"));
-          await checkAll(db);
-          await enrich(db);
+          await checkAll(db); // fatal on failure: acting on a partial answer would clear findings that still apply
+          // License and latest-version data is extra. Findings are saved by now, so losing it shouldn't fail the rescan.
+          try { await enrich(db); } catch (e) { warnings.push(`License and version data not updated: ${(e as Error).message}`); }
           await syncPrs(db);
-          return { ok: true };
+          return { ok: true, warnings };
         });
       }
       send(res, 404, { error: "not found" });
     } catch (e) {
+      console.error(`${req.method} ${req.url} failed:`, e);
       send(res, 400, { error: (e as Error).message });
     }
   });

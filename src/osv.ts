@@ -3,6 +3,7 @@
 
 import type { DatabaseSync } from "node:sqlite";
 import { tx } from "./db.ts";
+import { fetchRetry } from "./net.ts";
 
 const API = "https://api.osv.dev/v1";
 const BATCH = 1000; // OSV querybatch limit
@@ -22,7 +23,7 @@ export interface NewFinding {
 
 async function postJson(url: string, body: unknown): Promise<any> {
   for (let attempt = 0; ; attempt++) {
-    const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const res = await fetchRetry(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     if (res.ok) return res.json();
     if (attempt >= 3 || res.status < 500) throw new Error(`OSV ${res.status}: ${await res.text()}`);
     await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
@@ -31,7 +32,7 @@ async function postJson(url: string, body: unknown): Promise<any> {
 
 async function getJson(url: string): Promise<any> {
   for (let attempt = 0; ; attempt++) {
-    const res = await fetch(url);
+    const res = await fetchRetry(url);
     if (res.ok) return res.json();
     if (res.status === 404) return null;
     if (attempt >= 3) throw new Error(`OSV ${res.status} for ${url}`);

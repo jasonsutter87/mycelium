@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { errLine, prBody, type FixPlan, type PlannedFix } from "../src/fix.ts";
+import { errLine, ignoredOverrides, npmLockHas, prBody, prTitle, type FixPlan, type PlannedFix } from "../src/fix.ts";
 
 const fx = (over: Partial<PlannedFix>): PlannedFix => ({
   project: "app", projectPath: "/r/app", component: "package-lock.json", ecosystem: "npm", name: "next", from: "16.1.1",
@@ -245,4 +245,24 @@ test("sync: reads GitHub remotes without keeping credentials, and folder names d
   assert.equal(githubSlug("https://gitlab.com/a/b.git"), null);
   assert.deepEqual([...cloneDirs(["a/one", "b/two"]).values()], ["one", "two"]);
   assert.deepEqual([...cloneDirs(["a/same", "b/Same"]).values()], ["a__same", "b__Same"]);
+});
+
+test("npmLockHas finds nested copies and only exact versions", () => {
+  const lock = JSON.stringify({ packages: { "": {}, "node_modules/a": { version: "2.0.0" }, "node_modules/b/node_modules/a": { version: "1.0.0" }, "node_modules/x-a": { version: "1.0.0" } } });
+  assert.equal(npmLockHas(lock, "a", "1.0.0"), true);
+  assert.equal(npmLockHas(lock, "a", "3.0.0"), false);
+  assert.equal(npmLockHas("not json", "a", "1.0.0"), false);
+});
+
+test("an override npm ignored is reported; a bump that left a nested copy isn't an override", () => {
+  const lock = JSON.stringify({ packages: { "node_modules/core": { version: "2.0.0" }, "node_modules/p/node_modules/core": { version: "1.0.0" } } });
+  const stuck = fx({ name: "core", from: "1.0.0", strategy: "override" });
+  assert.deepEqual(ignoredOverrides(lock, [stuck, fx({ name: "core", from: "1.0.0", strategy: "bump-direct" }), fx({ name: "gone", from: "1.0.0", strategy: "override" })]), [stuck]);
+});
+
+test("PR title counts what was fixed, not what was attempted", () => {
+  const zod = fx({ name: "zod", from: "3.25.76", severity: "HIGH" });
+  const ftp = fx({ name: "basic-ftp", from: "5.3.1", severity: "CRITICAL" });
+  assert.equal(prTitle([zod, ftp], ["basic-ftp@5.3.1 (package-lock.json)"]), "Mycelium: upgrade 1 vulnerable package (high: zod)");
+  assert.equal(prTitle([zod, ftp], []), "Mycelium: upgrade 2 vulnerable packages (critical: basic-ftp)");
 });

@@ -16,6 +16,8 @@ Environment=MYCELIUM_HOST=127.0.0.1 MYCELIUM_BASE_URL=https://jason-server.taild
 # Sign-in: passkeys through Gatekeep. Mycelium refuses to start on that https address without it.
 Environment=GATEKEEP_ISSUER=https://id.gatekeepauth.com GATEKEEP_CLIENT_ID=mycelium
 Environment=GATEKEEP_ALLOWED_EMAILS=jasonsutter87@gmail.com
+# Rescan pulls these clones first, the same ones sync.service keeps fresh overnight.
+Environment=MYCELIUM_REPOS_DIR=%h/mycelium-repos MYCELIUM_REPOS_LIST=%h/.config/mycelium/repos.txt
 Environment=CI=1 PATH=%h/.local/opt/node22/bin:%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]

@@ -51,9 +51,10 @@ async function sync(dir?: string) {
   const target = resolve(dir);
   const r = syncRepos(target, readRepoList(list), (s) => console.log(c.dim(s)));
   console.log(`${r.cloned.length} cloned, ${r.updated.length} updated, ${r.failed.length} failed.`);
+  if (r.failed.length) process.exitCode = 1;
+  if (flags.has("--pull-only")) return; // the dashboard's Rescan does its own scan and check
   scan([target]);
   await checkAll(db);
-  if (r.failed.length) process.exitCode = 1;
 }
 
 /** Live with a reviewed finding for now: named projects, the advisories it has today, a reason, an expiry. */

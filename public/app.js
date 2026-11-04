@@ -481,11 +481,14 @@ $("rescan").onclick = async () => {
   const b = $("rescan");
   b.disabled = true; b.textContent = "Rescanning…";
   try {
-    await api("/api/refresh", {});
+    const out = await api("/api/refresh", {});
     state.tabs = {};
     await refresh();
-    banner("Rescan finished.");
-    setTimeout(() => banner(""), 4000);
+    if (out?.warnings?.length) banner(`Rescan finished. ${out.warnings.join(" ")}`, true);
+    else {
+      banner("Rescan finished.");
+      setTimeout(() => banner(""), 4000);
+    }
   } catch (e) { banner(e.message, true); }
   b.textContent = "Rescan all";
   b.disabled = !!state.data?.busy;

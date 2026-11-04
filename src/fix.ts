@@ -404,6 +404,7 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
             log(`${entry.preexisting ? "≈" : "✗"} ${inst.join(" ")}${entry.preexisting ? " (fails the same way before the fix: an environment issue, not this change)" : ""}`);
             continue; // can't build without dependencies
           }
+          res.verify.push({ dir: absDir, command: inst.join(" "), ok: true, output: "" });
         }
         const cmds = verifyCommands(dir);
         if (!cmds.length) log(`no build/test script found in ${relative(wt.get(repo)!.path, dir) || "."}: nothing to verify`);
@@ -504,9 +505,7 @@ function openPr(repo: string, branch: string, target: string, plan: FixPlan, res
   writeFileSync(bodyFile, prBody(plan, res, repo));
   const inRepo = (fx: PlannedFix) => join(fx.projectPath, fx.component).startsWith(repo + "/");
   const fixedHere = res.applied.filter(inRepo);
-  const worst = [...fixedHere].sort((a, b) => severityRank(b.severity) - severityRank(a.severity))[0];
-  const title = `Mycelium: upgrade ${fixedHere.length} vulnerable package${fixedHere.length === 1 ? "" : "s"}` +
-    (worst ? ` (${worst.severity.toLowerCase()}: ${worst.name})` : "");
+  const title = prTitle(fixedHere, res.stillVulnerable);
   const r = run("gh", ["pr", "create", "--base", base, "--head", branch, "--title", title, "--body-file", bodyFile], repo, 120_000);
   if (!r.ok) throw new Error(r.output.trim());
   const url = r.output.trim().split("\n").filter((l) => l.startsWith("https://")).at(-1) ?? r.output.trim();
@@ -538,6 +537,7 @@ export function prBody(plan: FixPlan, res: Pick<ApplyResult, "applied" | "stillV
   // Only this repo's checks: a multi-repo project (VeilSuite) used to list every repo's results in every PR.
   const checks = res.verify.filter((v) => !repo || v.dir === repo || v.dir.startsWith(repo + "/"));
   if (!checks.length) lines.push("Build/test was not run. Please run the app before merging.");
+  else if (checks.every((v) => /^\S+ (ci|install)\b/.test(v.command))) lines.push("Dependencies install cleanly, but this project has no build or test script, so nothing ran the code. Please run the app before merging.", "");
   for (const v of checks) {
     lines.push(`- ${v.ok ? "✅" : v.preexisting ? "⚠️" : "❌"} \`${v.command}\`${v.baseBroken ? ": fails, but couldn't be compared: the base branch doesn't even install. Please check this one by hand" : v.preexisting ? ": fails identically on the base branch, so it's pre-existing and not caused by these upgrades" : ""}`);
   }
@@ -586,8 +586,107 @@ function explain(fx: PlannedFix, raw: string): string {
   return raw;
 }
 
-/** Returns true when the lockfile had to be resolved with --legacy-peer-deps (the project already needed it). */
+/** Is this exact version anywhere in a package-lock.json, top-level or nested? */
+export function npmLockHas(text: string, name: string, version: string): boolean {
+  try {
+    return Object.entries<any>(JSON.parse(text).packages ?? {}).some(([k, v]) => k.endsWith(`node_modules/${name}`) && v?.version === version);
+  } catch {
+    return false;
+  }
+}
+
+/** The override fixes npm accepted but didn't act on: the old version is still in the lockfile. */
+export function ignoredOverrides(lockText: string, fxs: PlannedFix[]): PlannedFix[] {
+  return fxs.filter((f) => f.strategy === "override" && npmLockHas(lockText, f.name, f.from));
+}
+
+export function prTitle(fixedHere: PlannedFix[], stillVulnerable: string[]): string {
+  const still = new Set(stillVulnerable.map((s) => s.split(" ")[0]));
+  const done = fixedHere.filter((f) => !still.has(`${f.name}@${f.from}`));
+  const worst = [...done].sort((a, b) => severityRank(b.severity) - severityRank(a.severity))[0];
+  return `Mycelium: upgrade ${done.length} vulnerable package${done.length === 1 ? "" : "s"}` + (worst ? ` (${worst.severity.toLowerCase()}: ${worst.name})` : "");
+}
+
+let installedNpmMajor: string | undefined;
+/** The command for a given npm major: the installed npm when it matches, otherwise that version through npx. */
+function npmAt(major: string): string[] {
+  installedNpmMajor ??= run("npm", ["--version"], tmpdir(), 30_000).output.trim().split(".")[0];
+  return installedNpmMajor === major ? ["npm"] : ["npx", "--yes", `npm@${major}`];
+}
+
+/**
+ * npm versions disagree about the same overrides. npm 11 applies some that npm 10 ignores, and each refuses the other's
+ * lockfile in `npm ci` (lighthouse-sweep, ProjectPulse). So every lockfile is resolved with npm 10, whichever npm this
+ * machine has, because npm 11 accepts that result; and it's checked against both before it's kept.
+ */
+const resolverNpm = () => npmAt("10");
+
+/** Would `npm ci` accept this package.json + lockfile, on npm 10 and on npm 11? */
+function npmCiProblem(dir: string, legacy: boolean): string | null {
+  const args = ["ci", "--dry-run", "--ignore-scripts", "--no-audit", "--no-fund", ...(legacy ? ["--legacy-peer-deps"] : [])];
+  for (const major of ["10", "11"]) {
+    const [cmd, ...pre] = npmAt(major);
+    const r = run(cmd, [...pre, ...args], dir, 5 * 60_000);
+    // A failure to fetch that npm says nothing about the lockfile. Only npm's own verdict on the files counts.
+    if (!r.ok && /EUSAGE|ERESOLVE/.test(r.output)) return `npm ${major}: ${r.output.match(/(?:Invalid|Missing): [^\n]+/)?.[0] ?? errLine(r.output)}`;
+  }
+  return null;
+}
+
+/** Same check on the untouched files, in a temp copy, to tell "we broke it" from "it was already like this". */
+function npmCiProblemBefore(dir: string, pkg: string, lock: string, legacy: boolean): string | null {
+  const tmp = mkdtempSync(join(tmpdir(), "mycelium-ci-"));
+  try {
+    writeFileSync(join(tmp, "package.json"), pkg);
+    writeFileSync(join(tmp, "package-lock.json"), lock);
+    const rc = safeRead(join(dir, ".npmrc"));
+    if (rc) writeFileSync(join(tmp, ".npmrc"), rc);
+    return npmCiProblem(tmp, legacy);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Resolve, then keep only what npm actually honored. An override that didn't move its package does nothing except
+ * leave package.json disagreeing with the lockfile, which breaks `npm ci` on newer npm. Dropped fixes stay reported as
+ * not fixed (step 4 re-reads the lockfile). Nothing leaves here unless `npm ci` would accept it.
+ */
 function applyNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string) => void): boolean {
+  const pkgPath = join(dir, "package.json");
+  const lockPath = join(dir, lock);
+  const original = { pkg: safeRead(pkgPath), lock: safeRead(lockPath) };
+  const restore = () => {
+    if (original.pkg !== null) writeFileSync(pkgPath, original.pkg);
+    if (original.lock !== null) writeFileSync(lockPath, original.lock);
+  };
+  if (lock !== "package-lock.json") return resolveNpm(dir, lock, fxs, log);
+
+  let active = fxs;
+  let legacy = false;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    legacy = resolveNpm(dir, lock, active, log);
+    const ignored = ignoredOverrides(safeRead(lockPath) ?? "", active);
+    if (!ignored.length) break;
+    log(`npm ignored the override for ${ignored.map((f) => `${f.name}@${f.from}`).join(", ")}: taking it back out, so package.json matches the lockfile`);
+    active = active.filter((f) => !ignored.includes(f));
+    restore(); // from the top: moves made for a dropped override shouldn't stay in the tree
+    if (!active.length) return false;
+  }
+  const problem = npmCiProblem(dir, legacy);
+  if (problem) {
+    if (original.pkg && original.lock && npmCiProblemBefore(dir, original.pkg, original.lock, legacy)) {
+      log(`npm ci already refused this lockfile before the upgrade, and still does: ${problem}`);
+      return legacy;
+    }
+    restore();
+    throw new Error(`npm ci would refuse the upgraded lockfile, so it wasn't kept: ${problem}`);
+  }
+  return legacy;
+}
+
+/** Returns true when the lockfile had to be resolved with --legacy-peer-deps (the project already needed it). */
+function resolveNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string) => void): boolean {
   {
     const pkgPath = join(dir, "package.json");
     const original = { pkg: safeRead(pkgPath), lock: safeRead(join(dir, lock)) };
@@ -629,7 +728,9 @@ function applyNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string)
       : manager === "pnpm" ? ["install", "--lockfile-only", "--ignore-scripts"]
       : yarnBerry(dir) ? ["install", "--mode=update-lockfile"]
       : ["install", "--ignore-scripts", "--non-interactive"];
-    const first = run(manager, args, dir);
+    const [bin, ...pre] = manager === "npm" ? resolverNpm() : [manager];
+    const resolve = (a: string[]) => run(bin, [...pre, ...a], dir);
+    const first = resolve(args);
     if (first.ok && manager === "pnpm") {
       // pnpm can treat a lockfile as current while it still pins a version the override excludes (vite@7.3.0 under
       // vite@^7 → ^7.3.7), and neither `install` nor `update` moves it. Only a fresh resolve does. Verify then checks it.
@@ -637,7 +738,7 @@ function applyNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string)
       const stuck = fxs.filter((f) => f.strategy === "override" && pnpmLockHas(safeRead(lockPath) ?? "", f.name, f.from));
       if (stuck.length) {
         rmSync(lockPath, { force: true });
-        const fresh = run(manager, args, dir);
+        const fresh = resolve(args);
         if (!fresh.ok) fail(`${manager} ${args.join(" ")} (fresh lockfile) failed:\n${fresh.output.slice(-1500)}`);
         log(`pnpm: regenerated ${lock} from scratch: the override didn't move ${stuck.map((f) => `${f.name}@${f.from}`).join(", ")}, so every package was re-resolved within its range`);
       }
@@ -646,7 +747,7 @@ function applyNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string)
       // After released entries are re-added, npm's lock-only pass can leave their own dependencies out
       // (cityPassport: "Missing: jsonfile@6.2.1 from lock file", so `npm ci` refuses it). A second pass fills them in.
       if (manager === "npm" && release.length) {
-        const again = run(manager, args, dir);
+        const again = resolve(args);
         if (!again.ok) fail(`${manager} ${args.join(" ")} (second pass) failed:\n${again.output.slice(-1500)}`);
       }
       log(`${manager}: lockfile updated in ${dir}`);
@@ -655,7 +756,7 @@ function applyNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string)
     // Peer conflict: was the project already living with one before we touched it (lockfile made with
     // --legacy-peer-deps)? Then resolve the same way it always has. If the conflict is new, it's ours: fail.
     if (manager === "npm" && /ERESOLVE/.test(first.output) && original.pkg && original.lock && strictResolveFails(dir, original.pkg, original.lock)) {
-      const second = run(manager, [...args, "--legacy-peer-deps"], dir);
+      const second = resolve([...args, "--legacy-peer-deps"]);
       if (second.ok) {
         log(`npm: lockfile updated with --legacy-peer-deps (the project's existing tree already has peer conflicts: ${errLine("x:\n" + first.output).slice(3)})`);
         return true;
@@ -679,7 +780,8 @@ function strictResolveFails(dir: string, pkg: string, lock: string): boolean {
     writeFileSync(join(tmp, "package-lock.json"), lock);
     const rc = safeRead(join(dir, ".npmrc"));
     if (rc) writeFileSync(join(tmp, ".npmrc"), rc);
-    const r = run("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], tmp);
+    const [bin, ...pre] = resolverNpm();
+    const r = run(bin, [...pre, "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], tmp);
     return !r.ok && /ERESOLVE/.test(r.output);
   } finally {
     rmSync(tmp, { recursive: true, force: true });

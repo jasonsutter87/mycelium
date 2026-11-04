@@ -3,6 +3,7 @@
 
 import type { DatabaseSync } from "node:sqlite";
 import { tx } from "./db.ts";
+import { fetchRetry } from "./net.ts";
 
 const API = "https://api.deps.dev";
 const SYSTEM: Record<string, string> = { npm: "NPM", "crates.io": "CARGO", NuGet: "NUGET", PyPI: "PYPI", Go: "GO", Maven: "MAVEN" };
@@ -11,7 +12,7 @@ const STALE_DAYS = 7;
 
 async function post(url: string, body: unknown): Promise<any> {
   for (let attempt = 0; ; attempt++) {
-    const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const res = await fetchRetry(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     if (res.ok) return res.json();
     if (attempt >= 3 || (res.status < 500 && res.status !== 429)) throw new Error(`deps.dev ${res.status}: ${(await res.text()).slice(0, 200)}`);
     await new Promise((r) => setTimeout(r, 1500 * 2 ** attempt));
@@ -19,7 +20,7 @@ async function post(url: string, body: unknown): Promise<any> {
 }
 async function get(url: string): Promise<any> {
   for (let attempt = 0; ; attempt++) {
-    const res = await fetch(url);
+    const res = await fetchRetry(url);
     if (res.ok) return res.json();
     if (res.status === 404) return null;
     if (attempt >= 3) return null;
@@ -78,10 +79,17 @@ export async function enrich(db: DatabaseSync, log: (s: string) => void = () => 
     ON CONFLICT DO UPDATE SET latest = excluded.latest, latest_published = excluded.latest_published, fetched_at = excluded.fetched_at`);
   const rows: [string, string, string | null, string | null][] = [];
   let i = 0;
+  let skipped = 0;
   await Promise.all(Array.from({ length: 12 }, async () => {
     while (i < names.length) {
       const n = names[i++];
-      const j = await get(`${API}/v3/systems/${SYSTEM[n.ecosystem].toLowerCase()}/packages/${encodeURIComponent(n.name)}`);
+      let j: any;
+      try {
+        j = await get(`${API}/v3/systems/${SYSTEM[n.ecosystem].toLowerCase()}/packages/${encodeURIComponent(n.name)}`);
+      } catch {
+        skipped++; // no row saved, so the next run asks again
+        continue;
+      }
       const versions: any[] = j?.versions ?? [];
       const def = versions.find((v) => v.isDefault) ?? versions.at(-1);
       // "Last activity" = newest publish of any version (a maintained 1.x line counts as alive).
@@ -92,5 +100,6 @@ export async function enrich(db: DatabaseSync, log: (s: string) => void = () => 
   tx(db, () => {
     for (const r of rows) upLatest.run(...r, now);
   });
-  return { versions: need.length, latest: names.length };
+  if (skipped) log(`Couldn't fetch latest versions for ${skipped} of ${names.length} direct dependencies; will retry next run.`);
+  return { versions: need.length, latest: names.length, skipped };
 }
