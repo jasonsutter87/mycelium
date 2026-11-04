@@ -3,8 +3,8 @@
 #
 #   deploy/sr8.sh [branch]      push, install the service and daily sync, clone your repos, restart
 #
-# Needs on the server first: `gh auth login`, and a [clients.mycelium] entry in Gatekeep's clients.toml with
-# redirect URI https://jason-server.taildf1d89.ts.net:4444/auth/callback. This script checks and stops if not.
+# Needs first: `gh auth login` on the server, and the app registered in Gatekeep's control plane (not clients.toml,
+# which multi-tenant Gatekeep doesn't read for this). This script checks both and stops with the command if not.
 # Your repo list comes from this Mac (`mycelium repos`); the server keeps its own clones in ~/mycelium-repos.
 set -euo pipefail
 TARGET="jason@100.83.4.49"
@@ -13,7 +13,10 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$HERE"
 
 ssh "$TARGET" 'gh auth status >/dev/null 2>&1' || { echo "SR8 isn't signed in to GitHub. Run: ssh -t $TARGET gh auth login"; exit 1; }
-ssh "$TARGET" 'grep -q "^\[clients\.mycelium\]" ~/gatekeep/clients.toml' || { echo "Gatekeep doesn't know this app yet: add [clients.mycelium] to ~/gatekeep/clients.toml on SR8, then restart Gatekeep."; exit 1; }
+curl -fs -m 10 -o /dev/null -G https://id.gatekeepauth.com/authorize --data-urlencode client_id=mycelium --data-urlencode redirect_uri=https://jason-server.taildf1d89.ts.net:4444/auth/callback \
+  --data-urlencode response_type=code --data-urlencode scope=openid --data-urlencode state=x --data-urlencode nonce=x \
+  --data-urlencode code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM --data-urlencode code_challenge_method=S256 || {
+  echo "Gatekeep doesn't know this app yet. On SR8: docker exec gatekeep bun run src/tenancy/cli.ts app:set jason/production mycelium --name Mycelium --redirect https://jason-server.taildf1d89.ts.net:4444/auth/callback"; exit 1; }
 
 ssh "$TARGET" 'mkdir -p ~/repos && [ -d ~/repos/mycelium.git ] || git init --quiet --bare ~/repos/mycelium.git'
 git push --quiet "$TARGET:repos/mycelium.git" "$BRANCH:refs/heads/deploy" --force-with-lease=deploy 2>/dev/null || git push --quiet "$TARGET:repos/mycelium.git" "$BRANCH:refs/heads/deploy"
