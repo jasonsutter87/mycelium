@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="mycelium-token" content="__TOKEN__">
+<title>Mycelium</title>
+<link rel="icon" href="/favicon.svg"><link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><img src="/favicon.svg" alt="" width="22" height="22"><span>Mycelium</span></div>
+  <nav class="seg" id="views" aria-label="Views">
+    <button data-view="projects" class="on">Projects</button>
+    <button data-view="findings">Findings</button>
+    <button data-view="audit">Audit</button>
+    <button data-view="infra">Infrastructure</button>
+  </nav>
+  <div class="grow"></div>
+  <span class="top-note" id="checked"></span>
+  <button class="topbtn" id="rescan" title="Rescan every project and re-check advisories. Read-only for your repos.">Rescan all</button>
+  <button class="topbtn icon" id="theme" title="Switch light or dark" aria-label="Switch theme">◐</button>
+  <span class="top-note" id="user"></span>
+</header>
+<div class="banner" id="banner" role="status" hidden></div>
+<section class="stats" id="stats" aria-label="Summary"></section>
+<div class="workspace" id="workspace">
+  <main class="canvas" id="canvas"></main>
+  <aside class="inspector" id="inspector" hidden aria-label="Project details"></aside>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

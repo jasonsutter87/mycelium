@@ -350,11 +350,15 @@ async function fix(project: string) {
     if (plan.fixes.some((f) => f.strategy !== "manual")) console.log(c.dim(`\nApply with: mycelium fix ${project} --apply [--verify] [--pr] [--major]`));
     return;
   }
+  // --stream: machine-readable progress for the dashboard, which runs fixes as a separate process.
+  const stream = flags.has("--stream");
   const r = applyFixes(db, plan, {
     allowMajor: flags.has("--major"), verify: flags.has("--verify"),
     only: flagValue("--only")?.split(","), dryRun: flags.has("--dry-run"), pr: flags.has("--pr"),
+    ...(stream ? { onLog: (l: string) => console.log("@log " + l.split("\n")[0]) } : {}),
   });
-  printApply(r);
+  if (stream) console.log("@result " + JSON.stringify(r));
+  else printApply(r);
   if (r.applied.length && !flags.has("--dry-run")) {
     await checkAll(db);
     console.log(c.dim("\nRe-checked OSV. `mycelium projects` shows the new counts."));

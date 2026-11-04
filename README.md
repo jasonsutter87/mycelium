@@ -70,16 +70,29 @@ mycelium schedule          # daily scan + check with a macOS notification for an
 
 ## The dashboard
 
-`mycelium serve` serves a local page with every project as a card:
+`mycelium serve` opens the dashboard. The flow is **sign in → overview → Check → Fix → PR**:
 
-- open CVEs and audit issues per project, ranked
-- **🔧 Fix**: plan → choose what to apply (majors opt-in) → optionally **open a PR**
-- PR tracking: findings show *"fix in PR #12"* or *"merged in #12, pull to apply"*
-- **⬇ Pull**: fast-forwards your local branch after you merge, then rechecks. It only appears when that's safe.
-- **↻ Rescan**: re-scans all folders, refreshes advisories, license/deprecation data, and PR status
+- **Overview**: every project with its findings by severity. Search, filter by status (needs attention, clean, accepted, PRs open) or exposure, and sort any column either way.
+- **Check** is read-only: it re-reads the project's lockfiles and asks OSV. Nothing in your repo changes. **Fix stays locked until a check has run.**
+- **Fix** shows the pipeline live: Pull → Branch → Fix → Test → Commit → Push → PR. It runs in a throwaway copy, safe upgrades start ticked and majors opt-in, and nothing merges on its own.
+- **Pull** fast-forwards your folder after you merge, when that's safe.
+- **Findings, Audit, Infrastructure** tabs cover everything else, and **Rescan all** refreshes every project.
 
-It listens on `127.0.0.1` only, rejects unexpected `Host` headers (DNS rebinding), and requires a token
-on every API call, so no other website can press the buttons.
+It listens on `127.0.0.1` only, rejects unexpected `Host` headers (DNS rebinding), and requires a token on every API call, so no other website can press the buttons.
+
+### Sign-in (optional)
+
+Sign-in uses [Gatekeep](https://gatekeepauth.com). Register an app with redirect URI `<baseUrl>/auth/callback`, then add `~/.mycelium/config.json`:
+
+```json
+{
+  "baseUrl": "https://mycelium.example.com",
+  "host": "0.0.0.0",
+  "auth": { "issuer": "https://<gatekeep issuer>", "clientId": "mycelium", "allowedEmails": ["you@example.com"] }
+}
+```
+
+Mycelium refuses to listen on anything but this computer unless sign-in is configured.
 
 ---
 

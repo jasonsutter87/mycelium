@@ -172,3 +172,66 @@ test("acceptance: narrow on purpose (project, advisory, expiry), never for malic
   assert.ok(!acceptanceCovers({ ...rule, version: "0.18.5" }, { ...f, version: "0.19.0" }, "app", now), "version pin holds");
   assert.ok(!acceptanceCovers({ ...rule, vulnIds: ["MAL-1"] }, { ...f, vulnId: "MAL-1" }, "app", now), "malicious is never covered");
 });
+
+test("dashboard: engine log lines map to pipeline steps, and status reads open before accepted", async () => {
+  const { stepOf, statusOf } = await import("../src/dashboard.ts");
+  assert.equal(stepOf("PR mode: building on origin/main"), "pull");
+  assert.equal(stepOf("working in a separate worktree on mycelium/fix-1 (from origin/main); your checkout is untouched"), "branch");
+  assert.equal(stepOf("edited /tmp/x/package.json"), "fix");
+  assert.equal(stepOf("npm: lockfile updated in /tmp/x"), "fix");
+  assert.equal(stepOf("cargo-parent: zip 2 → 9"), "fix");
+  assert.equal(stepOf("✓ npm run build"), "verify");
+  assert.equal(stepOf("≈ npm test (fails the same way on origin/main: pre-existing, not caused by this fix)"), "verify");
+  assert.equal(stepOf("checking whether `npm test` already fails on origin/main…"), "verify");
+  assert.equal(stepOf("committed on mycelium/fix-1"), "commit");
+  assert.equal(stepOf("pushed mycelium/fix-1"), "push");
+  assert.equal(stepOf("opened PR https://github.com/a/b/pull/1 → main"), "pr");
+  assert.equal(stepOf("something else entirely"), null);
+  assert.equal(statusOf(2, 1), "attention");
+  assert.equal(statusOf(0, 1), "accepted");
+  assert.equal(statusOf(0, 0), "clean");
+});
+
+test("reposIn: finds a repo, or the repos nested in a folder that isn't one", async () => {
+  const { mkdtempSync, mkdirSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { reposIn } = await import("../src/dashboard.ts");
+  const root = mkdtempSync(join(tmpdir(), "myc-repos-"));
+  for (const d of ["a/.git", "b/inner/.git", "b/inner/nested/.git", "node_modules/x/.git", ".hidden/.git", "c/empty"]) mkdirSync(join(root, d), { recursive: true });
+  assert.deepEqual(reposIn(root).sort(), [join(root, "a"), join(root, "b/inner")].sort(), "stops at a repo; skips node_modules and dot folders");
+  assert.deepEqual(reposIn(join(root, "a")), [join(root, "a")]);
+  assert.deepEqual(reposIn(join(root, "c")), []);
+});
+
+test("downgrade hint: range checks and candidate picking stay conservative", async () => {
+  const { rangeAllows, pickCandidate, declaredRanges, parseVersion } = await import("../src/downgrade.ts");
+  assert.equal(rangeAllows("^4.2.2", "4.1.2"), false, "a parent needing 4.2.2 rejects 4.1.2");
+  assert.equal(rangeAllows("^4.2.2", "4.9.0"), true);
+  assert.equal(rangeAllows("^4.2.2", "5.0.0"), false);
+  assert.equal(rangeAllows("^0.3.1", "0.3.9"), true);
+  assert.equal(rangeAllows("^0.3.1", "0.4.0"), false);
+  assert.equal(rangeAllows("~1.2.3", "1.2.9"), true);
+  assert.equal(rangeAllows("~1.2.3", "1.3.0"), false);
+  assert.equal(rangeAllows(">=1.0.0 <2.0.0", "1.5.0"), true);
+  assert.equal(rangeAllows(">=1.0.0 <2.0.0", "2.0.0"), false);
+  assert.equal(rangeAllows("^1.0.0 || ^2.0.0", "2.1.0"), true);
+  assert.equal(rangeAllows("1.x", "1.9.0"), true);
+  assert.equal(rangeAllows("*", "1.0.0"), true);
+  assert.equal(rangeAllows("4.1.2", "4.1.2"), true);
+  assert.equal(rangeAllows("github:a/b", "1.0.0"), null, "a form we can't read is not a yes");
+  assert.equal(rangeAllows("1.0.0 - 2.0.0", "1.5.0"), null);
+  assert.equal(parseVersion("1.0.0-beta.1"), null);
+
+  const versions = ["4.0.0", "4.1.0", "4.1.2", "4.2.0", "4.3.1", "4.1.3-beta.1"];
+  assert.equal(pickCandidate(versions, ["4.2.0"]), "4.1.2", "newest stable below the introduction");
+  assert.equal(pickCandidate(versions, ["4.2.0", "4.1.0"]), "4.0.0", "below the earliest advisory");
+  assert.equal(pickCandidate(versions, ["0"]), null, "from the start: nothing older is clean");
+  assert.equal(pickCandidate(versions, ["0.0.0-0"]), null);
+  assert.equal(pickCandidate(versions, ["4.2.0", "0"]), null);
+  assert.equal(pickCandidate(versions, ["4.0.0"]), null, "nothing older exists");
+  assert.equal(pickCandidate(versions, []), null);
+
+  const lock = JSON.stringify({ packages: { "": { dependencies: { a: "^1.0.0" } }, "node_modules/b": { dependencies: { a: "^1.2.0" } }, "node_modules/c": { peerDependencies: { a: "*" } } } });
+  assert.deepEqual(declaredRanges(lock, "a").sort(), ["*", "^1.0.0", "^1.2.0"]);
+});
