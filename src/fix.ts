@@ -600,6 +600,21 @@ export function ignoredOverrides(lockText: string, fxs: PlannedFix[]): PlannedFi
   return fxs.filter((f) => f.strategy === "override" && npmLockHas(lockText, f.name, f.from));
 }
 
+/**
+ * npm 10 can ignore `name@^1` yet honor a plain `name`. But a plain key forces every copy, so it's only safe when
+ * nothing else in the tree sits on a different major: that would be dragged across a major nobody planned.
+ */
+export function plainOverrideSafe(lockText: string, fx: PlannedFix): boolean {
+  try {
+    const allowed = new Set([major(fx.from), major(fx.to!)]);
+    return Object.entries<any>(JSON.parse(lockText).packages ?? {})
+      .filter(([k, v]) => k.endsWith(`node_modules/${fx.name}`) && v?.version)
+      .every(([, v]) => allowed.has(major(v.version)));
+  } catch {
+    return false;
+  }
+}
+
 export function prTitle(fixedHere: PlannedFix[], stillVulnerable: string[]): string {
   const still = new Set(stillVulnerable.map((s) => s.split(" ")[0]));
   const done = fixedHere.filter((f) => !still.has(`${f.name}@${f.from}`));
@@ -664,12 +679,18 @@ function applyNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string)
 
   let active = fxs;
   let legacy = false;
-  for (let attempt = 0; attempt < 4; attempt++) {
-    legacy = resolveNpm(dir, lock, active, log);
+  const plain = new Set<string>();
+  for (let attempt = 0; attempt < 5; attempt++) {
+    legacy = resolveNpm(dir, lock, active, log, plain);
     const ignored = ignoredOverrides(safeRead(lockPath) ?? "", active);
     if (!ignored.length) break;
-    log(`npm ignored the override for ${ignored.map((f) => `${f.name}@${f.from}`).join(", ")}: taking it back out, so package.json matches the lockfile`);
-    active = active.filter((f) => !ignored.includes(f));
+    // First try the plain form where that's safe. What npm still ignores comes back out, so package.json matches the lockfile.
+    const retry = ignored.filter((f) => !plain.has(f.name) && plainOverrideSafe(safeRead(lockPath) ?? "", f));
+    const drop = ignored.filter((f) => !retry.includes(f));
+    if (retry.length) log(`npm ignored the versioned override for ${retry.map((f) => f.name).join(", ")}: trying a plain one`);
+    if (drop.length) log(`npm won't apply the override for ${drop.map((f) => `${f.name}@${f.from}`).join(", ")}: taking it back out`);
+    for (const f of retry) plain.add(f.name);
+    active = active.filter((f) => !drop.includes(f));
     restore(); // from the top: moves made for a dropped override shouldn't stay in the tree
     if (!active.length) return false;
   }
@@ -686,7 +707,7 @@ function applyNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string)
 }
 
 /** Returns true when the lockfile had to be resolved with --legacy-peer-deps (the project already needed it). */
-function resolveNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string) => void): boolean {
+function resolveNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: string) => void, plain = new Set<string>()): boolean {
   {
     const pkgPath = join(dir, "package.json");
     const original = { pkg: safeRead(pkgPath), lock: safeRead(join(dir, lock)) };
@@ -705,7 +726,7 @@ function resolveNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: strin
         const field = ["dependencies", "devDependencies", "optionalDependencies"].find((k) => manifest[k]?.[fx.name])!;
         manifest[field][fx.name] = `^${fx.to}`;
       } else {
-        const key = manager === "yarn" ? fx.name : `${fx.name}@^${major(fx.from)}`;
+        const key = manager === "yarn" || plain.has(fx.name) ? fx.name : `${fx.name}@^${major(fx.from)}`;
         const target =
           manager === "pnpm" ? ((manifest.pnpm ??= {}).overrides ??= {}) : manager === "yarn" ? (manifest.resolutions ??= {}) : (manifest.overrides ??= {});
         target[key] = `^${fx.to}`;

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { errLine, ignoredOverrides, npmLockHas, prBody, prTitle, type FixPlan, type PlannedFix } from "../src/fix.ts";
+import { errLine, ignoredOverrides, npmLockHas, plainOverrideSafe, prBody, prTitle, type FixPlan, type PlannedFix } from "../src/fix.ts";
 
 const fx = (over: Partial<PlannedFix>): PlannedFix => ({
   project: "app", projectPath: "/r/app", component: "package-lock.json", ecosystem: "npm", name: "next", from: "16.1.1",
@@ -265,4 +265,12 @@ test("PR title counts what was fixed, not what was attempted", () => {
   const ftp = fx({ name: "basic-ftp", from: "5.3.1", severity: "CRITICAL" });
   assert.equal(prTitle([zod, ftp], ["basic-ftp@5.3.1 (package-lock.json)"]), "Mycelium: upgrade 1 vulnerable package (high: zod)");
   assert.equal(prTitle([zod, ftp], []), "Mycelium: upgrade 2 vulnerable packages (critical: basic-ftp)");
+});
+
+test("a plain override is only safe when no copy sits on another major", () => {
+  const lock = (...v: string[]) => JSON.stringify({ packages: Object.fromEntries(v.map((x, i) => [`node_modules/p${i}/node_modules/core`, { version: x }])) });
+  const f = fx({ name: "core", from: "1.30.1", to: "2.8.0", strategy: "override" });
+  assert.equal(plainOverrideSafe(lock("1.30.1", "2.12.0"), f), true);
+  assert.equal(plainOverrideSafe(lock("1.30.1", "3.0.0"), f), false);
+  assert.equal(plainOverrideSafe("not json", f), false);
 });
