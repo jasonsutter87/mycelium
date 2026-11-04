@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Mycelium sync
+
+[Timer]
+OnCalendar=*-*-* 05:30:00
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

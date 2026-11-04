@@ -235,3 +235,14 @@ test("downgrade hint: range checks and candidate picking stay conservative", asy
   const lock = JSON.stringify({ packages: { "": { dependencies: { a: "^1.0.0" } }, "node_modules/b": { dependencies: { a: "^1.2.0" } }, "node_modules/c": { peerDependencies: { a: "*" } } } });
   assert.deepEqual(declaredRanges(lock, "a").sort(), ["*", "^1.0.0", "^1.2.0"]);
 });
+
+test("sync: reads GitHub remotes without keeping credentials, and folder names don't collide", async () => {
+  const { githubSlug, cloneDirs } = await import("../src/sync.ts");
+  assert.equal(githubSlug("https://github.com/a/b.git"), "a/b");
+  assert.equal(githubSlug("git@github.com:a/b.git"), "a/b");
+  assert.equal(githubSlug("https://github.com/a/b"), "a/b");
+  assert.equal(githubSlug("https://x:ghp_secret@github.com/a/b.git"), "a/b", "an embedded token never comes through");
+  assert.equal(githubSlug("https://gitlab.com/a/b.git"), null);
+  assert.deepEqual([...cloneDirs(["a/one", "b/two"]).values()], ["one", "two"]);
+  assert.deepEqual([...cloneDirs(["a/same", "b/Same"]).values()], ["a__same", "b__Same"]);
+});

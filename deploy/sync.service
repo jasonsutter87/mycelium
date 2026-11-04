@@ -1,0 +1,9 @@
+# Keeps the server's clones and advisories fresh without a person: see sync.timer.
+[Unit]
+Description=Mycelium: sync repos, scan, check
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/mycelium
+ExecStart=%h/.local/opt/node22/bin/node --experimental-strip-types --no-warnings=ExperimentalWarning src/cli.ts sync %h/mycelium-repos --list %h/.config/mycelium/repos.txt
+Environment=PATH=%h/.local/opt/node22/bin:%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin

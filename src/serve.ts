@@ -55,8 +55,10 @@ export function serve(db: DatabaseSync, port: number) {
 
   const cfg = loadConfig();
   const local = cfg.host === "127.0.0.1" || cfg.host === "localhost";
-  if (!cfg.auth && !local) throw new Error(`Refusing to listen on ${cfg.host} without sign-in: anyone who can reach it could run fixes. Configure auth in ~/.mycelium/config.json.`);
   const baseUrl = cfg.baseUrl ?? `http://mycelium.localhost:${port}`;
+  // A loopback bind behind a tunnel or `tailscale serve` is still reachable from elsewhere, so the public URL counts too.
+  const localUrl = /^http:\/\/([\w.-]*\.)?(localhost|127\.0\.0\.1)(:\d+)?\/?$/.test(baseUrl);
+  if (!cfg.auth && (!local || !localUrl)) throw new Error(`Refusing to serve ${local ? baseUrl : cfg.host} without sign-in: anyone who can reach it could run fixes. Configure auth in ~/.mycelium/config.json.`);
   const auth = cfg.auth ? createAuth(cfg.auth, baseUrl, join(homedir(), ".mycelium")) : null;
   const hosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`, `mycelium.localhost:${port}`, new URL(baseUrl).host]);
 
@@ -216,7 +218,7 @@ export function serve(db: DatabaseSync, port: number) {
   server.listen(port, cfg.host, () => {
     setImmediate(() => overview(db)); // warm the slow part, so the first page load is quick
     console.log(`🍄 Mycelium at ${baseUrl}/  ${auth ? "(sign-in on)" : "(this computer only)"}  (Ctrl-C to stop)`);
-    if (process.platform === "darwin" && local && !process.env.MYCELIUM_NO_OPEN) execFile("open", [baseUrl + "/"]);
+    if (process.platform === "darwin" && localUrl && !process.env.MYCELIUM_NO_OPEN) execFile("open", [baseUrl + "/"]);
   });
 }
 

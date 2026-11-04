@@ -123,7 +123,8 @@ export function projectDetail(db: DatabaseSync, name: string) {
   const packages = new Map<string, any>();
   for (const f of plan.fixes) {
     const k = `${f.name}@${f.from}`;
-    const kind = f.strategy === "manual" ? "manual" : f.breaking ? "major" : "auto";
+    // cargo-parent only works if a newer parent happens to exist, so it's an attempt, not a promise.
+    const kind = f.strategy === "manual" ? "manual" : f.strategy === "cargo-parent" ? "try" : f.breaking ? "major" : "auto";
     const e = packages.get(k) ?? { name: f.name, from: f.from, to: f.to, severity: f.severity, kind, note: f.note, vulns: [] as string[], lockfiles: [] as string[] };
     e.severity = worst(e.severity, f.severity);
     e.vulns = [...new Set([...e.vulns, ...f.vulns])];

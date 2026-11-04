@@ -289,7 +289,9 @@ function jobResultHtml(job) {
     if (r.verifyFailedRepos?.length) out += `<p class="warn">Build or tests broke, so no PR was opened. The branch was kept for you to look at.</p>`;
     for (const n of r.noPr ?? []) out += `<p class="warn">No PR: ${esc(n)}</p>`;
     if (r.verify?.length) out += `<p class="note">${r.verify.map((v) => `${v.ok ? "✓" : v.preexisting ? "≈" : "✗"} ${esc(v.command)}${!v.ok && v.preexisting ? " (already failing before this)" : ""}`).join("<br>")}</p>`;
-    if (!r.fixed?.length && !r.failed?.length && !r.stillVulnerable?.length) out += `<p class="note">Nothing changed.</p>`;
+    const stuck = (r.skipped ?? []).filter((x) => x.human);
+    if (stuck.length) out += `<div class="warn"><b>Can't be fixed from this repo yet:</b> ${stuck.map((x) => esc(x.fix.name)).filter((n, i, a) => a.indexOf(n) === i).join(", ")}. It's waiting on an upstream release, so nothing here is broken. If the risk is acceptable, record it: <span class="mono">mycelium accept &lt;package&gt; --project ${esc(job.project)} --reason "…"</span></div>`;
+    else if (!r.fixed?.length && !r.failed?.length && !r.stillVulnerable?.length) out += `<p class="note">Nothing changed.</p>`;
   }
   if (lines?.length) out += `<details ${job.state === "running" ? "open" : ""}><summary>Log (${lines.length})</summary><pre class="log" id="joblog">${esc(lines.join("\n").replace(/\S*\/mycelium-(?:wt|base)-\w+(?:\/up)*\/repo\/?/g, "(temp copy)/"))}</pre></details>`;
   return out;

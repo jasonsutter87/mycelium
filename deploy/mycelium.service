@@ -1,0 +1,22 @@
+# systemd *user* service, so fixes push and open PRs with your own git and gh logins.
+# Installed by deploy/sr8.sh to ~/.config/systemd/user/. Logs: journalctl --user -u mycelium -f
+[Unit]
+Description=Mycelium dashboard
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+WorkingDirectory=%h/mycelium
+ExecStart=%h/.local/opt/node22/bin/node --experimental-strip-types --no-warnings=ExperimentalWarning src/cli.ts serve --port 4700
+Restart=on-failure
+RestartSec=5
+# Loopback only. Reached at https://jason-server.taildf1d89.ts.net:4444 through
+# `tailscale serve --bg --https=4444 http://127.0.0.1:4700` (tailnet devices only).
+Environment=MYCELIUM_HOST=127.0.0.1 MYCELIUM_BASE_URL=https://jason-server.taildf1d89.ts.net:4444
+# Sign-in: passkeys through Gatekeep. Mycelium refuses to start on that https address without it.
+Environment=GATEKEEP_ISSUER=https://id.gatekeepauth.com GATEKEEP_CLIENT_ID=mycelium
+Environment=GATEKEEP_ALLOWED_EMAILS=jasonsutter87@gmail.com
+Environment=CI=1 PATH=%h/.local/opt/node22/bin:%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

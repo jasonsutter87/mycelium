@@ -15,7 +15,7 @@ import { acceptanceCovers, acceptedCount, findings, fixCommand, impact, loadAcce
 import { writeHtmlReport } from "./report.ts";
 
 const [cmd = "help", ...rest] = process.argv.slice(2);
-const VALUE_FLAGS = new Set(["--top", "--hour", "--project", "--html", "--min", "--only", "--port", "--category", "--reason", "--days"]);
+const VALUE_FLAGS = new Set(["--top", "--hour", "--project", "--html", "--min", "--only", "--port", "--category", "--reason", "--days", "--list"]);
 const flags = new Set<string>();
 const values = new Map<string, string>();
 const args: string[] = [];
@@ -42,6 +42,19 @@ const setSetting = (k: string, v: string) =>
   db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT DO UPDATE SET value = excluded.value").run(k, v);
 
 // ---------------------------------------------------------------- commands
+
+/** Headless: keep clones of your repos in <dir>, then scan and check them. */
+async function sync(dir?: string) {
+  const list = flagValue("--list");
+  if (!dir || !list) return fail("Usage: mycelium sync <dir> --list <file with one owner/name per line>");
+  const { readRepoList, syncRepos } = await import("./sync.ts");
+  const target = resolve(dir);
+  const r = syncRepos(target, readRepoList(list), (s) => console.log(c.dim(s)));
+  console.log(`${r.cloned.length} cloned, ${r.updated.length} updated, ${r.failed.length} failed.`);
+  scan([target]);
+  await checkAll(db);
+  if (r.failed.length) process.exitCode = 1;
+}
 
 /** Live with a reviewed finding for now: named projects, the advisories it has today, a reason, an expiry. */
 function accept(target?: string) {
@@ -552,6 +565,8 @@ function splitTarget(t: string): [string, string | undefined] {
 const HELP = `${c.bold("mycelium")}: map every dependency under everything you own; know when a CVE lands in it.
 
   ${c.cyan("scan")} [folders…]      Map projects (a folder of projects, or one project). Remembers the folders.
+  ${c.cyan("repos")}                GitHub repos behind your projects, one owner/name per line (input for sync).
+  ${c.cyan("sync")} <dir> --list <file>  Headless: clone or fast-forward those repos into <dir>, then scan and check.
   ${c.cyan("accept")} <pkg[@ver]>      Live with a reviewed finding: --project a,b --reason "…" [--days 90]. New advisories
                        still show. No args: list them. \`unaccept\` undoes it.
   ${c.cyan("ignore")} [folders…]    Leave folders out of every scan (snapshots, backups). No args: list them. \`unignore\` undoes it.
@@ -584,6 +599,8 @@ const HELP = `${c.bold("mycelium")}: map every dependency under everything you o
 try {
 switch (cmd) {
   case "scan": scan(args); break;
+  case "repos": console.log((await import("./sync.ts")).knownRepos(db).join("\n")); break;
+  case "sync": await sync(args[0]); break;
   case "accept": accept(args[0]); break;
   case "unaccept": unaccept(args[0]); break;
   case "ignore": ignore(args); break;
