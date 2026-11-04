@@ -752,6 +752,10 @@ function resolveNpm(dir: string, lock: string, fxs: PlannedFix[], log: (s: strin
     const [bin, ...pre] = manager === "npm" ? resolverNpm() : [manager];
     const resolve = (a: string[]) => run(bin, [...pre, ...a], dir);
     const first = resolve(args);
+    // Newer pnpm warns and carries on, which would report overrides as applied when nothing read them.
+    if (manager === "pnpm" && /no longer read by pnpm/.test(first.output)) {
+      fail(`this pnpm (${run("pnpm", ["--version"], dir, 30_000).output.trim()}) ignores pnpm.overrides in package.json, so these fixes can't apply. Mycelium needs pnpm 10.`);
+    }
     if (first.ok && manager === "pnpm") {
       // pnpm can treat a lockfile as current while it still pins a version the override excludes (vite@7.3.0 under
       // vite@^7 → ^7.3.7), and neither `install` nor `update` moves it. Only a fresh resolve does. Verify then checks it.
@@ -1006,6 +1010,23 @@ function installCommand(dir: string, legacyPeers = false): string[] {
   return ["npm", "ci", "--no-audit", "--no-fund", ...(legacyPeers ? ["--legacy-peer-deps"] : [])];
 }
 
+/**
+ * The folder a sibling path means. A package.json can say `../VeilChain` while the clone is `veilchain`: the same folder
+ * on a Mac, missing on Linux. Only falls back when exactly one folder matches, so it never guesses between two.
+ */
+export function siblingSource(path: string): string {
+  if (existsSync(path) || dirname(path) === path) return path;
+  const parent = siblingSource(dirname(path));
+  try {
+    const want = basename(path).toLowerCase();
+    const hits = readdirSync(parent).filter((n) => n.toLowerCase() === want);
+    if (hits.length === 1) return join(parent, hits[0]);
+  } catch {
+    /* parent missing too: let the caller report the path it was asked for */
+  }
+  return path;
+}
+
 /** Out-of-repo path dependencies (`path = "../../murmur/core"`, `"file:../lib"`), as paths relative to the repo root. */
 export function outsidePaths(repo: string, workspaceSiblings?: Set<string>): string[] {
   const out = new Set<string>();
@@ -1025,7 +1046,7 @@ export function outsidePaths(repo: string, workspaceSiblings?: Set<string>): str
       for (const m of text.matchAll(re)) {
         const target = resolve(dir, m[1].replace(/\/+$/, ""));
         const rel = relative(repo, target);
-        if (!rel.startsWith(".." + sep) || !existsSync(target)) continue;
+        if (!rel.startsWith(".." + sep) || !existsSync(siblingSource(target))) continue;
         out.add(rel);
         if (e.name === "pnpm-workspace.yaml") workspaceSiblings?.add(rel);
       }
@@ -1062,7 +1083,7 @@ function worktreeDir(repo: string, prefix: string): string {
     const link = resolve(path, top);
     if (existsSync(link)) continue;
     mkdirSync(dirname(link), { recursive: true });
-    const src = resolve(repo, top);
+    const src = siblingSource(resolve(repo, top));
     const srcRoot = git(src, ["rev-parse", "--show-toplevel"]);
     // Only pnpm workspace members need a real folder. `file:`/`link:`/Cargo path deps keep the symlink: they rely on
     // your built sibling (dist/), which a fresh checkout doesn't have.

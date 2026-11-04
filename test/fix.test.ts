@@ -1,6 +1,9 @@
 import { test } from "node:test";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import assert from "node:assert/strict";
-import { errLine, ignoredOverrides, npmLockHas, plainOverrideSafe, prBody, prTitle, type FixPlan, type PlannedFix } from "../src/fix.ts";
+import { errLine, ignoredOverrides, npmLockHas, plainOverrideSafe, prBody, prTitle, siblingSource, type FixPlan, type PlannedFix } from "../src/fix.ts";
 
 const fx = (over: Partial<PlannedFix>): PlannedFix => ({
   project: "app", projectPath: "/r/app", component: "package-lock.json", ecosystem: "npm", name: "next", from: "16.1.1",
@@ -273,4 +276,21 @@ test("a plain override is only safe when no copy sits on another major", () => {
   assert.equal(plainOverrideSafe(lock("1.30.1", "2.12.0"), f), true);
   assert.equal(plainOverrideSafe(lock("1.30.1", "3.0.0"), f), false);
   assert.equal(plainOverrideSafe("not json", f), false);
+});
+
+test("a sibling path matches its folder whatever the case, but never guesses", () => {
+  const dir = mkdtempSync(join(tmpdir(), "mycelium-sib-"));
+  mkdirSync(join(dir, "veilchain"));
+  mkdirSync(join(dir, "Exact"));
+  try {
+    const exact = existsSync(join(dir, "EXACT")); // a Mac's filesystem already matches this, so there's nothing to resolve
+    assert.equal(siblingSource(join(dir, "Exact")), join(dir, "Exact"));
+    if (!exact) assert.equal(siblingSource(join(dir, "VeilChain")), join(dir, "veilchain"));
+    mkdirSync(join(dir, "veilchain", "core"));
+    if (!exact) assert.equal(siblingSource(join(dir, "VeilChain", "core")), join(dir, "veilchain", "core"));
+    assert.equal(siblingSource(join(dir, "nothere")), join(dir, "nothere"));
+    assert.equal(siblingSource(join(dir, "gone", "x")), join(dir, "gone", "x"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

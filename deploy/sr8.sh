@@ -32,7 +32,8 @@ npm ci --omit=dev --no-audit --no-fund --silent
 gh auth setup-git
 
 # Build tools for verifying fixes, installed for this user only.
-command -v pnpm >/dev/null || npm install --silent --prefix ~/.local -g pnpm
+# pnpm stays on 10: your lockfiles are v9, and 12 no longer reads pnpm.overrides, which is how fixes are applied.
+[ "$(pnpm --version 2>/dev/null | cut -d. -f1)" = 10 ] || npm install --silent --prefix ~/.local -g pnpm@10
 command -v cargo >/dev/null || { curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path >/dev/null; }
 
 mkdir -p ~/.config/systemd/user
