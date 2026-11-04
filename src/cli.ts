@@ -11,11 +11,11 @@ import { audit, CATEGORY_LABEL } from "./audit.ts";
 import { enrich } from "./depsdev.ts";
 import { severityRank } from "./osv.ts";
 import { checkAll } from "./osv.ts";
-import { findings, fixCommand, impact, whyPaths, type Finding } from "./graph.ts";
+import { acceptanceCovers, acceptedCount, findings, fixCommand, impact, loadAcceptances, whyPaths, type Acceptance, type Finding } from "./graph.ts";
 import { writeHtmlReport } from "./report.ts";
 
 const [cmd = "help", ...rest] = process.argv.slice(2);
-const VALUE_FLAGS = new Set(["--top", "--hour", "--project", "--html", "--min", "--only", "--port", "--category"]);
+const VALUE_FLAGS = new Set(["--top", "--hour", "--project", "--html", "--min", "--only", "--port", "--category", "--reason", "--days"]);
 const flags = new Set<string>();
 const values = new Map<string, string>();
 const args: string[] = [];
@@ -42,6 +42,60 @@ const setSetting = (k: string, v: string) =>
   db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT DO UPDATE SET value = excluded.value").run(k, v);
 
 // ---------------------------------------------------------------- commands
+
+/** Live with a reviewed finding for now: named projects, the advisories it has today, a reason, an expiry. */
+function accept(target?: string) {
+  const rules = loadAcceptances(db);
+  if (!target) {
+    if (!rules.length) return console.log("Nothing accepted.");
+    const now = new Date();
+    for (const a of rules) {
+      const expired = new Date(a.expires) <= now;
+      console.log(`${c.bold(a.name + (a.version ? "@" + a.version : ""))}  ${expired ? c.red("EXPIRED " + a.expires.slice(0, 10)) : c.dim("until " + a.expires.slice(0, 10))}  ${c.cyan(a.projects.join(", "))}`);
+      console.log(`  ${a.reason}`);
+      console.log(c.dim(`  ${a.vulnIds.join(", ")}`));
+    }
+    return;
+  }
+  const [name, version] = splitTarget(target);
+  const reason = flagValue("--reason")?.trim();
+  const projects = flagValue("--project")?.split(",").map((p) => p.trim()).filter(Boolean) ?? [];
+  const days = Number(flagValue("--days") ?? 90);
+  if (!reason) return fail("A reason is required: --reason \"why this is OK for now\"");
+  if (!projects.length) return fail("Say which projects: --project a,b");
+  if (!(days > 0)) return fail("--days must be a positive number");
+  const matches = findings(db, { includeDev: true, includeAccepted: true }).filter(
+    (f) => f.name === name && (!version || f.version === version) && f.hits.some((h) => projects.includes(h.project)),
+  );
+  if (matches.some((f) => f.vulnId.startsWith("MAL-"))) return fail(`${target} is flagged as malicious (MAL-*): that can't be accepted. Remove it.`);
+  if (!matches.length) return fail(`No open finding for ${target} in ${projects.join(", ")}.`);
+  const key = (a: Acceptance) => `${a.name}@${a.version ?? ""}|${[...a.projects].sort().join(",")}`;
+  const entry: Acceptance = {
+    name, ...(version ? { version } : {}), vulnIds: [...new Set(matches.map((f) => f.vulnId))], projects, reason,
+    acceptedAt: new Date().toISOString(), expires: new Date(Date.now() + days * 86_400_000).toISOString(),
+  };
+  setSetting("accepted", JSON.stringify([...rules.filter((a) => key(a) !== key(entry)), entry]));
+  console.log(`Accepted ${c.bold(target)} in ${projects.join(", ")} until ${entry.expires.slice(0, 10)} (${entry.vulnIds.length} advisories).`);
+}
+
+function unaccept(target?: string) {
+  if (!target) return fail("Which package? mycelium unaccept <pkg[@ver]> [--project a,b]");
+  const [name, version] = splitTarget(target);
+  const only = flagValue("--project")?.split(",");
+  const rules = loadAcceptances(db);
+  const kept = rules.flatMap((a) => {
+    if (a.name !== name || (version && a.version !== version)) return [a];
+    const projects = only ? a.projects.filter((p) => !only.includes(p)) : [];
+    return projects.length ? [{ ...a, projects }] : [];
+  });
+  setSetting("accepted", JSON.stringify(kept));
+  console.log(`Removed ${rules.length - kept.length} acceptance(s) for ${target}${only ? ` (projects: ${only.join(", ")})` : ""}.`);
+}
+
+function fail(message: string) {
+  console.error(c.red(message));
+  process.exitCode = 1;
+}
 
 /** Folders left out of every scan. They stay on disk; findings from them just stop counting. */
 function ignore(folders: string[], remove = false) {
@@ -127,6 +181,8 @@ function summary(list: Finding[]) {
       `${SEV_COLOR.CRITICAL(`${by("CRITICAL")} critical`)}, ${SEV_COLOR.HIGH(`${by("HIGH")} high`)}, ` +
       `${SEV_COLOR.MODERATE(`${by("MODERATE")} moderate`)}, ${c.dim(`${by("LOW") + by("UNKNOWN")} low/unknown`)}`,
   );
+  const accepted = acceptedCount(db, { includeDev: flags.has("--dev") });
+  if (accepted) console.log(c.dim(`${accepted} accepted, not counted above (\`mycelium accept\` lists them).`));
 }
 
 function why(target: string) {
@@ -154,17 +210,26 @@ function impactCmd(target: string) {
 }
 
 function projects() {
-  const rows = db.prepare(`
+  // Counts come from findings(), so accepted items aren't "open" here either.
+  const open = new Map<string, Set<string>>();
+  for (const f of findings(db)) for (const h of f.hits) open.set(h.project, (open.get(h.project) ?? new Set()).add(f.vulnId));
+  const rules = loadAcceptances(db);
+  const accepted = new Map<string, Set<string>>();
+  for (const f of findings(db, { includeAccepted: true })) {
+    for (const h of f.hits) if (rules.some((a) => acceptanceCovers(a, f, h.project))) accepted.set(h.project, (accepted.get(h.project) ?? new Set()).add(f.vulnId));
+  }
+  const rows = (db.prepare(`
     SELECT pr.id, pr.name, pr.exposure,
-      (SELECT count(DISTINCT u.package_id) FROM uses u JOIN components c ON c.id = u.component_id WHERE c.project_id = pr.id) AS pkgs,
-      (SELECT count(DISTINCT pv.vuln_id) FROM package_vulns pv JOIN uses u ON u.package_id = pv.package_id
-         JOIN components c ON c.id = u.component_id WHERE c.project_id = pr.id AND u.scope = 'prod') AS vulns
-    FROM projects pr ORDER BY vulns DESC, pr.name`).all() as any[];
+      (SELECT count(DISTINCT u.package_id) FROM uses u JOIN components c ON c.id = u.component_id WHERE c.project_id = pr.id) AS pkgs
+    FROM projects pr`).all() as any[])
+    .map((r) => ({ ...r, vulns: open.get(r.name)?.size ?? 0, accepted: accepted.get(r.name)?.size ?? 0 }))
+    .sort((x, y) => y.vulns - x.vulns || x.name.localeCompare(y.name));
   const infraStmt = db.prepare("SELECT DISTINCT kind, value FROM infra WHERE project_id = ? AND kind IN ('host','domain','distribution')");
   for (const r of rows) {
     const where = (infraStmt.all(r.id) as any[]).map((i) => i.value).join(", ");
     const v = r.vulns ? c.red(`${r.vulns} vulns`.padEnd(9)) : c.green("clean".padEnd(9));
-    console.log(`${c.bold(r.name.padEnd(28))} ${String(r.pkgs).padStart(5)} pkgs  ${v} ${c.cyan(r.exposure.padEnd(11))} ${c.dim(where)}`);
+    const acc = r.accepted ? c.dim(` (${r.accepted} accepted)`) : "";
+    console.log(`${c.bold(r.name.padEnd(28))} ${String(r.pkgs).padStart(5)} pkgs  ${v}${acc} ${c.cyan(r.exposure.padEnd(11))} ${c.dim(where)}`);
   }
 }
 
@@ -483,6 +548,8 @@ function splitTarget(t: string): [string, string | undefined] {
 const HELP = `${c.bold("mycelium")}: map every dependency under everything you own; know when a CVE lands in it.
 
   ${c.cyan("scan")} [folders…]      Map projects (a folder of projects, or one project). Remembers the folders.
+  ${c.cyan("accept")} <pkg[@ver]>      Live with a reviewed finding: --project a,b --reason "…" [--days 90]. New advisories
+                       still show. No args: list them. \`unaccept\` undoes it.
   ${c.cyan("ignore")} [folders…]    Leave folders out of every scan (snapshots, backups). No args: list them. \`unignore\` undoes it.
   ${c.cyan("check")}                Query OSV.dev for every package in the graph; print what's new.
   ${c.cyan("report")}               Ranked findings with paths + fix commands.  --top N | --all | --dev | --html [file]
@@ -513,6 +580,8 @@ const HELP = `${c.bold("mycelium")}: map every dependency under everything you o
 try {
 switch (cmd) {
   case "scan": scan(args); break;
+  case "accept": accept(args[0]); break;
+  case "unaccept": unaccept(args[0]); break;
   case "ignore": ignore(args); break;
   case "unignore": ignore(args, true); break;
   case "check": {

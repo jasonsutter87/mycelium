@@ -3,6 +3,7 @@
 import { writeFileSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { fixCommand, whyPaths, type Finding } from "./graph.ts";
+import { acceptedCount } from "./graph.ts";
 import { audit, CATEGORY_LABEL } from "./audit.ts";
 import { prFixIndex, projectPrs } from "./prs.ts";
 
@@ -127,7 +128,7 @@ ${live ? `<button class="fixbtn" id="rescan" style="margin:0">↻ Rescan</button
 <div class="muted">${live ? `Last checked ${esc(lastChecked(db))}` : `Generated ${esc(new Date().toLocaleString())}`} · production dependencies only unless run with --dev</div>
 <div class="stats">
 <div class="stat"><b>${projects.length}</b>projects</div>
-<div class="stat"><b>${list.length}</b>findings</div>
+<div class="stat"><b>${list.length}</b>findings</div>${acceptedCount(db) ? `<div class="stat"><b>${acceptedCount(db)}</b>accepted</div>` : ""}
 <div class="stat"><b style="color:var(--crit)">${count("CRITICAL")}</b>critical</div>
 <div class="stat"><b style="color:var(--high)">${count("HIGH")}</b>high</div>
 <div class="stat"><b style="color:var(--mod)">${count("MODERATE")}</b>moderate</div>

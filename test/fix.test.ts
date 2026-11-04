@@ -154,3 +154,21 @@ test("pnpmLockHas: matches an exact lock entry, not a similar one", async () => 
   assert.ok(!pnpmLockHas(lock, "vite", "7.3.7"));
   assert.ok(!pnpmLockHas(lock, "foo", "1.0.0"), "a peer in parentheses isn't an entry");
 });
+
+test("acceptance: narrow on purpose (project, advisory, expiry), never for malicious packages", async () => {
+  const { acceptanceCovers } = await import("../src/graph.ts");
+  const now = new Date("2026-06-01");
+  const rule = {
+    name: "glib", vulnIds: ["RUSTSEC-1"], projects: ["app"], reason: "r",
+    acceptedAt: "2026-05-01T00:00:00Z", expires: "2026-08-01T00:00:00Z",
+  };
+  const f = { name: "glib", version: "0.18.5", vulnId: "RUSTSEC-1" };
+  assert.ok(acceptanceCovers(rule, f, "app", now));
+  assert.ok(!acceptanceCovers(rule, f, "other", now), "another project stays open");
+  assert.ok(!acceptanceCovers(rule, { ...f, vulnId: "RUSTSEC-2" }, "app", now), "a new advisory stays open");
+  assert.ok(!acceptanceCovers(rule, { ...f, name: "gtk" }, "app", now));
+  assert.ok(!acceptanceCovers(rule, f, "app", new Date("2026-09-01")), "expired acceptances stop applying");
+  assert.ok(acceptanceCovers(rule, { ...f, version: "0.19.0" }, "app", now), "no version pin: same advisory, any version");
+  assert.ok(!acceptanceCovers({ ...rule, version: "0.18.5" }, { ...f, version: "0.19.0" }, "app", now), "version pin holds");
+  assert.ok(!acceptanceCovers({ ...rule, vulnIds: ["MAL-1"] }, { ...f, vulnId: "MAL-1" }, "app", now), "malicious is never covered");
+});

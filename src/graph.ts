@@ -32,7 +32,42 @@ export interface Finding {
 }
 
 /** Every open finding, with the projects it touches, ranked by blast radius. */
-export function findings(db: DatabaseSync, opts: { includeDev?: boolean; onlyNew?: boolean } = {}): Finding[] {
+/**
+ * A finding someone reviewed and chose to live with for now (`mycelium accept`). It stays visible as "accepted",
+ * and it's deliberately narrow: named projects only, these exact advisories only, with a reason and an expiry.
+ */
+export interface Acceptance {
+  name: string;
+  version?: string;
+  vulnIds: string[];
+  projects: string[];
+  reason: string;
+  acceptedAt: string;
+  expires: string;
+}
+
+export function loadAcceptances(db: DatabaseSync): Acceptance[] {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'accepted'").get() as { value: string } | undefined;
+  return JSON.parse(row?.value ?? "[]");
+}
+
+export function acceptanceCovers(a: Acceptance, f: { name: string; version: string; vulnId: string }, project: string, now = new Date()): boolean {
+  if (new Date(a.expires) <= now) return false;
+  if (f.vulnId.startsWith("MAL-")) return false; // a malicious package is never something to live with
+  if (a.name !== f.name || (a.version && a.version !== f.version)) return false;
+  return a.vulnIds.includes(f.vulnId) && a.projects.includes(project); // a NEW advisory on this package still shows up
+}
+
+/** How many open-looking findings are currently accepted, per the same rules findings() applies. */
+export function acceptedCount(db: DatabaseSync, opts: { includeDev?: boolean; project?: string } = {}): number {
+  const rules = loadAcceptances(db);
+  return findings(db, { includeDev: opts.includeDev, includeAccepted: true }).filter((f) =>
+    f.hits.some((h) => (!opts.project || h.project === opts.project) && rules.some((a) => acceptanceCovers(a, f, h.project))),
+  ).length;
+}
+
+export function findings(db: DatabaseSync, opts: { includeDev?: boolean; onlyNew?: boolean; includeAccepted?: boolean } = {}): Finding[] {
+  const rules = opts.includeAccepted ? [] : loadAcceptances(db);
   const rows = db.prepare(`
     SELECT pv.vuln_id, pv.fixed, pv.first_seen, pv.notified, v.summary, v.severity, v.aliases, v.url,
            p.id AS package_id, p.ecosystem, p.name, p.version
@@ -51,6 +86,7 @@ export function findings(db: DatabaseSync, opts: { includeDev?: boolean; onlyNew
       componentId: h.component_id, direct: !!h.direct, scope: h.scope,
     }));
     if (!opts.includeDev) hits = hits.filter((h) => h.scope === "prod");
+    hits = hits.filter((h) => !rules.some((a) => acceptanceCovers(a, { name: r.name, version: r.version, vulnId: r.vuln_id }, h.project)));
     if (!hits.length) continue;
     const aliases: string[] = JSON.parse(r.aliases);
     const exposure = Math.max(...hits.map((h) => EXPOSURE_WEIGHT[h.exposure]));
