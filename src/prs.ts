@@ -65,8 +65,8 @@ export async function syncPrs(db: DatabaseSync, log: (s: string) => void = () =>
   await pool([...repos.keys()], 8, async (repo) => {
     const remote = await run("git", repo, ["remote", "get-url", "origin"]);
     if (!remote || !/github\.com[:/]/.test(remote)) return;
-    const raw = await run("gh", repo, ["pr", "list", "--state", "all", "--limit", "50", "--search", `head:${BRANCH_PREFIX}`,
-      "--json", "number,url,state,headRefName,baseRefName,headRefOid,mergeCommit"]);
+    const raw = await run("gh", repo, ["pr", "list", "--state", "all", "--limit", "200", "--search", `head:${BRANCH_PREFIX}`,
+      "--json", "number,url,state,headRefName,baseRefName,headRefOid,mergeCommit,title,body,createdAt,mergedAt"]);
     const prs = raw ? (JSON.parse(raw) as any[]).filter((p) => String(p.headRefName).startsWith(BRANCH_PREFIX)) : [];
     if (!prs.length) return;
     // Fresh base branches (for pull checks) and PR heads (to read their lockfiles), fetched by name only.
@@ -90,10 +90,12 @@ export async function syncPrs(db: DatabaseSync, log: (s: string) => void = () =>
 
   for (const [repo, prs] of found) {
     const projects = repos.get(repo)!;
+    const owners = projects.map((e) => (db.prepare("SELECT name FROM projects WHERE path = ?").get(e.projectPath) as { name: string }).name);
     for (const p of prs) {
       const now = new Date().toISOString();
       const { id } = upsert.get(repo, p.number, p.url, p.state, p.headRefName, p.baseRefName, p.headRefOid ?? null, p.mergeCommit?.oid ?? null, now) as { id: number };
       count++;
+      recordPrHistory(db, p, owners);
       // Read the lockfiles as they are in the PR (pull/N/head survives branch deletion after merge).
       const oid = p.headRefOid as string;
       const fixes: [string, string, string, string][] = [];
@@ -118,6 +120,73 @@ export async function syncPrs(db: DatabaseSync, log: (s: string) => void = () =>
     log(`${basename(repo)}: ${prs.length} Mycelium PR(s)`);
   }
   return count;
+}
+
+export interface FixedEntry {
+  severity: string;
+  name: string;
+  from: string;
+  to: string | null;
+  major: boolean;
+  lockfile: string;
+  advisories: { id: string; url: string }[];
+  moreAdvisories: number; // the PR table lists four and says "+N" for the rest
+}
+
+/**
+ * What a PR description says it fixed: the "### Fixed" table prBody() writes, plus the shapes of hand-written PRs (a table
+ * without some columns, a "### Upgraded" bullet list). [] when it's prose: better a PR with no package list than a guessed one.
+ */
+export function parseFixedTable(body: string): FixedEntry[] {
+  const out: FixedEntry[] = [];
+  const lines = String(body ?? "").split(/\r?\n/);
+  const start = lines.findIndex((l) => /^### (Fixed|Upgraded)\s*$/.test(l));
+  if (start < 0) return out;
+  const cellsOf = (l: string) => l.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+  const code = (c = "") => c.replace(/`/g, "");
+  let cols: string[] | null = null;
+  for (const line of lines.slice(start + 1)) {
+    if (line.startsWith("#")) break;
+    const bullet = line.match(/^- (\S+)@(\S+) → (\S+)(?: \((.+)\))?\s*$/);
+    if (bullet) {
+      out.push({ severity: "UNKNOWN", name: bullet[1], from: bullet[2], to: bullet[3], major: false, lockfile: bullet[4] ?? "", advisories: [], moreAdvisories: 0 });
+      continue;
+    }
+    if (!line.startsWith("|")) continue;
+    const cells = cellsOf(line);
+    if (!cols) {
+      if (cells.some((c) => /^package$/i.test(c))) cols = cells.map((c) => c.toLowerCase());
+      continue;
+    }
+    const at = (name: string) => cells[cols!.findIndex((c) => c.startsWith(name))];
+    const upgrade = at("upgrade")?.match(/^(\S+)\s*→\s*(.+)$/);
+    const name = code(at("package"));
+    if (!upgrade || !name) continue; // includes the |---|---| line
+    const to = upgrade[2].split(/\s+/)[0];
+    const advisories = cells.slice(cols.findIndex((c) => c.startsWith("advisor"))).join(" ");
+    out.push({
+      severity: /^(CRITICAL|HIGH|MODERATE|LOW)$/.test(at("severity") ?? "") ? at("severity") : "UNKNOWN",
+      name, from: upgrade[1], to: to === "null" || to === "removed" ? null : to, major: /major/.test(upgrade[2]), lockfile: code(at("lockfile")),
+      advisories: [...advisories.matchAll(/\[([^\]]+)\]\(([^)\s]+)\)/g)].map((m) => ({ id: m[1], url: m[2] })),
+      moreAdvisories: Number(advisories.match(/\+(\d+)\s*$/)?.[1] ?? 0),
+    });
+  }
+  return out;
+}
+
+/**
+ * Saves one PR to the permanent history. `pr` is a row from `gh pr list`; `owners` are the scanned projects its repo belongs to.
+ * The project a description names may since have been renamed, so it only wins if it's one of those.
+ * Rows are never deleted, so history outlives the scan.
+ */
+export function recordPrHistory(db: DatabaseSync, pr: any, owners: string[]) {
+  const named = String(pr.body ?? "").split("\n")[0].match(/ for \*\*(.+?)\*\*/)?.[1];
+  const repo = new URL(pr.url).pathname.split("/").slice(1, 3).join("/");
+  const project = named && owners.includes(named) ? named : owners[0] ?? named ?? repo.split("/")[1];
+  db.prepare(`INSERT INTO pr_history (url, repo, number, project, state, title, opened_at, merged_at, fixes, synced_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(url) DO UPDATE SET project = excluded.project, state = excluded.state, title = excluded.title,
+    opened_at = excluded.opened_at, merged_at = excluded.merged_at, fixes = excluded.fixes, synced_at = excluded.synced_at`)
+    .run(pr.url, repo, pr.number, project, pr.state, pr.title ?? "", pr.createdAt ?? null, pr.mergedAt ?? null, JSON.stringify(parseFixedTable(pr.body)), new Date().toISOString());
 }
 
 export interface PrInfo {

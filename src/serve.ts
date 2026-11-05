@@ -14,7 +14,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { DatabaseSync } from "node:sqlite";
 import { createAuth } from "./auth.ts";
-import { auditView, clearPrCache, findingsView, infraView, overview, PIPELINE, projectDetail, stepOf, withDowngradeHints, type Step } from "./dashboard.ts";
+import { auditView, clearPrCache, findingsView, fixedView, infraView, overview, PIPELINE, projectDetail, stepOf, withDowngradeHints, type Step } from "./dashboard.ts";
 import { checkAll } from "./osv.ts";
 import { saveProject, scanProject, scanRoots, setIgnored } from "./scan.ts";
 import { enrich } from "./depsdev.ts";
@@ -153,6 +153,7 @@ export function serve(db: DatabaseSync, port: number) {
         if (p === "/api/overview") return send(res, 200, { ...overview(db), user: user?.email ?? null, signIn: !!auth, busy, job: job && summary(job) });
         if (p === "/api/project") return send(res, 200, projectDetail(db, url.searchParams.get("name") ?? ""));
         if (p === "/api/findings") return send(res, 200, findingsView(db));
+        if (p === "/api/fixed") return send(res, 200, fixedView(db));
         if (p === "/api/audit") return send(res, 200, auditView(db));
         if (p === "/api/infra") return send(res, 200, infraView(db));
         if (p === "/api/job") return send(res, 200, job ? { ...summary(job), lines: job.lines, result: job.result, error: job.error } : null);

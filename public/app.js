@@ -27,7 +27,7 @@ const STEP_LABEL = { check: "Check", pull: "Pull", branch: "Branch", fix: "Fix",
 const state = {
   view: "projects",
   data: null,
-  tabs: {}, // lazily loaded findings / audit / infra
+  tabs: {}, // lazily loaded findings / fixed / audit / infra
   selected: null, // project name
   detail: null,
   checked: new Set(), // projects checked since the page loaded: Fix stays locked until then
@@ -39,6 +39,8 @@ const state = {
   exposure: store.get("exposure", "all"),
   sort: store.get("sort", { key: "worst", dir: "desc" }),
   sevFilter: "ALL",
+  fixedState: "all",
+  fixedQ: "",
 };
 
 function banner(msg, isErr) {
@@ -222,6 +224,44 @@ function renderFindings() {
   document.querySelectorAll("[data-goto]").forEach((b) => (b.onclick = () => { state.view = "projects"; selectProject(b.dataset.goto); renderAll(); }));
 }
 
+const day = (iso) => (iso ? new Date(iso).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }) : "–");
+
+function renderFixed() {
+  const list = state.tabs.fixed;
+  if (!list) return ($("canvas").innerHTML = `<div class="empty"><span class="spin"></span>Loading fixes</div>`);
+  const q = state.fixedQ.trim().toLowerCase();
+  const shown = list.filter((f) => {
+    if (state.fixedState !== "all" && f.state !== state.fixedState) return false;
+    return !q || `${f.name ?? f.title} ${f.project} ${f.repo} ${f.severity ?? ""} ${f.advisories.map((a) => a.id).join(" ")}`.toLowerCase().includes(q);
+  });
+  const prCount = new Set(shown.map((f) => f.url)).size;
+  const projectCount = new Set(shown.map((f) => f.project)).size;
+  const known = new Set(state.data.projects.map((p) => p.name));
+  const chips = [["all", "All", list.length], ["MERGED", "Merged", list.filter((f) => f.state === "MERGED").length], ["OPEN", "Awaiting merge", list.filter((f) => f.state === "OPEN").length]];
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  $("canvas").innerHTML = `<div class="filters">
+      <input class="field" id="fq" type="search" placeholder="Search fixes" aria-label="Search fixes" value="${esc(state.fixedQ)}">
+      <div class="chips" role="group" aria-label="Filter by PR state">${chips.map(([id, label, c]) => `<button data-fstate="${id}" class="${state.fixedState === id ? "on" : ""}">${label}<i>${c}</i></button>`).join("")}</div>
+      <span class="count">${plural(shown.filter((f) => f.name).length, "upgrade")} · ${plural(prCount, "PR")} · ${plural(projectCount, "project")}</span></div>` +
+    table(["Date", "Severity", "Package", "Advisories", "Project", "PR"], shown.map((f) => `<tr>
+      <td class="small muted">${day(f.at)}</td>
+      <td>${f.severity ? `<span class="sev ${esc(f.severity)}">${esc(f.severity)}</span>` : '<span class="muted">–</span>'}</td>
+      <td>${f.name ? `<b>${esc(f.name)}</b> <span class="mono muted">${esc(f.from)} → ${esc(f.to ?? "removed")}</span>${f.major ? ' <span class="tag major">major</span>' : ""}<div class="small muted">${f.lockfiles.length === 1 ? esc(f.lockfiles[0]) : `${f.lockfiles.length} lockfiles`}</div>` : `${esc(f.title)}<div class="small muted">No package list in this PR's description</div>`}</td>
+      <td class="small">${f.advisories.map((a) => `<a href="${safeUrl(a.url)}" target="_blank" rel="noopener noreferrer">${esc(a.id)}</a>`).join("<br>") || '<span class="muted">–</span>'}${f.moreAdvisories ? `<div class="muted">+${f.moreAdvisories} more</div>` : ""}</td>
+      <td>${known.has(f.project) ? `<button class="btn small" data-goto="${esc(f.project)}">${esc(f.project)}</button>` : esc(f.project)}</td>
+      <td class="small"><a href="${safeUrl(f.url)}" target="_blank" rel="noopener noreferrer">${esc(f.repo.split("/")[1])}#${f.number}</a>${f.state === "OPEN" ? '<div class="muted">awaiting merge</div>' : ""}</td></tr>`),
+    list.length ? "No fixes match these filters." : "No fixes recorded yet. <b>Rescan all</b> reads your Mycelium PRs from GitHub.");
+  const fq = $("fq");
+  fq.oninput = () => {
+    state.fixedQ = fq.value;
+    const pos = fq.selectionStart;
+    renderFixed();
+    const again = $("fq"); again.focus(); again.setSelectionRange(pos, pos);
+  };
+  document.querySelectorAll("[data-fstate]").forEach((b) => (b.onclick = () => { state.fixedState = b.dataset.fstate; renderFixed(); }));
+  document.querySelectorAll("[data-goto]").forEach((b) => (b.onclick = () => { state.view = "projects"; selectProject(b.dataset.goto); renderAll(); }));
+}
+
 function renderAudit() {
   const list = state.tabs.audit;
   if (!list) return ($("canvas").innerHTML = `<div class="empty"><span class="spin"></span>Loading audit</div>`);
@@ -238,7 +278,7 @@ function renderInfra() {
 }
 
 function renderCanvas() {
-  ({ projects: renderProjects, findings: renderFindings, audit: renderAudit, infra: renderInfra })[state.view]();
+  ({ projects: renderProjects, findings: renderFindings, fixed: renderFixed, audit: renderAudit, infra: renderInfra })[state.view]();
 }
 
 // ---------------------------------------------------------------- inspector: Check → Fix
@@ -459,6 +499,7 @@ async function runPull() {
 async function refresh() {
   state.data = await api("/api/overview");
   renderAll();
+  loadTab(); // a rescan or fix clears the tab caches; without this the open tab would spin forever
 }
 
 function renderAll() {

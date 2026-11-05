@@ -143,6 +143,21 @@ CREATE TABLE IF NOT EXISTS pr_fixes (
   version      TEXT NOT NULL
 );
 
+-- Every Mycelium PR, read from its own description. pr_fixes only knows what's still vulnerable in the current scan,
+-- so it empties once a fix is pulled; this is the permanent record. Keyed by URL: worktrees of one repo share PRs.
+CREATE TABLE IF NOT EXISTS pr_history (
+  url       TEXT PRIMARY KEY,
+  repo      TEXT NOT NULL,       -- owner/name on GitHub
+  number    INTEGER NOT NULL,
+  project   TEXT NOT NULL,
+  state     TEXT NOT NULL,       -- OPEN | MERGED | CLOSED
+  title     TEXT NOT NULL,
+  opened_at TEXT,
+  merged_at TEXT,
+  fixes     TEXT NOT NULL,       -- JSON array of FixedEntry
+  synced_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_edges_child ON edges(child_id);
 CREATE INDEX IF NOT EXISTS idx_uses_pkg ON uses(package_id);
 `;

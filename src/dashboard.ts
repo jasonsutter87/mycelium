@@ -8,7 +8,7 @@ import { audit, CATEGORY_LABEL } from "./audit.ts";
 import { acceptanceCovers, acceptedCount, findings, loadAcceptances, type Finding } from "./graph.ts";
 import { findDowngrade } from "./downgrade.ts";
 import { planFixes } from "./fix.ts";
-import { projectPrs } from "./prs.ts";
+import { projectPrs, type FixedEntry } from "./prs.ts";
 
 export type Severity = "CRITICAL" | "HIGH" | "MODERATE" | "LOW" | "UNKNOWN";
 const SEVERITIES: Severity[] = ["CRITICAL", "HIGH", "MODERATE", "LOW", "UNKNOWN"];
@@ -193,6 +193,29 @@ export function findingsView(db: DatabaseSync) {
     id: f.cve ?? f.vulnId, url: f.url, severity: f.severity, risk: f.risk, name: f.name, version: f.version, ecosystem: f.ecosystem, fixed: f.fixed, summary: f.summary,
     projects: [...new Set(f.hits.map((h) => h.project))],
   }));
+}
+
+/**
+ * The Fixed tab: one row per upgrade, newest first. Closed PRs are left out because they never landed. The same upgrade in
+ * several lockfiles of one PR is one row. A PR whose description has no Fixed table still gets a row (name: null).
+ */
+export function fixedView(db: DatabaseSync) {
+  const prs = db.prepare(`SELECT url, repo, number, project, state, title, opened_at, merged_at, fixes FROM pr_history
+    WHERE state != 'CLOSED' ORDER BY coalesce(merged_at, opened_at) DESC, url`).all() as any[];
+  return prs.flatMap((p) => {
+    const pr = { project: p.project, repo: p.repo, number: p.number, url: p.url, state: p.state, title: p.title, at: p.merged_at ?? p.opened_at };
+    const rows = new Map<string, any>();
+    for (const f of JSON.parse(p.fixes) as FixedEntry[]) {
+      const k = `${f.name}|${f.from}|${f.to}`;
+      const row = rows.get(k) ?? { ...pr, severity: f.severity, name: f.name, from: f.from, to: f.to, major: f.major, lockfiles: [] as string[], advisories: [] as FixedEntry["advisories"], moreAdvisories: 0 };
+      row.lockfiles.push(f.lockfile);
+      for (const a of f.advisories) if (!row.advisories.some((x: { id: string }) => x.id === a.id)) row.advisories.push(a);
+      row.moreAdvisories = Math.max(row.moreAdvisories, f.moreAdvisories);
+      rows.set(k, row);
+    }
+    return rows.size ? [...rows.values()].sort((a, b) => SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity) || a.name.localeCompare(b.name))
+      : [{ ...pr, severity: null, name: null, from: null, to: null, major: false, lockfiles: [], advisories: [], moreAdvisories: 0 }];
+  });
 }
 
 export function auditView(db: DatabaseSync) {
