@@ -193,6 +193,31 @@ pre.log { font: 11.5px/1.5 var(--mono); background: var(--soft); border-radius: 
   .workspace.has-inspector { grid-template-columns: minmax(0, 1fr); }
   .inspector { position: fixed; inset: 48px 0 0 auto; width: min(460px, 100%); max-height: none; border-radius: 0; z-index: 4; border-width: 0 0 0 1px; }
 }
+/* Repos and Alerts pages */
+.welcome { padding: 44px 24px; max-width: 520px; margin: 0 auto; }
+.welcome h2 { margin: 0 0 8px; font-size: 20px; }
+.welcome ol { margin: 16px 0 22px; padding-left: 20px; line-height: 1.9; }
+td.nowrap { white-space: nowrap; }
+.page { padding: 16px; }
+.page.narrow { max-width: 620px; }
+.page.border-top { border-top: 1px solid var(--line); }
+.page h2 { margin: 0 0 6px; font-size: 16px; }
+.page h3 { margin: 18px 0 6px; font-size: 11px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+.page .opts { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.page .row { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+.page .errbox, .page .warn-box { margin: 10px 0; }
+.plain { list-style: none; padding: 0; margin: 8px 0 0; }
+.field.area { display: block; width: 100%; height: auto; padding: 7px 8px; font: inherit; resize: vertical; }
+input.field.num-in { width: 64px; margin-right: 4px; }
+.actions { display: flex; align-items: center; gap: 8px; margin: 16px 0 8px; flex-wrap: wrap; }
+.warn-box { background: var(--mod-soft); color: var(--fg); border-radius: 6px; padding: 9px 11px; }
+.warn-text { color: var(--high); } .ok-text { color: var(--ok); }
+.m12 { margin: 12px; }
+.savebar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; background: var(--panel2); font-size: 12.5px; flex-wrap: wrap; }
+.savebar.on { background: var(--accent-soft); }
+td.tick { width: 28px; }
+.linkish { border: 0; background: none; padding: 0; cursor: pointer; }
+
 @media (max-width: 720px) {
   .topbar { gap: 8px; padding: 8px 10px; position: static; }
   .inspector { inset: 0; width: 100%; border: 0; z-index: 6; }

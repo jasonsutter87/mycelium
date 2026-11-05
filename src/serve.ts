@@ -19,6 +19,9 @@ import { checkAll } from "./osv.ts";
 import { saveProject, scanProject, scanRoots, setIgnored } from "./scan.ts";
 import { enrich } from "./depsdev.ts";
 import { pullProject, syncPrs } from "./prs.ts";
+import { alertsView, runAlerts, saveAlertSettings, sendTestEmail } from "./alerts.ts";
+import { applyRepoChange, listGithubRepos, loadAutoWatch, saveAutoWatch, validSlug, type GithubRepo } from "./repos.ts";
+import { cloneDirs, readRepoList } from "./sync.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PUBLIC = join(HERE, "..", "public");
@@ -67,6 +70,37 @@ export function serve(db: DatabaseSync, port: number) {
   let busy: string | null = null; // one job at a time: they run package managers and git
   let job: Job | null = null;
   let jobCount = 0;
+
+  // Listing repos walks GitHub's pages: seconds on a big account, and it rarely changes while someone's ticking boxes.
+  let githubCache: { at: number; repos: GithubRepo[] } | null = null;
+  const githubRepos = async (fresh = false) => {
+    if (fresh || !githubCache || Date.now() - githubCache.at > 5 * 60_000) githubCache = { at: Date.now(), repos: await listGithubRepos() };
+    return githubCache.repos;
+  };
+
+  /** Update the clones, scan, check, sync PRs, send any alert. What Rescan does, and what follows a change to the repo list. */
+  const rescanAll = async () => {
+    const warnings: string[] = [];
+    // Server clones exist only for Mycelium, so Rescan brings them up to date. Otherwise a merged PR looks
+    // unmerged until the nightly sync. On a laptop these are your working folders: those are never pulled here.
+    if (cfg.repos) {
+      try {
+        await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings=ExperimentalWarning", CLI, "sync", cfg.repos.dir, "--list", cfg.repos.list, "--pull-only"], { timeout: 15 * 60_000, maxBuffer: 1 << 24 });
+      } catch (e: any) {
+        const failed = String(e.stdout ?? "").split("\n").filter((l) => l.includes("✗"));
+        console.error("repo sync:", failed.join("\n") || e.message);
+        warnings.push(failed.length ? `${failed.length} repo(s) couldn't be updated and were scanned as they were.` : "Repos couldn't be updated, so they were scanned as they were.");
+      }
+    }
+    scanRoots(db, JSON.parse(setting("roots") ?? "[]"));
+    await checkAll(db); // fatal on failure: acting on a partial answer would clear findings that still apply
+    // License and latest-version data is extra. Findings are saved by now, so losing it shouldn't fail the rescan.
+    try { await enrich(db); } catch (e) { warnings.push(`License and version data not updated: ${(e as Error).message}`); }
+    await syncPrs(db);
+    const alert = await runAlerts(db, baseUrl);
+    if (alert.error) warnings.push(`Couldn't send the alert email: ${alert.error}`);
+    return { ok: true, warnings };
+  };
 
   const page = (file: string, res: ServerResponse) => {
     const html = readFileSync(join(PUBLIC, file), "utf8").replace("__TOKEN__", token!);
@@ -156,11 +190,33 @@ export function serve(db: DatabaseSync, port: number) {
         if (p === "/api/fixed") return send(res, 200, fixedView(db));
         if (p === "/api/audit") return send(res, 200, auditView(db));
         if (p === "/api/infra") return send(res, 200, infraView(db));
+        if (p === "/api/alerts") return send(res, 200, alertsView(db));
+        if (p === "/api/repos") {
+          if (!cfg.repos) return send(res, 200, { managed: false, roots: JSON.parse(setting("roots") ?? "[]") });
+          const list = existsSync(cfg.repos.list) ? readRepoList(cfg.repos.list) : [];
+          const folders = cloneDirs(list);
+          const projectAt = new Map((db.prepare("SELECT name, path FROM projects").all() as { name: string; path: string }[]).map((r) => [r.path, r.name]));
+          const watched = list.map((slug) => ({ slug, project: projectAt.get(join(cfg.repos!.dir, folders.get(slug)!)) ?? null }));
+          let available: GithubRepo[] = [], error: string | null = null;
+          try {
+            available = await githubRepos(url.searchParams.has("fresh"));
+          } catch (e) {
+            console.error("listing GitHub repos:", e);
+            error = "Couldn't list your GitHub repos. Check that `gh auth status` works on this server.";
+          }
+          return send(res, 200, { managed: true, watched, available, autoOwners: loadAutoWatch(db).owners, error });
+        }
         if (p === "/api/job") return send(res, 200, job ? { ...summary(job), lines: job.lines, result: job.result, error: job.error } : null);
         return send(res, 404, { error: "not found" });
       }
       if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
       const body = await readBody(req);
+      // Settings, not work: fine while a rescan runs.
+      if (p === "/api/alerts") return send(res, 200, { ...saveAlertSettings(db, body), view: alertsView(db) });
+      if (p === "/api/alerts/test") {
+        await sendTestEmail(db, baseUrl, Array.isArray(body.recipients) ? body.recipients.map(String).filter(Boolean) : []);
+        return send(res, 200, { ok: true });
+      }
       if (["/api/check", "/api/fix", "/api/pull"].includes(p) && typeof body.project !== "string") return send(res, 400, { error: "which project? (missing project name)" });
       if (busy) return send(res, 409, { error: `Mycelium is busy (${busy}). Try again when that finishes.` });
       const pathOf = (name: string) => (db.prepare("SELECT path FROM projects WHERE name = ?").get(name) as { path: string } | undefined)?.path;
@@ -203,27 +259,22 @@ export function serve(db: DatabaseSync, port: number) {
           return r;
         });
       }
-      if (p === "/api/refresh") {
-        return await run("rescanning everything", async () => {
-          const warnings: string[] = [];
-          // Server clones exist only for Mycelium, so Rescan brings them up to date. Otherwise a merged PR looks
-          // unmerged until the nightly sync. On a laptop these are your working folders: those are never pulled here.
-          if (cfg.repos) {
-            try {
-              await promisify(execFile)(process.execPath, ["--experimental-strip-types", "--no-warnings=ExperimentalWarning", CLI, "sync", cfg.repos.dir, "--list", cfg.repos.list, "--pull-only"], { timeout: 15 * 60_000, maxBuffer: 1 << 24 });
-            } catch (e: any) {
-              const failed = String(e.stdout ?? "").split("\n").filter((l) => l.includes("✗"));
-              console.error("repo sync:", failed.join("\n") || e.message);
-              warnings.push(failed.length ? `${failed.length} repo(s) couldn't be updated and were scanned as they were.` : "Repos couldn't be updated, so they were scanned as they were.");
-            }
-          }
-          scanRoots(db, JSON.parse(setting("roots") ?? "[]"));
-          await checkAll(db); // fatal on failure: acting on a partial answer would clear findings that still apply
-          // License and latest-version data is extra. Findings are saved by now, so losing it shouldn't fail the rescan.
-          try { await enrich(db); } catch (e) { warnings.push(`License and version data not updated: ${(e as Error).message}`); }
-          await syncPrs(db);
-          return { ok: true, warnings };
-        });
+      if (p === "/api/refresh") return await run("rescanning everything", rescanAll);
+      if (p === "/api/repos") {
+        if (!cfg.repos) return send(res, 400, { error: "This install scans folders on this computer, so there's no repo list to change." });
+        const add = Array.isArray(body.add) ? body.add : [], remove = Array.isArray(body.remove) ? body.remove : [];
+        if (![...add, ...remove].every(validSlug)) return send(res, 400, { error: "That doesn't look like a GitHub repo name." });
+        const available = await githubRepos();
+        // Only what this GitHub account can actually see gets added, so a typo or a crafted name never reaches `gh repo clone`.
+        const known = new Set(available.map((r) => r.slug));
+        const unknown = add.find((s: string) => !known.has(s));
+        if (unknown) return send(res, 400, { error: `${unknown} isn't visible to the GitHub account on this server.` });
+        const owners = Array.isArray(body.autoOwners) ? body.autoOwners.map(String).filter((o: string) => available.some((r) => r.owner === o)) : loadAutoWatch(db).owners;
+        const { dir, list } = cfg.repos;
+        applyRepoChange(db, dir, list, existsSync(list) ? readRepoList(list) : [], add, remove);
+        saveAutoWatch(db, owners, available);
+        if (!add.length && !remove.length) return send(res, 200, { ok: true, warnings: [] });
+        return await run("updating your repos", rescanAll);
       }
       send(res, 404, { error: "not found" });
     } catch (e) {

@@ -6,4 +6,7 @@ Description=Mycelium: sync repos, scan, check
 Type=oneshot
 WorkingDirectory=%h/mycelium
 ExecStart=%h/.local/opt/node22/bin/node --experimental-strip-types --no-warnings=ExperimentalWarning src/cli.ts sync %h/mycelium-repos --list %h/.config/mycelium/repos.txt
+# Alert emails link back to the dashboard. RESEND_API_KEY and MYCELIUM_EMAIL_FROM live in this file, outside the repo.
+Environment=MYCELIUM_BASE_URL=https://jason-server.taildf1d89.ts.net:4444
+EnvironmentFile=-%h/.config/mycelium/env
 Environment=PATH=%h/.local/opt/node22/bin:%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin

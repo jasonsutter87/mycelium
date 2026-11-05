@@ -158,6 +158,12 @@ CREATE TABLE IF NOT EXISTS pr_history (
   synced_at TEXT NOT NULL
 );
 
+-- Findings already emailed (or baselined when alerts were turned on). A text key, so it survives package rows being rebuilt.
+CREATE TABLE IF NOT EXISTS alerted (
+  key        TEXT PRIMARY KEY,     -- ecosystem|name@version|vuln id
+  alerted_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_edges_child ON edges(child_id);
 CREATE INDEX IF NOT EXISTS idx_uses_pkg ON uses(package_id);
 `;

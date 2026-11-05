@@ -77,6 +77,8 @@ mycelium schedule          # daily scan + check with a macOS notification for an
 - **Fix** shows the pipeline live: Pull → Branch → Fix → Test → Commit → Push → PR. It runs in a throwaway copy, safe upgrades start ticked and majors opt-in, and nothing merges on its own.
 - **Pull** fast-forwards your folder after you merge, when that's safe.
 - **Fixed** is the history of what Mycelium has fixed: every upgrade from its GitHub PRs, merged or awaiting merge, with the advisories it closed. It's read from the PR descriptions and kept permanently, so entries stay after you pull. Fixes on local-only branches (no GitHub PR) aren't listed.
+- **Repos** (server installs): tick which GitHub repos to watch, and optionally watch new repos from an account automatically. Unticking stops watching a repo and keeps its clone and fix history.
+- **Alerts**: email when a new critical appears or enough new highs are waiting (3 by default). One email per check. Turning alerts on treats what's already open as known, and a failed send is retried at the next check. Needs `RESEND_API_KEY` and `MYCELIUM_EMAIL_FROM`; on a server they go in `~/.config/mycelium/env`.
 - **Findings, Audit, Infrastructure** tabs cover everything else, and **Rescan all** refreshes every project.
 
 It listens on `127.0.0.1` only, rejects unexpected `Host` headers (DNS rebinding), and requires a token on every API call, so no other website can press the buttons.
@@ -279,4 +281,4 @@ npm run typecheck
 - Gradle, Go and csproj projects without lockfiles only show direct dependencies.
 - No reachability analysis: it can't tell whether your code actually calls the vulnerable function.
 - GitHub Actions and Docker images are flagged for pinning but not yet matched against advisories.
-- PRs are GitHub-only (via `gh`). The dashboard's always-on mode and notifications are macOS-only.
+- PRs are GitHub-only (via `gh`). The dashboard's always-on mode (`--install`) and desktop notifications are macOS-only; email alerts work everywhere.
