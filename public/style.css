@@ -203,6 +203,14 @@ pre.log { font: 11.5px/1.5 var(--mono); background: var(--soft); border-radius: 
 .ptiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
 .ptile { text-align: left; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel2); color: inherit; padding: 12px 14px; cursor: pointer; font: inherit; }
 .ptile:hover { border-color: var(--accent); }
+.backlink { display: inline-block; border: 0; background: none; padding: 0; margin: 0 0 12px; color: var(--accent); font: inherit; font-size: 12.5px; cursor: pointer; }
+.backlink:hover { text-decoration: underline; }
+.ptile.static { cursor: default; }
+.ptile.static:hover { border-color: var(--line); }
+.pcard .row { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+.pcard .field.area { margin-top: 8px; }
+.profile .errbox, .profile .warn-box { margin: 0 0 12px; }
+.profile > .actions { margin: 14px 0 0; }
 .ptile b { display: block; font-size: 21px; line-height: 1.2; font-variant-numeric: tabular-nums; }
 .ptile span { color: var(--muted); font-size: 12px; }
 .pgrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: start; }
