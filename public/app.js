@@ -354,13 +354,15 @@ function renderRepos() {
   const projects = new Map(state.data.projects.map((p) => [p.name, p]));
   const projectOf = new Map(d.watched.map((w) => [w.slug, w.project]));
   // Watched repos GitHub no longer shows (deleted, or access lost) stay listed, or they could never be removed.
-  const rows = [...d.available.filter((r) => !r.archived || watchedNow.has(r.slug)),
+  const hidden = new Set(d.hiddenAccounts);
+  const rows = [...d.available.filter((r) => watchedNow.has(r.slug) || (!r.archived && !hidden.has(r.owner))),
     ...d.watched.filter((w) => !d.available.some((r) => r.slug === w.slug)).map((w) => ({ slug: w.slug, owner: w.slug.split("/")[0], missing: true, description: "" }))];
   const problem = (r) => d.issues[r.slug] || r.missing;
   const problems = rows.filter((r) => watchedNow.has(r.slug) && problem(r));
-  const owners = [...new Set(d.available.map((r) => r.owner))];
   const repoCount = (o) => d.available.filter((r) => r.owner === o).length;
-  owners.sort((a, b) => repoCount(b) - repoCount(a) || a.localeCompare(b));
+  const allOwners = [...new Set(d.available.map((r) => r.owner))].sort((a, b) => repoCount(b) - repoCount(a) || a.localeCompare(b));
+  const owners = allOwners.filter((o) => !hidden.has(o));
+  if (hidden.has(state.repoOwner)) state.repoOwner = "all";
   // Open on what's useful: your watched repos, or the picker when there aren't any yet.
   const tab = state.repoTab ?? (watchedNow.size ? "watching" : "available");
   const inTab = { watching: (r) => watchedNow.has(r.slug), available: (r) => !watchedNow.has(r.slug), problems: (r) => watchedNow.has(r.slug) && problem(r) };
@@ -395,6 +397,7 @@ function renderRepos() {
       <div class="chips" role="group" aria-label="Which repos">${tabs.map(([id, label, c]) => `<button data-rtab="${id}" class="${tab === id ? "on" : ""}">${label}<i>${c}</i></button>`).join("")}</div>
       <input class="field" id="rq" type="search" placeholder="Search repos" aria-label="Search repos" value="${esc(state.repoQ)}">
       <select class="field" id="rowner" aria-label="Filter by GitHub account"><option value="all">All accounts</option>${owners.map((o) => `<option value="${esc(o)}" ${state.repoOwner === o ? "selected" : ""}>${esc(o)} (${repoCount(o)})</option>`).join("")}</select>
+      ${state.repoOwner !== "all" ? `<button class="btn small" id="rhide" title="Leave this account out of this list">Hide this account</button>` : ""}
       ${tab === "available" ? `<button class="btn small" id="rselect" title="Tick every repo shown here">Select shown</button><button class="btn small" id="rclear" title="Untick every repo shown here">Clear shown</button>` : ""}
       ${tab === "problems" && problems.length ? `<button class="btn small" id="rretry" ${running || state.data.busy ? "disabled" : ""}>Retry all</button>` : ""}
       <span class="count">${shown.length} shown</span></div>
@@ -416,7 +419,10 @@ function renderRepos() {
       <div class="actions"><button class="btn small" id="rparse">Add to selection</button></div></details>` +
     (owners.length ? `<details class="page border-top" ${state.repoAutoOpen ? "open" : ""} id="rautod"><summary><b>Watch new repos automatically</b>${draft.auto.size ? ` <span class="muted">· ${draft.auto.size} account${draft.auto.size === 1 ? "" : "s"}</span>` : ""}</summary>
       <p class="small muted">New repos from these accounts are added at the next rescan or nightly check. Repos you've unticked stay unticked.</p>
-      <div class="opts">${owners.map((o) => `<label><input type="checkbox" data-auto="${esc(o)}" ${draft.auto.has(o) ? "checked" : ""}> ${esc(o)}</label>`).join("")}</div></details>` : "");
+      <div class="opts">${owners.map((o) => `<label><input type="checkbox" data-auto="${esc(o)}" ${draft.auto.has(o) ? "checked" : ""}> ${esc(o)}</label>`).join("")}</div></details>` : "") +
+    (allOwners.length ? `<details class="page border-top" ${state.repoHideOpen ? "open" : ""} id="rhided"><summary><b>Hide accounts</b>${hidden.size ? ` <span class="muted">· ${hidden.size} hidden</span>` : ""}</summary>
+      <p class="small muted">Hidden accounts aren't offered for import or automatic watching. Repos you already watch from them stay watched until you untick them.</p>
+      <div class="opts">${allOwners.map((o) => `<label><input type="checkbox" data-hide="${esc(o)}" ${hidden.has(o) ? "checked" : ""}> ${esc(o)} <span class="muted">(${repoCount(o)})</span></label>`).join("")}</div></details>` : "");
 
   const rq = $("rq");
   rq.oninput = () => {
@@ -434,6 +440,31 @@ function renderRepos() {
   document.querySelectorAll("[data-auto]").forEach((c) => (c.onchange = () => { c.checked ? draft.auto.add(c.dataset.auto) : draft.auto.delete(c.dataset.auto); renderRepos(); }));
   document.querySelectorAll("[data-goto]").forEach((b) => (b.onclick = () => { state.view = "projects"; selectProject(b.dataset.goto); renderAll(); }));
   $("rpaste").ontoggle = (e) => { state.repoPasteOpen = e.target.open; };
+  const setHidden = async (next, message) => {
+    try {
+      const out = await api("/api/repos/hidden", { accounts: [...next] });
+      d.hiddenAccounts = out.hiddenAccounts;
+      d.autoOwners = out.autoOwners;
+      // Unsaved ticks for repos that just went out of sight would otherwise be imported unseen.
+      for (const s of [...draft.add]) if (out.hiddenAccounts.includes(s.split("/")[0])) draft.add.delete(s);
+      for (const o of out.hiddenAccounts) draft.auto.delete(o);
+      banner(message);
+    } catch (e) { banner(e.message, true); }
+    renderRepos();
+  };
+  document.querySelectorAll("[data-hide]").forEach((c) => (c.onchange = () => {
+    const next = new Set(hidden);
+    c.checked ? next.add(c.dataset.hide) : next.delete(c.dataset.hide);
+    setHidden(next, c.checked ? `Hid ${c.dataset.hide}.` : `${c.dataset.hide} is back in the list.`);
+  }));
+  const hideBtn = $("rhide");
+  if (hideBtn) hideBtn.onclick = () => {
+    const name = state.repoOwner;
+    state.repoHideOpen = true;
+    setHidden(new Set([...hidden, name]), `Hid ${name}. You can bring it back under Hide accounts, below the list.`);
+  };
+  const hided = $("rhided");
+  if (hided) hided.ontoggle = (e) => { state.repoHideOpen = e.target.open; };
   const autod = $("rautod");
   if (autod) autod.ontoggle = (e) => { state.repoAutoOpen = e.target.open; };
   $("rtext").oninput = (e) => { state.repoPaste = e.target.value; };

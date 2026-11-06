@@ -150,3 +150,18 @@ export function updateRepoIssues(db: DatabaseSync, ok: string[], failed: { slug:
   for (const { slug, error } of failed) issues[slug] = { error, at: new Date().toISOString() };
   setSetting(db, "repo_issues", issues);
 }
+
+// ---------------------------------------------------------------- hidden accounts
+
+/** GitHub accounts left out of the repo picker. Only about what's offered: repos already being watched stay watched. */
+export const loadHiddenAccounts = (db: DatabaseSync) => getSetting<string[]>(db, "repo_hidden_accounts", []);
+
+export function saveHiddenAccounts(db: DatabaseSync, accounts: unknown): string[] {
+  const list = Array.isArray(accounts) ? [...new Set(accounts)] : [];
+  if (!list.every((a) => typeof a === "string" && /^[\w-]+$/.test(a))) throw new Error("That doesn't look like a GitHub account name.");
+  setSetting(db, "repo_hidden_accounts", list);
+  // Hiding an account also means not pulling in its new repos.
+  const auto = loadAutoWatch(db);
+  setSetting(db, "repo_auto", { ...auto, owners: auto.owners.filter((o) => !list.includes(o)) });
+  return list as string[];
+}

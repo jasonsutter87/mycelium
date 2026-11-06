@@ -20,7 +20,7 @@ import { saveProject, scanProject, scanRoots, setIgnored } from "./scan.ts";
 import { enrich } from "./depsdev.ts";
 import { pullProject, syncPrs } from "./prs.ts";
 import { alertsView, loadAlertSettings, runAlerts, saveAlertSettings, sendTestEmail } from "./alerts.ts";
-import { applyRepoChange, cleanError, fetchRepos, listGithubRepos, loadAutoWatch, loadRepoIssues, parseRepoInput, saveAutoWatch, updateRepoIssues, validSlug, type GithubRepo } from "./repos.ts";
+import { applyRepoChange, cleanError, fetchRepos, listGithubRepos, loadAutoWatch, loadHiddenAccounts, loadRepoIssues, parseRepoInput, saveAutoWatch, saveHiddenAccounts, updateRepoIssues, validSlug, type GithubRepo } from "./repos.ts";
 import { companyName, saveCompanyName } from "./db.ts";
 import { cloneDirs, readRepoList } from "./sync.ts";
 
@@ -279,7 +279,7 @@ export function serve(db: DatabaseSync, port: number) {
             console.error("listing GitHub repos:", e);
             error = "Couldn't list your GitHub repos. Check that `gh auth status` works on this server.";
           }
-          return send(res, 200, { managed: true, watched, available, autoOwners: loadAutoWatch(db).owners, issues: loadRepoIssues(db), error });
+          return send(res, 200, { managed: true, watched, available, autoOwners: loadAutoWatch(db).owners, hiddenAccounts: loadHiddenAccounts(db), issues: loadRepoIssues(db), error });
         }
         if (p === "/api/repos/job") return send(res, 200, repoJob);
         if (p === "/api/profile") {
@@ -287,7 +287,8 @@ export function serve(db: DatabaseSync, port: number) {
           let accounts: { owner: string; repos: number }[] = [];
           try {
             const tally = new Map<string, number>();
-            for (const r of await githubRepos()) tally.set(r.owner, (tally.get(r.owner) ?? 0) + 1);
+            const hidden = new Set(loadHiddenAccounts(db));
+            for (const r of (await githubRepos()).filter((x) => !hidden.has(x.owner))) tally.set(r.owner, (tally.get(r.owner) ?? 0) + 1);
             accounts = [...tally].map(([owner, repos]) => ({ owner, repos })).sort((a, b) => b.repos - a.repos || a.owner.localeCompare(b.owner));
           } catch { /* shown as not connected */ }
           const alerts = loadAlertSettings(db);
@@ -305,6 +306,7 @@ export function serve(db: DatabaseSync, port: number) {
       const body = await readBody(req);
       // Settings, not work: fine while a rescan runs.
       if (p === "/api/profile") return send(res, 200, { company: saveCompanyName(db, body.company) });
+      if (p === "/api/repos/hidden") return send(res, 200, { hiddenAccounts: saveHiddenAccounts(db, body.accounts), autoOwners: loadAutoWatch(db).owners });
       if (p === "/api/repos/parse") {
         const { slugs, invalid } = parseRepoInput(body.text);
         const watched = new Set(watchedList());

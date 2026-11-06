@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import { companyName, openDb, saveCompanyName } from "../src/db.ts";
-import { applyAutoWatch, fetchRepos, loadRepoIssues, newRepos, parseRepoInput, planRepoChange, saveAutoWatch, updateRepoIssues, validSlug, writeRepoList, type GithubRepo } from "../src/repos.ts";
+import { applyAutoWatch, fetchRepos, loadAutoWatch, loadHiddenAccounts, loadRepoIssues, newRepos, parseRepoInput, planRepoChange, saveAutoWatch, saveHiddenAccounts, updateRepoIssues, validSlug, writeRepoList, type GithubRepo } from "../src/repos.ts";
 import { readRepoList } from "../src/sync.ts";
 
 const repo = (slug: string, over: Partial<GithubRepo> = {}): GithubRepo => ({ slug, owner: slug.split("/")[0], private: false, archived: false, fork: false, description: "", pushedAt: null, ...over });
@@ -111,4 +111,15 @@ test("the company name is cleaned and limited", () => {
   assert.equal(saveCompanyName(db, "  Acme\r\nBcc: x@y.z "), "Acme Bcc: x@y.z");
   assert.equal(companyName(db), "Acme Bcc: x@y.z");
   assert.throws(() => saveCompanyName(db, "x".repeat(81)), /80 characters/);
+});
+
+test("hiding an account stops auto-watching it, and bad names are refused", () => {
+  const db = openDb(":memory:");
+  saveAutoWatch(db, ["old", "keep"], [repo("old/a"), repo("keep/b")]);
+  assert.deepEqual(saveHiddenAccounts(db, ["old", "old"]), ["old"]);
+  assert.deepEqual(loadHiddenAccounts(db), ["old"]);
+  assert.deepEqual(loadAutoWatch(db).owners, ["keep"]);
+  assert.deepEqual(loadAutoWatch(db).seen, ["old/a", "keep/b"], "what's been seen is kept, so unhiding doesn't pull in old repos");
+  assert.throws(() => saveHiddenAccounts(db, ["../etc"]), /account name/);
+  assert.deepEqual(saveHiddenAccounts(db, []), []);
 });
