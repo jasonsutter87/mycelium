@@ -3,7 +3,9 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
-import { errLine, ignoredOverrides, npmLockHas, plainOverrideSafe, prBody, prTitle, siblingSource, type FixPlan, type PlannedFix } from "../src/fix.ts";
+import { errLine, fixKey, ignoredOverrides, installedVersion, leftOutFindings, leftoverDetail, npmLockHas, plainOverrideSafe, prBody, prTitle, siblingSource, waitingSummary, type FixPlan, type LeftOut, type PlannedFix } from "../src/fix.ts";
+import { parseFixedTable } from "../src/prs.ts";
+import type { Finding } from "../src/graph.ts";
 
 const fx = (over: Partial<PlannedFix>): PlannedFix => ({
   project: "app", projectPath: "/r/app", component: "package-lock.json", ecosystem: "npm", name: "next", from: "16.1.1",
@@ -293,4 +295,64 @@ test("a sibling path matches its folder whatever the case, but never guesses", (
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("installedVersion: reads what landed, from the copy on the fix's major line", () => {
+  // VeilProof#2: asked for minimatch 5.1.8, npm landed on 5.1.9, and copies at other majors share the lockfile.
+  assert.equal(installedVersion(["3.1.5", "5.1.9", "9.0.3"], { to: "5.1.8" }), "5.1.9");
+  assert.equal(installedVersion(["5.1.8", "5.1.9"], { to: "5.1.8" }), "5.1.8");
+  assert.equal(installedVersion([], { to: "5.1.8" }), null, "no copy left: it left the tree");
+  assert.equal(installedVersion(["3.1.5"], { to: "5.1.8" }), undefined, "no match: don't guess");
+});
+
+test("PR body: shows the version that landed, and the dashboard still parses it", () => {
+  const plan: FixPlan = { project: "app", projectPath: "/r/app", fixes: [] };
+  const mm = fx({ name: "minimatch", from: "5.1.6", to: "5.1.8" });
+  const gone = fx({ name: "rand", from: "0.8.5", to: "0.8.6" });
+  const body = prBody(plan, { applied: [mm, gone], stillVulnerable: [], skipped: [], failed: [], verify: [],
+    installed: { [fixKey(mm)]: "5.1.9", [fixKey(gone)]: null } });
+  const rows = parseFixedTable(body);
+  assert.equal(rows.find((r) => r.name === "minimatch")?.to, "5.1.9");
+  assert.equal(rows.find((r) => r.name === "rand")?.to, null);
+});
+
+const finding = (name: string, version: string, severity: string, scope: string, component = "package-lock.json"): Finding => ({
+  vulnId: `V-${name}-${severity}`, cve: null, summary: "", severity, url: "", packageId: 1, ecosystem: "npm", name, version, fixed: null, firstSeen: "", risk: 1,
+  hits: [{ project: "app", projectPath: "/r/app", exposure: "local", component, componentId: 1, direct: false, scope }],
+} as Finding);
+
+test("leftOutFindings: only what's still there and wasn't planned, one row per package", () => {
+  const plan: FixPlan = { project: "app", projectPath: "/r/app", fixes: [fx({ name: "fastify", from: "4.29.1" })] };
+  const have = new Set(["package-lock.json|minimatch@9.0.3", "package-lock.json|fastify@4.29.1", "package-lock.json|left@1.0.0"]);
+  const out = leftOutFindings([
+    finding("minimatch", "9.0.3", "MODERATE", "dev"),
+    finding("minimatch", "9.0.3", "HIGH", "dev"),
+    finding("minimatch", "3.1.2", "HIGH", "dev"), // cleared along the way: not in the new lockfile
+    finding("fastify", "4.29.1", "HIGH", "prod"), // planned: it has its own line
+    finding("left", "1.0.0", "LOW", "prod"),
+  ], plan, have, (c) => c);
+  assert.deepEqual(out.map((l) => [l.name, l.version, l.severity, l.devOnly]), [["minimatch", "9.0.3", "HIGH", true], ["left", "1.0.0", "LOW", false]]);
+});
+
+test("PR body: says what it left out, and caps the list", () => {
+  const plan: FixPlan = { project: "app", projectPath: "/r/app", fixes: [] };
+  const left = (name: string, devOnly = true): LeftOut => ({ projectPath: "/r/app", component: "package-lock.json", name, version: "9.0.3", severity: "HIGH", devOnly });
+  const base = { applied: [fx({})], stillVulnerable: [], skipped: [], failed: [], verify: [] };
+  const body = prBody(plan, { ...base, leftOut: [left("minimatch"), left("lodash", false)] });
+  assert.match(body, /### Not fixed in this PR/);
+  assert.match(body, /`minimatch` 9\.0\.3 \(HIGH, `package-lock\.json`\): dev-only/);
+  assert.match(body, /`lodash` 9\.0\.3 .*lower severity/);
+  const many = prBody(plan, { ...base, leftOut: Array.from({ length: 18 }, (_, i) => left(`p${i}`)) });
+  assert.match(many, /and 3 more/);
+  assert.doesNotMatch(many, /`p15`/);
+  assert.doesNotMatch(prBody(plan, base), /Not fixed/);
+});
+
+test("fix-all: waiting on upstream reads apart from needing a person, and groups by package", () => {
+  assert.equal(leftoverDetail(2, 1), "2 need a human · 1 waiting on an upstream release");
+  assert.equal(leftoverDetail(0, 1), "1 waiting on an upstream release");
+  assert.equal(leftoverDetail(3, 0), "3 need a human");
+  assert.deepEqual(waitingSummary([
+    { project: "a", waiting: ["glib 0.18.5", "glib 0.18.5"] }, { project: "b", waiting: ["glib 0.18.5", "zip 2.0.0"] }, { project: "c", waiting: [] },
+  ]), ["glib 0.18.5: a, b", "zip 2.0.0: b"]);
 });

@@ -177,6 +177,60 @@ export interface ApplyOptions {
   onLog?: (line: string) => void;
 }
 
+export interface LeftOut {
+  projectPath: string;
+  component: string;
+  name: string;
+  version: string;
+  severity: string;
+  devOnly: boolean;
+}
+
+export const fixKey = (fx: Pick<PlannedFix, "component" | "name" | "from">) => `${fx.component}|${fx.name}@${fx.from}`;
+
+/**
+ * A fix's `to` is the lowest version that clears the advisories. The package manager can land higher, and a package
+ * often has several copies at other majors, so match on the major line. null: no copy left. undefined: can't tell.
+ */
+export function installedVersion(versions: string[], fx: Pick<PlannedFix, "to">): string | null | undefined {
+  if (!versions.length) return null;
+  const to = fx.to;
+  if (!to) return undefined;
+  return versions.filter((v) => major(v) === major(to) && compareVersions(v, to) >= 0).sort(compareVersions)[0];
+}
+
+/** Findings still present after the upgrade that aren't in the plan: without this a PR reads as if it cleared everything. */
+export function leftOutFindings(found: Finding[], plan: FixPlan, have: Set<string>, relPath: (component: string) => string): LeftOut[] {
+  const planned = new Set(plan.fixes.map(fixKey));
+  const out = new Map<string, LeftOut>();
+  for (const f of found) {
+    for (const h of f.hits) {
+      if (h.project !== plan.project) continue;
+      const key = fixKey({ component: h.component, name: f.name, from: f.version });
+      if (planned.has(key) || !have.has(`${relPath(h.component)}|${f.name}@${f.version}`)) continue;
+      const seen = out.get(key);
+      const prod = f.hits.some((x) => x.project === plan.project && x.component === h.component && x.scope === "prod");
+      out.set(key, {
+        projectPath: plan.projectPath, component: h.component, name: f.name, version: f.version, devOnly: !prod,
+        severity: seen && severityRank(seen.severity) > severityRank(f.severity) ? seen.severity : f.severity,
+      });
+    }
+  }
+  return [...out.values()].sort((a, b) => severityRank(b.severity) - severityRank(a.severity) || a.name.localeCompare(b.name));
+}
+
+/** How a fix-all row reads when nothing could be done yet. Waiting is apart from needing a person: it clears by itself. */
+export function leftoverDetail(manual: number, waiting: number): string {
+  return [manual ? `${manual} need a human` : "", waiting ? `${waiting} waiting on an upstream release` : ""].filter(Boolean).join(" · ");
+}
+
+/** One line per blocked package, however many repos share it: nine repos stuck on glib is one thing to know. */
+export function waitingSummary(rows: { project: string; waiting: string[] }[]): string[] {
+  const by = new Map<string, string[]>();
+  for (const r of rows) for (const w of new Set(r.waiting)) by.set(w, [...(by.get(w) ?? []), r.project]);
+  return [...by].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0])).map(([pkg, projects]) => `${pkg}: ${projects.join(", ")}`);
+}
+
 export interface ApplyResult {
   branch: string | null;
   repos: string[];
@@ -186,6 +240,10 @@ export interface ApplyResult {
   failed: { fix: PlannedFix; error: string }[];
   fixed: string[]; // "name@from" that no longer appear vulnerable after re-scan
   stillVulnerable: string[];
+  /** What each fix really landed on, from the lockfile. Key: fixKey(). null: the package left the tree. */
+  installed: Record<string, string | null>;
+  /** Vulnerable packages still in the lockfile that this run wasn't asked to fix, so the PR can say so. */
+  leftOut: LeftOut[];
   /** preexisting: the same command also fails on the branch you started from, so the upgrade didn't cause it. */
   verify: { dir: string; command: string; ok: boolean; output: string; preexisting?: boolean; baseBroken?: boolean }[];
   committed: boolean;
@@ -207,7 +265,7 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
     }
   };
   plan = { ...plan, projectPath: real(plan.projectPath), fixes: plan.fixes.map((f) => ({ ...f, projectPath: real(f.projectPath) })) };
-  const res: ApplyResult = { branch: null, repos: [], applied: [], skipped: [], failed: [], fixed: [], stillVulnerable: [], verify: [], committed: false, prs: [], noPr: [], verifyFailedRepos: [], log: [] };
+  const res: ApplyResult = { branch: null, repos: [], applied: [], skipped: [], failed: [], fixed: [], stillVulnerable: [], installed: {}, leftOut: [], verify: [], committed: false, prs: [], noPr: [], verifyFailedRepos: [], log: [] };
   const log = (s: string) => {
     res.log.push(s);
     opts.onLog?.(s);
@@ -380,11 +438,20 @@ export function applyFixes(db: DatabaseSync, plan: FixPlan, opts: ApplyOptions =
     for (const [repo, { path }] of wt) {
       const scan = scanProject(path);
       const have = new Set(scan.components.flatMap((c) => c.packages.map((p) => `${c.path}|${p.name}@${p.version}`)));
+      const relPath = (component: string) => relative(repo, join(plan.projectPath, component));
       for (const fx of res.applied.filter((f) => repoOf.get(join(f.projectPath, dirname(f.component))) === repo)) {
         const label = `${fx.name}@${fx.from}`;
-        if (have.has(`${relative(repo, join(fx.projectPath, fx.component))}|${label}`)) res.stillVulnerable.push(`${label} (${fx.component})`);
-        else res.fixed.push(`${label} → ${fx.to} (${fx.component})`);
+        const rel = relative(repo, join(fx.projectPath, fx.component));
+        if (have.has(`${rel}|${label}`)) {
+          res.stillVulnerable.push(`${label} (${fx.component})`);
+          continue;
+        }
+        const versions = scan.components.filter((c) => c.path === rel).flatMap((c) => c.packages.filter((p) => p.name === fx.name).map((p) => p.version));
+        const landed = installedVersion(versions, fx);
+        if (landed !== undefined) res.installed[fixKey(fx)] = landed;
+        res.fixed.push(`${label} → ${landed === undefined ? fx.to : landed ?? "removed"} (${fx.component})`);
       }
+      res.leftOut.push(...leftOutFindings(findings(db, { includeDev: true }), plan, have, relPath));
     }
 
     // 5. Optional build/test, in the worktree. Rust reuses your target/ so it doesn't rebuild the world.
@@ -515,24 +582,35 @@ function openPr(repo: string, branch: string, target: string, plan: FixPlan, res
 }
 
 /** PR description: what changed, which advisories it closes, what was left and why, and how it was verified. */
-export function prBody(plan: FixPlan, res: Pick<ApplyResult, "applied" | "stillVulnerable" | "skipped" | "failed" | "verify">, repo?: string): string {
-  const inRepo = (fx: PlannedFix) => !repo || join(fx.projectPath, fx.component).startsWith(repo + "/");
+const LEFT_OUT_SHOWN = 15;
+
+export function prBody(plan: FixPlan, res: Pick<ApplyResult, "applied" | "stillVulnerable" | "skipped" | "failed" | "verify"> & Partial<Pick<ApplyResult, "installed" | "leftOut">>, repo?: string): string {
+  const inRepo = (fx: Pick<PlannedFix, "projectPath" | "component">) => !repo || join(fx.projectPath, fx.component).startsWith(repo + "/");
   const still = new Set(res.stillVulnerable.map((s) => s.split(" ")[0]));
   const fixed = res.applied.filter(inRepo).filter((fx) => !still.has(`${fx.name}@${fx.from}`));
   const link = (id: string) =>
     /^GHSA-/.test(id) ? `[${id}](https://github.com/advisories/${id})` : /^CVE-/.test(id) ? `[${id}](https://nvd.nist.gov/vuln/detail/${id})` : `[${id}](https://osv.dev/vulnerability/${id})`;
+  const landed = (fx: PlannedFix) => {
+    const v = res.installed?.[fixKey(fx)];
+    return v === undefined ? fx.to : v ?? "removed (no longer in the tree)";
+  };
+  const leftOut = (res.leftOut ?? []).filter(inRepo);
   const lines: string[] = [];
   lines.push(`Automated dependency security upgrade for **${plan.project}** by Mycelium 🍄.`, "");
   lines.push("### Fixed", "", "| Severity | Package | Upgrade | Lockfile | Advisories |", "|---|---|---|---|---|");
   for (const fx of fixed.sort((a, b) => severityRank(b.severity) - severityRank(a.severity))) {
-    lines.push(`| ${fx.severity} | \`${fx.name}\` | ${fx.from} → ${fx.to}${fx.breaking ? " ⚠️ major" : ""} | \`${fx.component}\` | ${fx.vulns.slice(0, 4).map(link).join(" ")}${fx.vulns.length > 4 ? ` +${fx.vulns.length - 4}` : ""} |`);
+    lines.push(`| ${fx.severity} | \`${fx.name}\` | ${fx.from} → ${landed(fx)}${fx.breaking ? " ⚠️ major" : ""} | \`${fx.component}\` | ${fx.vulns.slice(0, 4).map(link).join(" ")}${fx.vulns.length > 4 ? ` +${fx.vulns.length - 4}` : ""} |`);
   }
   lines.push("", "Each one was confirmed by re-reading the lockfile after the upgrade, not just by the install exiting cleanly.");
-  if (res.stillVulnerable.length || res.skipped.length || res.failed.length) {
+  if (res.stillVulnerable.length || res.skipped.length || res.failed.length || leftOut.length) {
     lines.push("", "### Not fixed in this PR", "");
     for (const s of res.stillVulnerable) lines.push(`- \`${s}\`: the package manager kept the old version (a parent pins it)`);
     for (const s of res.skipped.filter((s) => inRepo(s.fix))) lines.push(`- \`${s.fix.name}\` ${s.fix.from}: ${s.reason}`);
     for (const f of res.failed.filter((f) => inRepo(f.fix))) lines.push(`- \`${f.fix.name}\` ${f.fix.from}: ${errLine(f.error)}`);
+    for (const l of leftOut.slice(0, LEFT_OUT_SHOWN)) {
+      lines.push(`- \`${l.name}\` ${l.version} (${l.severity}, \`${l.component}\`): ${l.devOnly ? "dev-only, and automatic fixes leave those out" : "lower severity or a fix closed earlier, so not part of this run"}`);
+    }
+    if (leftOut.length > LEFT_OUT_SHOWN) lines.push(`- and ${leftOut.length - LEFT_OUT_SHOWN} more: see the dashboard`);
   }
   lines.push("", "### Verification", "");
   // Only this repo's checks: a multi-repo project (VeilSuite) used to list every repo's results in every PR.
