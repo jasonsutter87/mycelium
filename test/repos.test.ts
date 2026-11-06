@@ -3,8 +3,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
-import { openDb } from "../src/db.ts";
-import { applyAutoWatch, newRepos, planRepoChange, saveAutoWatch, validSlug, writeRepoList, type GithubRepo } from "../src/repos.ts";
+import { companyName, openDb, saveCompanyName } from "../src/db.ts";
+import { applyAutoWatch, fetchRepos, loadRepoIssues, newRepos, parseRepoInput, planRepoChange, saveAutoWatch, updateRepoIssues, validSlug, writeRepoList, type GithubRepo } from "../src/repos.ts";
 import { readRepoList } from "../src/sync.ts";
 
 const repo = (slug: string, over: Partial<GithubRepo> = {}): GithubRepo => ({ slug, owner: slug.split("/")[0], private: false, archived: false, fork: false, description: "", pushedAt: null, ...over });
@@ -59,4 +59,56 @@ test("no owners means no call to GitHub", async () => {
   const db = openDb(":memory:");
   assert.deepEqual(await applyAutoWatch(db, "/c", "/nope", [], async () => { throw new Error("shouldn't be called"); }), []);
   assert.deepEqual(newRepos([repo("o/a")], { owners: [], seen: [] }), []);
+});
+
+test("pasted repos: names and URLs in any separator, junk reported, duplicates merged", () => {
+  const out = parseRepoInput(`acme/api, https://github.com/acme/web.git
+    git@github.com:acme/ssh.git https://github.com/acme/api/tree/main  https://github.com/acme/slash/
+    --upload-pack=evil just-a-word https://gitlab.com/acme/other`);
+  assert.deepEqual(out.slugs, ["acme/api", "acme/web", "acme/ssh", "acme/slash"]);
+  assert.deepEqual(out.invalid, ["--upload-pack=evil", "just-a-word", "https://gitlab.com/acme/other"]);
+  assert.deepEqual(parseRepoInput(""), { slugs: [], invalid: [] });
+});
+
+test("fetching: clones what's missing, pulls what's there, and one failure doesn't stop the rest", async () => {
+  const calls: string[][] = [];
+  const events: string[] = [];
+  const out = await fetchRepos("/c", ["o/have"], ["o/have", "o/new", "o/bad"], (p) => events.push(`${p.slug}:${p.state}`), {
+    exists: (p) => p === "/c/have/.git",
+    run: async (cmd, args) => {
+      calls.push([cmd, ...args]);
+      if (args.includes("o/bad")) throw Object.assign(new Error("Command failed"), { stderr: "fatal: https://user:s3cret@github.com/o/bad not found\nmore" });
+    },
+  });
+  assert.deepEqual(calls.find((c) => c[0] === "git"), ["git", "-C", "/c/have", "pull", "--ff-only", "--quiet"]);
+  assert.deepEqual(calls.find((c) => c.includes("o/new")), ["gh", "repo", "clone", "o/new", "/c/new", "--", "--quiet"]);
+  assert.equal(out.failed.length, 1);
+  assert.equal(out.failed[0].slug, "o/bad");
+  assert.doesNotMatch(out.failed[0].error, /s3cret/, "a token in a URL never reaches the page");
+  assert.ok(events.includes("o/new:ok") && events.includes("o/bad:failed"));
+  assert.equal(out.pathOf("o/new"), "/c/new");
+});
+
+test("fetching never runs more than the limit at once", async () => {
+  let now = 0, peak = 0;
+  await fetchRepos("/c", [], ["o/a", "o/b", "o/c", "o/d", "o/e"], () => {}, {
+    exists: () => false, concurrency: 2,
+    run: async () => { peak = Math.max(peak, ++now); await new Promise((r) => setTimeout(r, 5)); now--; },
+  });
+  assert.equal(peak, 2);
+});
+
+test("problems clear once a repo updates, and stay separate per repo", () => {
+  const db = openDb(":memory:");
+  updateRepoIssues(db, [], [{ slug: "o/a", error: "gone" }, { slug: "o/b", error: "denied" }]);
+  updateRepoIssues(db, ["o/a"], []);
+  assert.deepEqual(Object.keys(loadRepoIssues(db)), ["o/b"]);
+});
+
+test("the company name is cleaned and limited", () => {
+  const db = openDb(":memory:");
+  assert.equal(companyName(db), "");
+  assert.equal(saveCompanyName(db, "  Acme\r\nBcc: x@y.z "), "Acme Bcc: x@y.z");
+  assert.equal(companyName(db), "Acme Bcc: x@y.z");
+  assert.throws(() => saveCompanyName(db, "x".repeat(81)), /80 characters/);
 });

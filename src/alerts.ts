@@ -5,6 +5,7 @@
 // baseline, so the first email is about something new rather than the whole backlog.
 
 import type { DatabaseSync } from "node:sqlite";
+import { companyName } from "./db.ts";
 import { findings, type Finding } from "./graph.ts";
 import { fetchRetry } from "./net.ts";
 
@@ -89,7 +90,7 @@ const esc = (s: unknown) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "
 const safeUrl = (u: unknown) => (/^https?:\/\//i.test(String(u ?? "")) ? esc(u) : "");
 const projectsOf = (f: Finding) => [...new Set(f.hits.map((h) => h.project))];
 
-export function buildAlertEmail(list: Finding[], recipients: string[], baseUrl: string | null): Email {
+export function buildAlertEmail(list: Finding[], recipients: string[], baseUrl: string | null, company = ""): Email {
   const ordered = [...list].sort((a, b) => Number(isCritical(b)) - Number(isCritical(a)) || b.risk - a.risk);
   const crit = list.filter(isCritical).length, high = list.length - crit;
   const projects = [...new Set(list.flatMap(projectsOf))];
@@ -116,7 +117,7 @@ export function buildAlertEmail(list: Finding[], recipients: string[], baseUrl: 
     ...ordered.map((f) => `${isCritical(f) ? "CRITICAL" : "HIGH"}  ${f.name} ${f.version} (${fix(f)})  ${f.cve ?? f.vulnId}  in ${projectsOf(f).join(", ")}\n  ${f.summary}`),
     ...(baseUrl ? ["", `Open Mycelium: ${baseUrl}`] : [])].join("\n");
   // Package names and summaries come from outside: no line breaks in a header.
-  return { to: recipients, subject: `Mycelium: ${what} in ${where}`.replace(/[\r\n]+/g, " "), html, text };
+  return { to: recipients, subject: `${company ? `[${company}] ` : ""}Mycelium: ${what} in ${where}`.replace(/[\r\n]+/g, " "), html, text };
 }
 
 // ---------------------------------------------------------------- sending
@@ -156,7 +157,7 @@ export async function runAlerts(db: DatabaseSync, baseUrl: string | null, send: 
   if (!list.length) return { sent: 0 };
   const status = loadAlertStatus(db);
   try {
-    await send(buildAlertEmail(list, s.recipients, baseUrl));
+    await send(buildAlertEmail(list, s.recipients, baseUrl, companyName(db)));
   } catch (e) {
     const error = (e as Error).message;
     setJson(db, "alerts_status", { ...status, lastError: error, lastErrorAt: new Date().toISOString() });

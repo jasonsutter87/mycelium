@@ -49,7 +49,7 @@ async function sync(dir?: string) {
   if (!dir || !list) return fail("Usage: mycelium sync <dir> --list <file with one owner/name per line>");
   const { readRepoList, syncRepos } = await import("./sync.ts");
   const target = resolve(dir);
-  const { applyAutoWatch } = await import("./repos.ts");
+  const { applyAutoWatch, updateRepoIssues } = await import("./repos.ts");
   try {
     const added = await applyAutoWatch(db, target, list, readRepoList(list));
     if (added.length) console.log(`watching ${added.length} new repo(s): ${added.join(", ")}`);
@@ -57,6 +57,7 @@ async function sync(dir?: string) {
     console.log(c.dim(`couldn't look for new repos: ${(e as Error).message.split("\n")[0]}`)); // the ones we have still get checked
   }
   const r = syncRepos(target, readRepoList(list), (s) => console.log(c.dim(s)));
+  updateRepoIssues(db, readRepoList(list).filter((s) => !r.failed.includes(s)), r.errors);
   console.log(`${r.cloned.length} cloned, ${r.updated.length} updated, ${r.failed.length} failed.`);
   if (r.failed.length) process.exitCode = 1;
   if (flags.has("--pull-only")) return; // the dashboard's Rescan does its own scan and check

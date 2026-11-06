@@ -3,11 +3,11 @@
 // a clone can hold a branch kept from a failed fix, and re-adding is instant.
 
 import { execFile } from "node:child_process";
-import { writeFileSync, renameSync } from "node:fs";
+import { existsSync, writeFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type { DatabaseSync } from "node:sqlite";
-import { cloneDirs } from "./sync.ts";
+import { cloneDirs, githubSlug } from "./sync.ts";
 
 export interface GithubRepo {
   slug: string;
@@ -89,4 +89,64 @@ export async function applyAutoWatch(db: DatabaseSync, dir: string, file: string
   if (add.length) applyRepoChange(db, dir, file, list, add, []);
   saveAutoWatch(db, auto.owners, available);
   return add;
+}
+
+// ---------------------------------------------------------------- importing
+
+/** Reads pasted repos: owner/name or any GitHub URL, separated by lines, spaces or commas. */
+export function parseRepoInput(text: string): { slugs: string[]; invalid: string[] } {
+  const slugs = new Set<string>(), invalid: string[] = [];
+  for (const raw of String(text ?? "").split(/[\s,]+/).filter(Boolean)) {
+    const cleaned = raw.replace(/\/(tree|blob|pull|issues)\/.*$/, "").replace(/\/$/, "");
+    const slug = /github\.com[:/]/.test(cleaned) ? githubSlug(cleaned) : cleaned.replace(/\.git$/, "");
+    if (validSlug(slug)) slugs.add(slug);
+    else invalid.push(raw);
+  }
+  return { slugs: [...slugs], invalid };
+}
+
+/** The first useful line of a git or gh error, with any token in a URL removed. */
+export function cleanError(e: any): string {
+  const line = String(e?.stderr || e?.message || e).trim().split("\n").find((l) => l.trim() && !l.startsWith("Command failed")) ?? "unknown error";
+  return line.replace(/\/\/[^/@\s]+@/g, "//").slice(0, 300);
+}
+
+export type RepoRunner = (cmd: string, args: string[]) => Promise<unknown>;
+const defaultRunner: RepoRunner = (cmd, args) => promisify(execFile)(cmd, args, { encoding: "utf8", timeout: 600_000, maxBuffer: 1 << 24 });
+
+/**
+ * Clones what's missing and fast-forwards what's there, without blocking the server: a big clone takes minutes and the
+ * page has to keep showing progress. One failure doesn't stop the rest. Never force-updates.
+ */
+export async function fetchRepos(dir: string, list: string[], targets: string[], onProgress: (p: { slug: string; state: "start" | "ok" | "failed"; error?: string }) => void,
+  { run = defaultRunner, exists = (p: string) => existsSync(p), concurrency = 3 }: { run?: RepoRunner; exists?: (p: string) => boolean; concurrency?: number } = {}) {
+  const folders = cloneDirs([...new Set([...list, ...targets])]);
+  const failed: { slug: string; error: string }[] = [];
+  const queue = [...targets];
+  await Promise.all(Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+    for (let slug = queue.shift(); slug; slug = queue.shift()) {
+      onProgress({ slug, state: "start" });
+      const path = join(dir, folders.get(slug)!);
+      try {
+        if (exists(join(path, ".git"))) await run("git", ["-C", path, "pull", "--ff-only", "--quiet"]);
+        else await run("gh", ["repo", "clone", slug, path, "--", "--quiet"]);
+        onProgress({ slug, state: "ok" });
+      } catch (e) {
+        const error = cleanError(e);
+        failed.push({ slug, error });
+        onProgress({ slug, state: "failed", error });
+      }
+    }
+  }));
+  return { failed, pathOf: (slug: string) => join(dir, folders.get(slug)!) };
+}
+
+/** Repos that couldn't be updated, with why, for the Problems view. Whoever updates a repo clears or sets its entry. */
+export interface RepoIssue { error: string; at: string }
+export const loadRepoIssues = (db: DatabaseSync) => getSetting<Record<string, RepoIssue>>(db, "repo_issues", {});
+export function updateRepoIssues(db: DatabaseSync, ok: string[], failed: { slug: string; error: string }[]) {
+  const issues = loadRepoIssues(db);
+  for (const slug of ok) delete issues[slug];
+  for (const { slug, error } of failed) issues[slug] = { error, at: new Date().toISOString() };
+  setSetting(db, "repo_issues", issues);
 }

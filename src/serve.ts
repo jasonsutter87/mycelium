@@ -19,8 +19,9 @@ import { checkAll } from "./osv.ts";
 import { saveProject, scanProject, scanRoots, setIgnored } from "./scan.ts";
 import { enrich } from "./depsdev.ts";
 import { pullProject, syncPrs } from "./prs.ts";
-import { alertsView, runAlerts, saveAlertSettings, sendTestEmail } from "./alerts.ts";
-import { applyRepoChange, listGithubRepos, loadAutoWatch, saveAutoWatch, validSlug, type GithubRepo } from "./repos.ts";
+import { alertsView, loadAlertSettings, runAlerts, saveAlertSettings, sendTestEmail } from "./alerts.ts";
+import { applyRepoChange, cleanError, fetchRepos, listGithubRepos, loadAutoWatch, loadRepoIssues, parseRepoInput, saveAutoWatch, updateRepoIssues, validSlug, type GithubRepo } from "./repos.ts";
+import { companyName, saveCompanyName } from "./db.ts";
 import { cloneDirs, readRepoList } from "./sync.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -28,6 +29,22 @@ const PUBLIC = join(HERE, "..", "public");
 const CLI = join(HERE, "cli.ts");
 const STATIC: Record<string, string> = { "/style.css": "text/css", "/app.js": "text/javascript", "/favicon.svg": "image/svg+xml" };
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+const LOCAL_ONLY = "This install scans folders on this computer, so there's no repo list to change.";
+
+/** Importing or re-scanning a few repos, in the background. Only ever touches those repos, not the whole account. */
+interface RepoJob {
+  kind: "import" | "scan";
+  state: "running" | "done" | "failed";
+  step: "fetching" | "scanning" | "checking" | "finished";
+  total: number;
+  finished: number;
+  current: string[];
+  failed: { slug: string; error: string }[];
+  warnings: string[];
+  error: string | null;
+  startedAt: string;
+}
 
 interface Job {
   id: number;
@@ -77,6 +94,64 @@ export function serve(db: DatabaseSync, port: number) {
     if (fresh || !githubCache || Date.now() - githubCache.at > 5 * 60_000) githubCache = { at: Date.now(), repos: await listGithubRepos() };
     return githubCache.repos;
   };
+
+  const watchedList = () => (cfg.repos && existsSync(cfg.repos.list) ? readRepoList(cfg.repos.list) : []);
+
+  // Identity of the GitHub login Mycelium acts as. Cached with the repo list: it's a network call, and rarely changes.
+  let githubUserCache: { at: number; value: { login: string; name: string | null } | null; error: string | null } | null = null;
+  const githubUser = async () => {
+    if (!githubUserCache || Date.now() - githubUserCache.at > 5 * 60_000) {
+      try {
+        const { stdout } = await promisify(execFile)("gh", ["api", "user", "--jq", "{login, name}"], { encoding: "utf8", timeout: 20_000 });
+        githubUserCache = { at: Date.now(), value: JSON.parse(stdout), error: null };
+      } catch (e) {
+        console.error("reading the GitHub user:", e);
+        githubUserCache = { at: Date.now(), value: null, error: "not connected" };
+      }
+    }
+    return githubUserCache;
+  };
+
+  let repoJob: RepoJob | null = null;
+  function startRepoJob(kind: RepoJob["kind"], slugs: string[]): RepoJob {
+    const current: RepoJob = { kind, state: "running", step: "fetching", total: slugs.length, finished: 0, current: [], failed: [], warnings: [], error: null, startedAt: new Date().toISOString() };
+    repoJob = current;
+    busy = `${kind === "import" ? "importing" : "scanning"} ${slugs.length} repo${slugs.length === 1 ? "" : "s"}`;
+    void (async () => {
+      try {
+        const { failed, pathOf } = await fetchRepos(cfg.repos!.dir, watchedList(), slugs, (u) => {
+          if (u.state === "start") current.current.push(u.slug);
+          else {
+            current.current = current.current.filter((s) => s !== u.slug);
+            current.finished++;
+          }
+        });
+        current.failed = failed;
+        const failedNames = new Set(failed.map((f) => f.slug));
+        updateRepoIssues(db, slugs.filter((s) => !failedNames.has(s)), failed);
+        current.step = "scanning";
+        setIgnored(JSON.parse(setting("ignored") ?? "[]"));
+        for (const slug of slugs) if (existsSync(pathOf(slug))) saveProject(db, scanProject(pathOf(slug))); // a failed pull still has last night's clone
+        current.step = "checking";
+        await checkAll(db); // fatal on failure: acting on a partial answer would clear findings that still apply
+        try { await enrich(db); } catch (e) { current.warnings.push(`License and version data not updated: ${(e as Error).message}`); }
+        try { await syncPrs(db); } catch (e) { current.warnings.push(`Fix history not updated: ${cleanError(e)}`); }
+        const alert = await runAlerts(db, baseUrl);
+        if (alert.error) current.warnings.push(`Couldn't send the alert email: ${alert.error}`);
+        current.state = "done";
+      } catch (e) {
+        console.error("repo job failed:", e);
+        current.state = "failed";
+        current.error = (e as Error).message;
+      } finally {
+        current.step = "finished";
+        current.current = [];
+        busy = null;
+        clearPrCache();
+      }
+    })();
+    return current;
+  }
 
   /** Update the clones, scan, check, sync PRs, send any alert. What Rescan does, and what follows a change to the repo list. */
   const rescanAll = async () => {
@@ -184,7 +259,7 @@ export function serve(db: DatabaseSync, port: number) {
       if (req.headers["x-mycelium-token"] !== token) return send(res, 403, { error: "bad token" });
 
       if (req.method === "GET") {
-        if (p === "/api/overview") return send(res, 200, { ...overview(db), user: user?.email ?? null, signIn: !!auth, busy, job: job && summary(job) });
+        if (p === "/api/overview") return send(res, 200, { ...overview(db), user: user?.email ?? null, signIn: !!auth, company: companyName(db), busy, job: job && summary(job) });
         if (p === "/api/project") return send(res, 200, projectDetail(db, url.searchParams.get("name") ?? ""));
         if (p === "/api/findings") return send(res, 200, findingsView(db));
         if (p === "/api/fixed") return send(res, 200, fixedView(db));
@@ -193,7 +268,7 @@ export function serve(db: DatabaseSync, port: number) {
         if (p === "/api/alerts") return send(res, 200, alertsView(db));
         if (p === "/api/repos") {
           if (!cfg.repos) return send(res, 200, { managed: false, roots: JSON.parse(setting("roots") ?? "[]") });
-          const list = existsSync(cfg.repos.list) ? readRepoList(cfg.repos.list) : [];
+          const list = watchedList();
           const folders = cloneDirs(list);
           const projectAt = new Map((db.prepare("SELECT name, path FROM projects").all() as { name: string; path: string }[]).map((r) => [r.path, r.name]));
           const watched = list.map((slug) => ({ slug, project: projectAt.get(join(cfg.repos!.dir, folders.get(slug)!)) ?? null }));
@@ -204,7 +279,24 @@ export function serve(db: DatabaseSync, port: number) {
             console.error("listing GitHub repos:", e);
             error = "Couldn't list your GitHub repos. Check that `gh auth status` works on this server.";
           }
-          return send(res, 200, { managed: true, watched, available, autoOwners: loadAutoWatch(db).owners, error });
+          return send(res, 200, { managed: true, watched, available, autoOwners: loadAutoWatch(db).owners, issues: loadRepoIssues(db), error });
+        }
+        if (p === "/api/repos/job") return send(res, 200, repoJob);
+        if (p === "/api/profile") {
+          const github = await githubUser();
+          let accounts: { owner: string; repos: number }[] = [];
+          try {
+            const tally = new Map<string, number>();
+            for (const r of await githubRepos()) tally.set(r.owner, (tally.get(r.owner) ?? 0) + 1);
+            accounts = [...tally].map(([owner, repos]) => ({ owner, repos })).sort((a, b) => b.repos - a.repos || a.owner.localeCompare(b.owner));
+          } catch { /* shown as not connected */ }
+          const alerts = loadAlertSettings(db);
+          return send(res, 200, {
+            user: user?.email ?? null, signIn: !!auth, allowedEmails: cfg.auth?.allowedEmails ?? [], company: companyName(db),
+            github: { login: github.value?.login ?? null, name: github.value?.name ?? null, accounts },
+            install: { managed: !!cfg.repos, baseUrl, watched: watchedList().length, projects: (db.prepare("SELECT count(*) AS n FROM projects").get() as { n: number }).n },
+            alerts: { enabled: alerts.enabled, recipients: alerts.recipients },
+          });
         }
         if (p === "/api/job") return send(res, 200, job ? { ...summary(job), lines: job.lines, result: job.result, error: job.error } : null);
         return send(res, 404, { error: "not found" });
@@ -212,6 +304,18 @@ export function serve(db: DatabaseSync, port: number) {
       if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
       const body = await readBody(req);
       // Settings, not work: fine while a rescan runs.
+      if (p === "/api/profile") return send(res, 200, { company: saveCompanyName(db, body.company) });
+      if (p === "/api/repos/parse") {
+        const { slugs, invalid } = parseRepoInput(body.text);
+        const watched = new Set(watchedList());
+        const visible = new Set((await githubRepos()).map((r) => r.slug));
+        return send(res, 200, {
+          add: slugs.filter((s) => visible.has(s) && !watched.has(s)),
+          already: slugs.filter((s) => watched.has(s)),
+          notVisible: slugs.filter((s) => !visible.has(s) && !watched.has(s)),
+          invalid,
+        });
+      }
       if (p === "/api/alerts") return send(res, 200, { ...saveAlertSettings(db, body), view: alertsView(db) });
       if (p === "/api/alerts/test") {
         await sendTestEmail(db, baseUrl, Array.isArray(body.recipients) ? body.recipients.map(String).filter(Boolean) : []);
@@ -261,7 +365,7 @@ export function serve(db: DatabaseSync, port: number) {
       }
       if (p === "/api/refresh") return await run("rescanning everything", rescanAll);
       if (p === "/api/repos") {
-        if (!cfg.repos) return send(res, 400, { error: "This install scans folders on this computer, so there's no repo list to change." });
+        if (!cfg.repos) return send(res, 400, { error: LOCAL_ONLY });
         const add = Array.isArray(body.add) ? body.add : [], remove = Array.isArray(body.remove) ? body.remove : [];
         if (![...add, ...remove].every(validSlug)) return send(res, 400, { error: "That doesn't look like a GitHub repo name." });
         const available = await githubRepos();
@@ -271,10 +375,22 @@ export function serve(db: DatabaseSync, port: number) {
         if (unknown) return send(res, 400, { error: `${unknown} isn't visible to the GitHub account on this server.` });
         const owners = Array.isArray(body.autoOwners) ? body.autoOwners.map(String).filter((o: string) => available.some((r) => r.owner === o)) : loadAutoWatch(db).owners;
         const { dir, list } = cfg.repos;
-        applyRepoChange(db, dir, list, existsSync(list) ? readRepoList(list) : [], add, remove);
+        applyRepoChange(db, dir, list, watchedList(), add, remove);
         saveAutoWatch(db, owners, available);
-        if (!add.length && !remove.length) return send(res, 200, { ok: true, warnings: [] });
-        return await run("updating your repos", rescanAll);
+        // Stopping is immediate: the clone stays, and the project just leaves the graph.
+        const ignored: string[] = JSON.parse(setting("ignored") ?? "[]");
+        for (const path of ignored) db.prepare("DELETE FROM projects WHERE path = ?").run(path);
+        updateRepoIssues(db, [...remove], []);
+        clearPrCache();
+        if (!add.length) return send(res, 200, { ok: true });
+        return send(res, 202, startRepoJob("import", add));
+      }
+      if (p === "/api/repos/scan") {
+        if (!cfg.repos) return send(res, 400, { error: LOCAL_ONLY });
+        const slugs = Array.isArray(body.slugs) ? body.slugs : [];
+        const watched = new Set(watchedList());
+        if (!slugs.length || !slugs.every((s: unknown) => validSlug(s) && watched.has(s))) return send(res, 400, { error: "That repo isn't being watched." });
+        return send(res, 202, startRepoJob("scan", slugs));
       }
       send(res, 404, { error: "not found" });
     } catch (e) {

@@ -105,5 +105,6 @@ test("email content is escaped, can't break the subject line, and links to the p
   assert.doesNotMatch(m.html, /<script>|javascript:|<b>evil/);
   assert.doesNotMatch(m.subject, /[\r\n]/);
   assert.match(m.html, /https:\/\/m\.example\/#project=my%20app/);
-  assert.match(m.subject, /1 critical in my app/);
+  assert.match(m.subject, /^Mycelium: 1 critical in my app/);
+  assert.match(buildAlertEmail([f], ["a@b.co"], null, "Acme").subject, /^\[Acme\] Mycelium/);
 });

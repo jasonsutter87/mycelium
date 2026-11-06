@@ -184,6 +184,19 @@ export function openDb(path = DB_PATH): DatabaseSync {
   return db;
 }
 
+/** The company this install belongs to, shown in the top bar and alert subjects. "" when not set. */
+export function companyName(db: DatabaseSync): string {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'company'").get() as { value: string } | undefined;
+  return row?.value ?? "";
+}
+
+export function saveCompanyName(db: DatabaseSync, name: unknown): string {
+  const clean = String(name ?? "").replace(/[\x00-\x1f\x7f]+/g, " ").trim();
+  if (clean.length > 80) throw new Error("Keep the company name to 80 characters.");
+  db.prepare("INSERT INTO settings (key, value) VALUES ('company', ?) ON CONFLICT DO UPDATE SET value = excluded.value").run(clean);
+  return clean;
+}
+
 export function tx<T>(db: DatabaseSync, fn: () => T): T {
   db.exec("BEGIN");
   try {

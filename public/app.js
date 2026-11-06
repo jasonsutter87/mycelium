@@ -43,8 +43,9 @@ const state = {
   fixedQ: "",
   repoQ: "",
   repoOwner: "all",
-  repoDraft: null, // { watch: Set of slugs, auto: Set of owners }, thrown away after saving
-  repoSaving: false,
+  repoDraft: null, // the user's unsaved changes: { add, remove, auto } sets. Never a copy of the list, which can change underneath it.
+  repoTab: null, // watching / available / problems; null picks one from what's there
+  repoJob: null,
   alertDraft: null,
   alertMsg: null,
 };
@@ -73,7 +74,9 @@ const ago = (iso) => {
 function renderTop() {
   const d = state.data;
   $("checked").textContent = `Checked ${ago(d.lastChecked)}`;
-  $("user").innerHTML = d.signIn ? `${esc(d.user)} · <a href="/auth/logout">Sign out</a>` : "This computer only";
+  $("user").innerHTML = `<button class="profilebtn ${state.view === "profile" ? "on" : ""}" id="profileBtn" title="Your profile">${d.signIn ? esc(d.user) : "This computer only"}</button>`;
+  $("profileBtn").onclick = () => { state.view = "profile"; loadTab(); renderAll(); };
+  $("company").textContent = d.company ? `· ${d.company}` : "";
   $("rescan").disabled = !!d.busy;
   document.querySelectorAll("#views button").forEach((b) => b.classList.toggle("on", b.dataset.view === state.view));
 }
@@ -296,6 +299,40 @@ function renderInfra() {
 
 // ---------------------------------------------------------------- repos
 
+const JOB_STEP = { fetching: "Getting the code", scanning: "Reading dependencies", checking: "Checking for vulnerabilities", finished: "Finished" };
+
+function repoJobHtml() {
+  const j = state.repoJob;
+  if (!j || j.state !== "running") return "";
+  const fetching = j.step === "fetching";
+  const pct = fetching ? Math.round((j.finished / j.total) * 100) : 100;
+  return `<div class="jobbox" role="status" aria-live="polite">
+    <div><span class="spin"></span><b>${JOB_STEP[j.step]}</b> <span class="muted">${fetching ? `${j.finished} of ${j.total}` : ""}${fetching && j.current.length ? ` · ${esc(j.current.join(", "))}` : ""}</span></div>
+    <div class="bar"><i style="width:${pct}%"></i></div>
+    <div class="small muted">This keeps going if you leave this page.</div></div>`;
+}
+
+async function pollRepoJob() {
+  try {
+    const j = await api("/api/repos/job");
+    state.repoJob = j;
+    if (j?.state === "running") {
+      const el = $("rjob");
+      if (el) el.innerHTML = repoJobHtml();
+      return void setTimeout(pollRepoJob, 1200);
+    }
+    if (j) {
+      const failed = j.failed.length ? `${j.failed.length} couldn't be updated: see Problems.` : "";
+      const what = j.kind === "import" ? `Imported ${j.total - j.failed.length} of ${j.total}.` : "Scan finished.";
+      if (j.state === "failed") banner(`That didn't finish: ${j.error}`, true);
+      else banner([what, failed, ...j.warnings].filter(Boolean).join(" "), !!(failed || j.warnings.length));
+      if (j.failed.length) state.repoTab = "problems";
+    }
+    state.tabs = {};
+    await refresh();
+  } catch (e) { banner(`Lost track of the import: ${e.message}`, true); setTimeout(pollRepoJob, 4000); }
+}
+
 function renderRepos() {
   const d = state.tabs.repos;
   if (!d) return ($("canvas").innerHTML = `<div class="empty"><span class="spin"></span>Loading your repos from GitHub</div>`);
@@ -305,51 +342,81 @@ function renderRepos() {
     return;
   }
   const watchedNow = new Set(d.watched.map((w) => w.slug));
-  if (!state.repoDraft) state.repoDraft = { watch: new Set(watchedNow), auto: new Set(d.autoOwners) };
+  if (!state.repoDraft) state.repoDraft = { add: new Set(), remove: new Set(), auto: new Set(d.autoOwners) };
   const draft = state.repoDraft;
+  const isOn = (s) => draft.add.has(s) || (watchedNow.has(s) && !draft.remove.has(s));
+  const setOn = (s, on) => {
+    draft.add.delete(s); draft.remove.delete(s);
+    if (on && !watchedNow.has(s)) draft.add.add(s);
+    if (!on && watchedNow.has(s)) draft.remove.add(s);
+  };
+  const running = state.repoJob?.state === "running";
   const projects = new Map(state.data.projects.map((p) => [p.name, p]));
   const projectOf = new Map(d.watched.map((w) => [w.slug, w.project]));
   // Watched repos GitHub no longer shows (deleted, or access lost) stay listed, or they could never be removed.
   const rows = [...d.available.filter((r) => !r.archived || watchedNow.has(r.slug)),
     ...d.watched.filter((w) => !d.available.some((r) => r.slug === w.slug)).map((w) => ({ slug: w.slug, owner: w.slug.split("/")[0], missing: true, description: "" }))];
-  const owners = [...new Set(d.available.map((r) => r.owner))].sort((a, b) => a.localeCompare(b));
+  const problem = (r) => d.issues[r.slug] || r.missing;
+  const problems = rows.filter((r) => watchedNow.has(r.slug) && problem(r));
+  const owners = [...new Set(d.available.map((r) => r.owner))];
+  const repoCount = (o) => d.available.filter((r) => r.owner === o).length;
+  owners.sort((a, b) => repoCount(b) - repoCount(a) || a.localeCompare(b));
+  // Open on what's useful: your watched repos, or the picker when there aren't any yet.
+  const tab = state.repoTab ?? (watchedNow.size ? "watching" : "available");
+  const inTab = { watching: (r) => watchedNow.has(r.slug), available: (r) => !watchedNow.has(r.slug), problems: (r) => watchedNow.has(r.slug) && problem(r) };
   const q = state.repoQ.trim().toLowerCase();
-  const shown = rows.filter((r) => (state.repoOwner === "all" || r.owner === state.repoOwner) && (!q || `${r.slug} ${r.description}`.toLowerCase().includes(q)))
-    // Watched first, then most recently active: what someone's likely looking for isn't a ten-year-old fork.
-    .sort((a, b) => Number(watchedNow.has(b.slug)) - Number(watchedNow.has(a.slug)) || Date.parse(b.pushedAt || 0) - Date.parse(a.pushedAt || 0) || a.slug.localeCompare(b.slug));
-  const add = [...draft.watch].filter((s) => !watchedNow.has(s));
-  const remove = [...watchedNow].filter((s) => !draft.watch.has(s));
+  const shown = rows.filter((r) => inTab[tab](r) && (state.repoOwner === "all" || r.owner === state.repoOwner) && (!q || `${r.slug} ${r.description}`.toLowerCase().includes(q)))
+    // Most recently active first: what someone's likely looking for isn't a ten-year-old fork.
+    .sort((a, b) => Date.parse(b.pushedAt || 0) - Date.parse(a.pushedAt || 0) || a.slug.localeCompare(b.slug));
+  const add = [...draft.add].filter((s) => !watchedNow.has(s));
+  const remove = [...draft.remove].filter((s) => watchedNow.has(s));
   const autoChanged = owners.some((o) => draft.auto.has(o) !== d.autoOwners.includes(o));
   const dirty = add.length || remove.length || autoChanged;
   const statusOfRepo = (r) => {
     if (!watchedNow.has(r.slug)) return '<span class="muted">Not watched</span>';
     const p = projects.get(projectOf.get(r.slug));
-    if (!p) return '<span class="muted">No dependencies found yet</span>';
-    return p.open ? `<button class="linkish" data-goto="${esc(p.name)}"><span class="counts">${counts(p.bySeverity)}</span></button>` : `<span class="pill clean"><span class="dot"></span>Clean</span>`;
+    if (!p) return '<span class="muted">No dependencies found</span>';
+    return p.open ? `<button class="linkish" data-goto="${esc(p.name)}"><span class="counts">${counts(p.bySeverity)}</span></button>` : `<button class="linkish" data-goto="${esc(p.name)}"><span class="pill clean"><span class="dot"></span>Clean</span></button>`;
   };
+  const scanned = (r) => {
+    const p = projects.get(projectOf.get(r.slug));
+    return watchedNow.has(r.slug) && p ? `<div class="small muted">Scanned ${ago(p.scannedAt)}</div>` : "";
+  };
+  const issueLine = (r) => (d.issues[r.slug] && watchedNow.has(r.slug) ? `<div class="small warn-text">Couldn't update ${esc(ago(d.issues[r.slug].at))}: ${esc(d.issues[r.slug].error)}</div>` : "");
   const repoWord = (n) => `${n} repo${n === 1 ? "" : "s"}`;
-  const saveLabel = [add.length && `watch ${repoWord(add.length)}`, remove.length && `stop watching ${repoWord(remove.length)}`].filter(Boolean).join(", ");
+  const saveLabel = [add.length && `import ${repoWord(add.length)}`, remove.length && `stop watching ${repoWord(remove.length)}`].filter(Boolean).join(", ");
+  const tabs = [["watching", "Watching", watchedNow.size], ["available", "Not watching", rows.length - rows.filter((r) => watchedNow.has(r.slug)).length], ["problems", "Problems", problems.length]];
+  const tip = { watching: "These are checked every night and whenever you rescan. Untick one to stop watching it; its fix history stays.", available: "Tick the repos to import. Only repos this GitHub account can push to are listed, since Mycelium fixes through pull requests.", problems: "Mycelium couldn't update these, so their results may be out of date." }[tab];
+  const empty = { watching: "You aren't watching any repos yet.", available: "Nothing else to import.", problems: "No problems." }[tab];
+
   $("canvas").innerHTML = `${d.error ? `<div class="errbox m12">${esc(d.error)}</div>` : ""}
+    <div id="rjob">${repoJobHtml()}</div>
     <div class="filters">
+      <div class="chips" role="group" aria-label="Which repos">${tabs.map(([id, label, c]) => `<button data-rtab="${id}" class="${tab === id ? "on" : ""}">${label}<i>${c}</i></button>`).join("")}</div>
       <input class="field" id="rq" type="search" placeholder="Search repos" aria-label="Search repos" value="${esc(state.repoQ)}">
-      <select class="field" id="rowner" aria-label="Filter by GitHub account"><option value="all">All accounts</option>${owners.map((o) => `<option value="${esc(o)}" ${state.repoOwner === o ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>
-      <button class="btn small" id="rselect" title="Tick every repo shown here">Select shown</button>
-      <button class="btn small" id="rclear" title="Untick every repo shown here">Clear shown</button>
-      <span class="count">${draft.watch.size} watched · ${shown.length} shown</span></div>
+      <select class="field" id="rowner" aria-label="Filter by GitHub account"><option value="all">All accounts</option>${owners.map((o) => `<option value="${esc(o)}" ${state.repoOwner === o ? "selected" : ""}>${esc(o)} (${repoCount(o)})</option>`).join("")}</select>
+      ${tab === "available" ? `<button class="btn small" id="rselect" title="Tick every repo shown here">Select shown</button><button class="btn small" id="rclear" title="Untick every repo shown here">Clear shown</button>` : ""}
+      ${tab === "problems" && problems.length ? `<button class="btn small" id="rretry" ${running || state.data.busy ? "disabled" : ""}>Retry all</button>` : ""}
+      <span class="count">${shown.length} shown</span></div>
     <div class="savebar ${dirty ? "on" : ""}" role="status">
-      ${state.repoSaving ? `<span><span class="spin"></span>Saving, then updating and scanning your repos. This can take a few minutes, and it keeps going if you leave this page.</span>`
-        : dirty ? `<span>${saveLabel ? esc(saveLabel[0].toUpperCase() + saveLabel.slice(1)) : "Change automatic watching"}.${remove.length ? " Their fix history stays." : ""}</span>
-          <span class="grow"></span><button class="btn small" id="rcancel">Cancel</button><button class="btn small primary" id="rsave" ${state.data.busy ? "disabled" : ""}>${add.length || remove.length ? "Save and scan" : "Save"}</button>`
-        : `<span class="muted">Tick the repos Mycelium should watch. It checks them every night and whenever you rescan.</span>`}
+      ${dirty ? `<span>${saveLabel ? esc(saveLabel[0].toUpperCase() + saveLabel.slice(1)) : "Change automatic watching"}.</span>
+          <span class="grow"></span><button class="btn small" id="rcancel">Cancel</button><button class="btn small primary" id="rsave" ${running || state.data.busy ? "disabled" : ""}>${add.length ? "Import" : "Save"}</button>`
+        : `<span class="muted">${tip}</span>`}
     </div>` +
-    table(["", "Repository", "Last push", "Status"], shown.map((r) => `<tr>
-      <td class="tick"><input type="checkbox" data-repo="${esc(r.slug)}" aria-label="Watch ${esc(r.slug)}" ${draft.watch.has(r.slug) ? "checked" : ""} ${state.repoSaving ? "disabled" : ""}></td>
+    table(["", "Repository", "Last push", "Status", ""], shown.map((r) => `<tr>
+      <td class="tick"><input type="checkbox" data-repo="${esc(r.slug)}" aria-label="Watch ${esc(r.slug)}" ${isOn(r.slug) ? "checked" : ""}></td>
       <td class="wrap"><b>${esc(r.slug)}</b>${r.private ? ' <span class="tag try">private</span>' : ""}${r.fork ? ' <span class="tag try">fork</span>' : ""}${r.archived ? ' <span class="tag try">archived</span>' : ""}
-        ${r.missing ? `<div class="small warn-text">GitHub no longer shows this repo to this account</div>` : r.description ? `<div class="small muted">${esc(r.description)}</div>` : ""}</td>
-      <td class="small muted">${r.pushedAt ? ago(r.pushedAt) : "–"}</td>
-      <td class="nowrap">${statusOfRepo(r)}</td></tr>`), d.error ? "No repos to show." : "No repos match these filters.") +
-    (owners.length ? `<div class="page border-top"><h3>Watch new repos automatically</h3><p class="small muted">New repos from these accounts get added at the next rescan or nightly check. Repos you've unticked stay unticked.</p>
-      <div class="opts">${owners.map((o) => `<label><input type="checkbox" data-auto="${esc(o)}" ${draft.auto.has(o) ? "checked" : ""} ${state.repoSaving ? "disabled" : ""}> ${esc(o)}</label>`).join("")}</div></div>` : "");
+        ${r.missing ? `<div class="small warn-text">GitHub no longer shows this repo to this account</div>` : r.description ? `<div class="small muted">${esc(r.description)}</div>` : ""}${issueLine(r)}</td>
+      <td class="small muted nowrap">${r.pushedAt ? ago(r.pushedAt) : "–"}</td>
+      <td class="nowrap">${statusOfRepo(r)}${scanned(r)}</td>
+      <td class="right nowrap">${watchedNow.has(r.slug) ? `<button class="btn small" data-scan="${esc(r.slug)}" ${running || state.data.busy ? "disabled" : ""}>${d.issues[r.slug] ? "Retry" : "Scan now"}</button>` : ""}</td></tr>`), d.error ? "No repos to show." : q || state.repoOwner !== "all" ? "No repos match these filters." : empty) +
+    `<details class="page border-top" ${state.repoPasteOpen ? "open" : ""} id="rpaste"><summary><b>Paste a list of repos</b></summary>
+      <p class="small muted">GitHub URLs or owner/name, one per line. They're ticked for you to review before anything is imported.</p>
+      <textarea class="field area" id="rtext" rows="4" placeholder="acme/storefront&#10;https://github.com/acme/api" aria-label="Repos to import">${esc(state.repoPaste || "")}</textarea>
+      <div class="actions"><button class="btn small" id="rparse">Add to selection</button></div></details>` +
+    (owners.length ? `<details class="page border-top" ${state.repoAutoOpen ? "open" : ""} id="rautod"><summary><b>Watch new repos automatically</b>${draft.auto.size ? ` <span class="muted">· ${draft.auto.size} account${draft.auto.size === 1 ? "" : "s"}</span>` : ""}</summary>
+      <p class="small muted">New repos from these accounts are added at the next rescan or nightly check. Repos you've unticked stay unticked.</p>
+      <div class="opts">${owners.map((o) => `<label><input type="checkbox" data-auto="${esc(o)}" ${draft.auto.has(o) ? "checked" : ""}> ${esc(o)}</label>`).join("")}</div></details>` : "");
 
   const rq = $("rq");
   rq.oninput = () => {
@@ -359,25 +426,93 @@ function renderRepos() {
     const again = $("rq"); again.focus(); again.setSelectionRange(pos, pos);
   };
   $("rowner").onchange = (e) => { state.repoOwner = e.target.value; renderRepos(); };
-  $("rselect").onclick = () => { shown.forEach((r) => draft.watch.add(r.slug)); renderRepos(); };
-  $("rclear").onclick = () => { shown.forEach((r) => draft.watch.delete(r.slug)); renderRepos(); };
-  document.querySelectorAll("[data-repo]").forEach((c) => (c.onchange = () => { c.checked ? draft.watch.add(c.dataset.repo) : draft.watch.delete(c.dataset.repo); renderRepos(); }));
+  document.querySelectorAll("[data-rtab]").forEach((b) => (b.onclick = () => { state.repoTab = b.dataset.rtab; renderRepos(); }));
+  const sel = $("rselect"), clr = $("rclear");
+  if (sel) sel.onclick = () => { shown.forEach((r) => setOn(r.slug, true)); renderRepos(); };
+  if (clr) clr.onclick = () => { shown.forEach((r) => setOn(r.slug, false)); renderRepos(); };
+  document.querySelectorAll("[data-repo]").forEach((c) => (c.onchange = () => { setOn(c.dataset.repo, c.checked); renderRepos(); }));
   document.querySelectorAll("[data-auto]").forEach((c) => (c.onchange = () => { c.checked ? draft.auto.add(c.dataset.auto) : draft.auto.delete(c.dataset.auto); renderRepos(); }));
   document.querySelectorAll("[data-goto]").forEach((b) => (b.onclick = () => { state.view = "projects"; selectProject(b.dataset.goto); renderAll(); }));
+  $("rpaste").ontoggle = (e) => { state.repoPasteOpen = e.target.open; };
+  const autod = $("rautod");
+  if (autod) autod.ontoggle = (e) => { state.repoAutoOpen = e.target.open; };
+  $("rtext").oninput = (e) => { state.repoPaste = e.target.value; };
+  $("rparse").onclick = async () => {
+    try {
+      const r = await api("/api/repos/parse", { text: state.repoPaste || "" });
+      r.add.forEach((s) => setOn(s, true));
+      const parts = [r.add.length && `${r.add.length} ready to import`, r.already.length && `${r.already.length} already watched`, r.notVisible.length && `can't reach ${r.notVisible.join(", ")}`, r.invalid.length && `didn't understand ${r.invalid.join(", ")}`].filter(Boolean);
+      // In the banner: this section sits below the list, which can be hundreds of rows long.
+      banner(parts.join(" · ") || "Nothing to add.", !!(r.notVisible.length || r.invalid.length));
+      window.scrollTo(0, 0);
+      if (r.add.length) { state.repoPaste = ""; state.repoTab = "available"; state.repoOwner = "all"; state.repoQ = ""; }
+    } catch (e) { banner(e.message, true); }
+    renderRepos();
+  };
+  const startJob = async (path, payload) => {
+    banner("");
+    const job = await api(path, payload);
+    state.repoDraft = null;
+    state.repoPaste = "";
+    if (job.state === "running") {
+      state.repoJob = job;
+      state.data.busy = "working";
+      state.tabs.repos = await api("/api/repos"); // the new repos count as watched from here on
+      renderRepos();
+      pollRepoJob();
+    } else {
+      banner("Saved.");
+      state.tabs = {};
+      await refresh();
+    }
+  };
+  document.querySelectorAll("[data-scan]").forEach((b) => (b.onclick = () => startJob("/api/repos/scan", { slugs: [b.dataset.scan] }).catch((e) => banner(e.message, true))));
+  const retry = $("rretry");
+  if (retry) retry.onclick = () => startJob("/api/repos/scan", { slugs: problems.filter((r) => !r.missing).map((r) => r.slug) }).catch((e) => banner(e.message, true));
   const cancel = $("rcancel");
   if (cancel) cancel.onclick = () => { state.repoDraft = null; renderRepos(); };
   const save = $("rsave");
-  if (save) save.onclick = async () => {
-    state.repoSaving = true; renderRepos();
-    try {
-      const out = await api("/api/repos", { add, remove, autoOwners: [...draft.auto] });
-      banner(out.warnings?.length ? `Saved. ${out.warnings.join(" ")}` : "Repos updated.", !!out.warnings?.length);
-      state.tabs = {}; state.repoDraft = null;
-      await refresh();
-    } catch (e) { banner(e.message, true); }
-    state.repoSaving = false;
-    renderCanvas();
+  if (save) save.onclick = () => {
+    if (add.length) state.repoTab = "watching";
+    startJob("/api/repos", { add, remove, autoOwners: [...draft.auto] }).catch((e) => banner(e.message, true));
   };
+}
+
+// ---------------------------------------------------------------- profile
+
+function renderProfile() {
+  const d = state.tabs.profile;
+  if (!d) return ($("canvas").innerHTML = `<div class="empty"><span class="spin"></span>Loading your profile</div>`);
+  const gh = d.github;
+  $("canvas").innerHTML = `<div class="page narrow">
+    <h2>Profile</h2>
+    <h3>Company</h3>
+    <div class="actions tight"><input class="field grow" id="pCompany" maxlength="80" placeholder="Your company name" aria-label="Company name" value="${esc(state.profileDraft ?? d.company)}"><button class="btn" id="pSave">Save</button>${state.profileMsg ? `<span class="small ${state.profileMsg.err ? "warn-text" : "ok-text"}" role="status">${esc(state.profileMsg.text)}</span>` : ""}</div>
+    <p class="small muted">Shown at the top of this page and in the subject of alert emails.</p>
+    <h3>Your account</h3>
+    ${d.signIn ? `<p>Signed in as <b>${esc(d.user)}</b> · <a href="/auth/logout">Sign out</a></p>
+      <p class="small muted">Can sign in here: ${d.allowedEmails.map(esc).join(", ")}. This list is set when Mycelium is installed.</p>`
+      : `<p>No sign-in: this install can only be reached from this computer.</p>`}
+    <h3>GitHub connection</h3>
+    ${gh.login ? `<p><span class="pill clean"><span class="dot"></span>Connected</span> as <b>${esc(gh.login)}</b>${gh.name ? ` <span class="muted">(${esc(gh.name)})</span>` : ""}</p>
+      <p class="small muted">Mycelium reads repos and opens fix pull requests as this account, so PRs show its name.</p>
+      ${gh.accounts.length ? `<ul class="plain small">${gh.accounts.slice(0, 8).map((a) => `<li>${esc(a.owner)} <span class="muted">· ${a.repos} repo${a.repos === 1 ? "" : "s"}</span></li>`).join("")}${gh.accounts.length > 8 ? `<li class="muted">and ${gh.accounts.length - 8} more</li>` : ""}</ul>` : ""}`
+      : `<div class="warn-box"><b>GitHub isn't connected.</b> On the machine running Mycelium, run <span class="mono">gh auth login</span>, then reload this page.</div>`}
+    <h3>This install</h3>
+    <p>${d.install.managed ? `${d.install.watched} repo${d.install.watched === 1 ? "" : "s"} watched` : "Scanning folders on this computer"} · ${d.install.projects} project${d.install.projects === 1 ? "" : "s"}</p>
+    <div class="actions tight">${d.install.managed ? `<button class="btn small" data-go="repos">Manage repos</button>` : ""}<button class="btn small" data-go="alerts">${d.alerts.enabled ? `Alerts on: ${d.alerts.recipients.length} recipient${d.alerts.recipients.length === 1 ? "" : "s"}` : "Alerts off: set them up"}</button></div>
+  </div>`;
+  $("pCompany").oninput = (e) => { state.profileDraft = e.target.value; };
+  $("pSave").onclick = async () => {
+    try {
+      const out = await api("/api/profile", { company: $("pCompany").value });
+      d.company = out.company; state.data.company = out.company; state.profileDraft = null;
+      state.profileMsg = { text: "Saved." };
+      renderTop();
+    } catch (e) { state.profileMsg = { text: e.message, err: true }; }
+    renderProfile();
+  };
+  document.querySelectorAll("[data-go]").forEach((b) => (b.onclick = () => { state.view = b.dataset.go; loadTab(); renderAll(); }));
 }
 
 // ---------------------------------------------------------------- alerts
@@ -434,7 +569,7 @@ function renderAlerts() {
 }
 
 function renderCanvas() {
-  ({ projects: renderProjects, findings: renderFindings, fixed: renderFixed, audit: renderAudit, infra: renderInfra, repos: renderRepos, alerts: renderAlerts })[state.view]();
+  ({ projects: renderProjects, findings: renderFindings, fixed: renderFixed, audit: renderAudit, infra: renderInfra, repos: renderRepos, profile: renderProfile, alerts: renderAlerts })[state.view]();
 }
 
 // ---------------------------------------------------------------- inspector: Check → Fix
@@ -712,6 +847,9 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape" && state.se
     // Links in alert emails: /#project=name opens that project.
     const linked = new URLSearchParams(location.hash.slice(1)).get("project");
     if (linked && state.data.projects.some((p) => p.name === linked)) selectProject(linked);
+    // An import started earlier may still be running: pick its progress back up.
+    const rj = await api("/api/repos/job");
+    if (rj?.state === "running") { state.repoJob = rj; pollRepoJob(); }
     const j = await api("/api/job");
     if (j) {
       state.job = { ...j, detail: j };

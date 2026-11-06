@@ -194,6 +194,16 @@ pre.log { font: 11.5px/1.5 var(--mono); background: var(--soft); border-radius: 
   .inspector { position: fixed; inset: 48px 0 0 auto; width: min(460px, 100%); max-height: none; border-radius: 0; z-index: 4; border-width: 0 0 0 1px; }
 }
 /* Repos and Alerts pages */
+.jobbox { padding: 10px 12px; border-bottom: 1px solid var(--line); background: var(--accent-soft); font-size: 12.5px; }
+.bar { height: 6px; border-radius: 3px; background: var(--line); margin: 7px 0; overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--accent); transition: width .3s; }
+details.page summary { cursor: pointer; }
+.actions.tight { margin: 4px 0; }
+.actions .grow { flex: 1; min-width: 160px; }
+.company:empty { display: none; }
+.company { color: var(--top-muted); font-weight: 400; margin-left: 6px; }
+.profilebtn { border: 0; background: none; color: inherit; font: inherit; cursor: pointer; padding: 3px 6px; border-radius: 5px; }
+.profilebtn:hover, .profilebtn.on { background: var(--top-on); color: var(--top-fg); }
 .welcome { padding: 44px 24px; max-width: 520px; margin: 0 auto; }
 .welcome h2 { margin: 0 0 8px; font-size: 20px; }
 .welcome ol { margin: 16px 0 22px; padding-left: 20px; line-height: 1.9; }
@@ -214,7 +224,8 @@ input.field.num-in { width: 64px; margin-right: 4px; }
 .warn-text { color: var(--high); } .ok-text { color: var(--ok); }
 .m12 { margin: 12px; }
 .savebar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; background: var(--panel2); font-size: 12.5px; flex-wrap: wrap; }
-.savebar.on { background: var(--accent-soft); }
+/* Pinned once there's something to save: on a long list the button would otherwise be out of sight. */
+.savebar.on { position: fixed; top: auto; bottom: 16px; left: 50%; transform: translateX(-50%); width: min(620px, calc(100% - 24px)); z-index: 5; background: var(--panel); border: 1px solid var(--accent); border-radius: 10px; box-shadow: 0 6px 24px rgba(21,19,31,.25); padding: 10px 14px; }
 td.tick { width: 28px; }
 .linkish { border: 0; background: none; padding: 0; cursor: pointer; }
 
