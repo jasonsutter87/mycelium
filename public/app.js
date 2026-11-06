@@ -577,25 +577,39 @@ function renderAlerts() {
   const a = state.alertDraft;
   const on = d.settings.enabled;
   const st = d.status;
-  const when = st.lastSentAt ? `Last email: ${ago(st.lastSentAt)}, about ${st.lastCount} finding${st.lastCount === 1 ? "" : "s"}.` : on ? "Nothing has needed an email yet." : "";
-  const waitingNote = d.waiting.critical + d.waiting.high ? `${d.waiting.critical} critical and ${d.waiting.high} high not emailed yet.${on ? "" : " Turning alerts on treats these as already known, so you're only emailed about what's new."}` : "";
-  $("canvas").innerHTML = `<div class="page narrow">
-    <h2>Email alerts</h2>
-    <p class="muted">Get an email when something urgent shows up, so nobody has to keep checking this page. You get one email per check, and accepted risks are left out.</p>
+  const waiting = d.waiting.critical + d.waiting.high;
+  $("canvas").innerHTML = `<div class="profile">
+    <button class="backlink" id="aBack">← Profile</button>
+    <header class="phead">
+      <div class="pavatar" aria-hidden="true">✉</div>
+      <div class="pwho"><h2>Email alerts</h2><p class="muted">Get an email when something urgent shows up, so nobody has to keep checking this page.</p></div>
+    </header>
     ${d.configured ? "" : `<div class="warn-box"><b>Email isn't set up on this server yet.</b> Add <span class="mono">RESEND_API_KEY</span> and <span class="mono">MYCELIUM_EMAIL_FROM</span> to Mycelium's environment, then restart it.</div>`}
     ${st.lastError ? `<div class="errbox">The last email failed ${esc(ago(st.lastErrorAt))}: ${esc(st.lastError)} The next check tries again.</div>` : ""}
-    <label class="row"><input type="checkbox" id="aOn" ${a.enabled ? "checked" : ""} ${d.configured ? "" : "disabled"}> <b>Send email alerts</b></label>
-    <h3>Send to</h3>
-    <textarea class="field area" id="aTo" rows="3" placeholder="security@yourcompany.com" aria-label="Email addresses, one per line">${esc(a.recipients)}</textarea>
-    <p class="small muted">One address per line.</p>
-    <h3>Send when</h3>
-    <label class="row"><input type="checkbox" id="aCrit" ${a.critical ? "checked" : ""}> A new <span class="sev CRITICAL">critical</span> appears</label>
-    <label class="row"><input type="checkbox" id="aHigh" ${a.highOn ? "checked" : ""}> <span><input class="field num-in" id="aN" type="number" min="1" max="1000" value="${esc(a.highN)}" aria-label="Number of new highs" ${a.highOn ? "" : "disabled"}> or more new <span class="sev HIGH">high</span> are waiting</span></label>
-    <p class="small muted">Highs below that number keep counting until they reach it. A malicious package always counts as critical.</p>
+    <div class="ptiles">
+      <div class="ptile static"><b class="${on ? "ok-text" : ""}">${on ? "On" : "Off"}</b><span>${on ? `to ${d.settings.recipients.length} recipient${d.settings.recipients.length === 1 ? "" : "s"}` : "email alerts"}</span></div>
+      <button class="ptile" id="aWaiting"><b>${waiting}</b><span>${d.waiting.critical} critical, ${d.waiting.high} high not emailed</span></button>
+      <div class="ptile static"><b>${st.lastSentAt ? esc(ago(st.lastSentAt)) : "None yet"}</b><span>${st.lastSentAt ? `last email, about ${st.lastCount} finding${st.lastCount === 1 ? "" : "s"}` : "last email"}</span></div>
+    </div>
+    <div class="pgrid">
+      <section class="pcard">
+        <h3>Send to</h3>
+        <label class="row"><input type="checkbox" id="aOn" ${a.enabled ? "checked" : ""} ${d.configured ? "" : "disabled"}> <b>Send email alerts</b></label>
+        <textarea class="field area" id="aTo" rows="3" placeholder="security@yourcompany.com" aria-label="Email addresses, one per line">${esc(a.recipients)}</textarea>
+        <p class="small muted">One address per line.${d.from ? ` Sent from ${esc(d.from)}.` : ""}</p>
+        ${!on && waiting ? `<p class="small muted">Turning alerts on treats what's open now as already known, so you're only emailed about what's new.</p>` : ""}
+      </section>
+      <section class="pcard">
+        <h3>Send when</h3>
+        <label class="row"><input type="checkbox" id="aCrit" ${a.critical ? "checked" : ""}> <span>A new <span class="sev CRITICAL">critical</span> appears</span></label>
+        <label class="row"><input type="checkbox" id="aHigh" ${a.highOn ? "checked" : ""}> <span><input class="field num-in" id="aN" type="number" min="1" max="1000" value="${esc(a.highN)}" aria-label="Number of new highs" ${a.highOn ? "" : "disabled"}> or more new <span class="sev HIGH">high</span> are waiting</span></label>
+        <p class="small muted">Highs below that number keep counting until they reach it. A malicious package always counts as critical. You get one email per check, and accepted risks are left out.</p>
+      </section>
+    </div>
     <div class="actions"><button class="btn primary" id="aSave">Save</button><button class="btn" id="aTest" ${d.configured ? "" : "disabled"}>Send a test email</button>${state.alertMsg ? `<span class="small ${state.alertMsg.err ? "warn-text" : "ok-text"}" role="status">${esc(state.alertMsg.text)}</span>` : ""}</div>
-    <p class="small muted">${esc(when)} ${esc(waitingNote)}</p>
-    ${d.from ? `<p class="small muted">Sent from ${esc(d.from)}.</p>` : ""}
   </div>`;
+  $("aBack").onclick = () => { state.view = "profile"; loadTab(); renderAll(); };
+  $("aWaiting").onclick = () => { state.view = "findings"; state.sevFilter = "ALL"; loadTab(); renderAll(); };
   const read = () => { a.enabled = $("aOn").checked; a.recipients = $("aTo").value; a.critical = $("aCrit").checked; a.highOn = $("aHigh").checked; a.highN = $("aN").value; };
   const addresses = () => a.recipients.split(/[\s,;]+/).filter(Boolean);
   ["aOn", "aCrit"].forEach((id) => ($(id).onchange = read));
