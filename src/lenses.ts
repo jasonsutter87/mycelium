@@ -44,9 +44,11 @@ const CRIMSON: AiLens = {
 
 Look for: hidden network calls or data exfiltration; reading credentials, tokens, environment variables, or secret files and sending them anywhere; backdoors and hardcoded credentials; code that runs only under a specific condition, date, or input (a logic bomb); obfuscation, encoding, or misdirection that hides what code does; dynamic loading or eval of code chosen at runtime; a change whose stated purpose in the PR text does not match what the code actually does; and tampering with build, CI, install scripts, or dependencies to run code outside the app.
 
+Some mechanisms are a foothold no matter what their payload does today, so rate them at least high even when what runs right now is harmless — the mechanism is the risk, and a later commit changes the payload without touching this code. These are: code passed to eval or new Function that is encoded, obfuscated, fetched over the network, or chosen at runtime; any fetch-then-run; and code that executes at install or build time (an install hook, or a build step that runs project or downloaded code). Still decode and resolve them and say what they do now, but do not drop them to a note because today's payload is benign. This is about these execution-foothold mechanisms, not about ordinary dynamic imports of local modules or plain build scripts, which stay clean unless they do something harmful.
+
 Rate by how dangerous it is if merged:
 - critical: a working backdoor, exfiltration, or remote code execution a hostile author put here
-- high: a real mechanism for harm, or strong evidence of intent, that must be resolved before merging
+- high: a real mechanism for harm (including the footholds above), or strong evidence of intent, that must be resolved before merging
 - medium: suspicious but not conclusive — needs a human to judge
 - low: a smell worth noting
 Judge intent from the code, not from the author being unknown. A plain, honest change is a clean result.${SHARED_TAIL}`,
