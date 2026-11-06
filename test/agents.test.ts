@@ -491,3 +491,31 @@ test("a non-blocking Crimson finding reads as notes for a person, not a pass", a
     assert.match(st.description, /note/, "but it's not reported as 'nothing suspicious'");
   } finally { r.cleanup(); }
 });
+
+
+test("the AI lenses and the rule-based agents poll separately (only: rules | ai)", async () => {
+  const r = repo();
+  try {
+    const db = openDb(":memory:");
+    let aiCalls = 0;
+    const engine: ReviewEngine = async () => { aiCalls++; return { result: { summary: "ok", findings: [] }, costUsd: null }; };
+    saveAgentSettings(db, { keys: true, crimson: true });
+    const cur = JSON.parse((db.prepare("SELECT value FROM settings WHERE key='agents'").get() as any).value);
+    db.prepare("UPDATE settings SET value=? WHERE key='agents'").run(JSON.stringify({ ...cur, seen: { ...cur.seen, keys: ["o/r"], crimson: ["o/r"] } }));
+    const sha = r.commit({ "a.ts": `export const k = "${GH}";\n` });
+    withOrigin(r, sha);
+    const open = [pr(r, sha, { baseSha: r.base, author: "alice" })];
+
+    const gh1 = fake(open);
+    await pollAgents(db, ["o/r"], { github: gh1.github, repoPath: () => r.dir, baseUrl: null, engine, only: "rules" });
+    assert.equal(aiCalls, 0, "a rules-only pass never runs the engine");
+    assert.ok(gh1.statuses.some((s: any) => s.context === "Mycelium keys"), "keys ran");
+    assert.ok(!gh1.statuses.some((s: any) => s.context === "Mycelium crimson"), "crimson did not");
+
+    const gh2 = fake(open);
+    await pollAgents(db, ["o/r"], { github: gh2.github, repoPath: () => r.dir, baseUrl: null, engine, only: "ai" });
+    assert.equal(aiCalls, 1, "an ai-only pass runs the engine");
+    assert.ok(gh2.statuses.some((s: any) => s.context === "Mycelium crimson"), "crimson ran");
+    assert.ok(!gh2.statuses.some((s: any) => s.context === "Mycelium keys"), "keys wasn't re-run");
+  } finally { r.cleanup(); }
+});
