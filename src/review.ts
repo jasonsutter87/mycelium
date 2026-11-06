@@ -371,6 +371,10 @@ export async function runReviewAgent(client: ReviewClient, input: ReviewInput, t
 }
 
 /** Decided here, from the findings, so nothing in a PR can talk the agent into declaring a pass while reporting a blocker. */
+// A stopped or refused review brings back no findings and a summary that says so. This matches statements about
+// THE REVIEW itself, not the PR content ("a worker was stopped by SIGTERM" is the code, and must not match).
+export const INCOMPLETE_REVIEW = /\b(this|the) (review|assessment|analysis)\b[^.]{0,90}(stopped|halted|cut off|interrupted|incomplete|did ?n.t (finish|complete)|could ?n.t (finish|complete)|not complete)|safety classifier (stopped|halted|interrupted|cut|ended|prevented)|stopped by (a |the )?safety|no findings (were|are) recorded|assessment of [^.]{0,40} withheld/i;
+
 export const verdictOf = (findings: ReviewFinding[]): "passed" | "sent_back" =>
   findings.some((f) => f.severity === "critical" || f.severity === "high") ? "sent_back" : "passed";
 
@@ -609,6 +613,9 @@ export async function reviewOne(db: DatabaseSync, row: Row, deps: ReviewDeps): P
     }
     runId = Number(db.prepare("INSERT INTO review_runs (at) VALUES (?)").run(new Date().toISOString()).lastInsertRowid);
     const { result, costUsd } = await deps.engine({ repo: row.repo, number: row.number, title: row.title, body: row.body, author: row.author, baseRef: row.base_ref, diff, omitted }, repo, row.sha);
+    // A safety classifier (or a limit) can stop a review before it finishes; the model then returns no findings with a
+    // summary saying so. That must not read as a clean pass, so fail it closed and let it end as an error on GitHub.
+    if (!result.findings.length && INCOMPLETE_REVIEW.test(result.summary)) throw new ReviewFailed("The review was stopped before it finished, so it isn't a pass.");
     const full = withheldFindings(result, omitted);
     // Saved before anything goes to GitHub, so trouble posting it never means paying for the same review again.
     setRow(db, row, { state: verdictOf(full.findings), summary: neutralise(full.summary), findings: JSON.stringify(full.findings), note: omitted.length ? `Not reviewed: ${omitted.join(", ")}` : null, cost_usd: costUsd, reviewed_at: new Date().toISOString(), published: 0 });
