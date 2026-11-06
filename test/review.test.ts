@@ -7,7 +7,7 @@ import { join } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { openDb } from "../src/db.ts";
 import {
-  buildComment, buildPrompt, neutralise, openPrsQuery, pollReviews, prepareDiff, recordOpenPrs, redactSecrets, requeueReview, resetInterrupted, reviewOne, runReviewAgent, runTool,
+  apiEngine, buildComment, buildPrompt, claudeCodeArgs, EngineTrouble, parseClaudeCodeOutput, ReviewFailed, neutralise, openPrsQuery, pollReviews, prepareDiff, recordOpenPrs, redactSecrets, requeueReview, resetInterrupted, reviewOne, runReviewAgent, runTool,
   saveReviewSettings, reviewsView, verdictOf, type GithubPort, type OpenPr, type ReviewClient, type ReviewFinding, type ReviewInput,
 } from "../src/review.ts";
 
@@ -202,7 +202,7 @@ test("a clean PR passes: comment, then green check, and the same comment is upda
     const open = [pr({ sha: r.head, baseSha: r.base })];
     const gh = fakeGithub(open);
     const { client, calls } = scripted(text({ summary: "Fine", findings: [] }), text({ summary: "Still fine", findings: [] }));
-    const deps = { github: gh.github, client, repoPath: () => r.clone, baseUrl: "https://m.test" };
+    const deps = { github: gh.github, engine: apiEngine(client), repoPath: () => r.clone, baseUrl: "https://m.test" };
     assert.deepEqual(await pollReviews(db, ["o/r"], deps), { reviewed: 1, queued: 1 });
     assert.deepEqual(gh.statuses.map((s) => s.state), ["pending", "success"]);
     assert.match(gh.comments[0].body, /ready for a person/);
@@ -226,7 +226,7 @@ test("a blocker sends the PR back and emails it", async () => {
     const gh = fakeGithub([pr({ sha: r.head, baseSha: r.base })]);
     const mail: any[] = [];
     const { client } = scripted(text({ summary: "Bad", findings: [finding("critical", { title: "SQL injection" })] }));
-    await pollReviews(db, ["o/r"], { github: gh.github, client, repoPath: () => r.clone, baseUrl: null, send: async (m) => void mail.push(m) });
+    await pollReviews(db, ["o/r"], { github: gh.github, engine: apiEngine(client), repoPath: () => r.clone, baseUrl: null, send: async (m) => void mail.push(m) });
     assert.equal(gh.statuses.at(-1)!.state, "failure");
     assert.match(gh.statuses.at(-1)!.description, /1 issue to fix/);
     assert.equal(stateOf(db, r.head).state, "sent_back");
@@ -246,7 +246,7 @@ test("a review that can't finish ends as an error, never a pass or a stuck pendi
     live(db);
     const gh = fakeGithub([pr({ sha: r.head, baseSha: r.base })]);
     const { client } = scripted({ stop_reason: "refusal", usage: {}, content: [] });
-    await pollReviews(db, ["o/r"], { github: gh.github, client, repoPath: () => r.clone, baseUrl: null });
+    await pollReviews(db, ["o/r"], { github: gh.github, engine: apiEngine(client), repoPath: () => r.clone, baseUrl: null });
     assert.equal(gh.statuses.at(-1)!.state, "error");
     assert.equal(gh.comments.length, 0);
     assert.equal(stateOf(db, r.head).state, "error");
@@ -257,7 +257,7 @@ test("a passing network failure retries on the next poll, then gives up", async 
   const db = openDb(":memory:");
   live(db);
   const gh = fakeGithub([pr()]);
-  const deps = { github: gh.github, client: scripted().client, repoPath: () => "/nonexistent/clone", baseUrl: null };
+  const deps = { github: gh.github, engine: apiEngine(scripted().client), repoPath: () => "/nonexistent/clone", baseUrl: null };
   await pollReviews(db, ["o/r"], deps).catch(() => {});
   assert.equal(stateOf(db).state, "queued");
   await pollReviews(db, ["o/r"], deps).catch(() => {});
@@ -273,7 +273,7 @@ test("trouble with the API keeps the PR in the queue, uses no attempts, and stop
     live(db);
     const gh = fakeGithub([pr({ sha: r.head, baseSha: r.base }), pr({ number: 2, sha: r.head + "x", baseSha: r.base })]);
     const { client, calls } = scripted(new Anthropic.InternalServerError(529, undefined, "overloaded", new Headers()));
-    const deps = { github: gh.github, client, repoPath: () => r.clone, baseUrl: null };
+    const deps = { github: gh.github, engine: apiEngine(client), repoPath: () => r.clone, baseUrl: null };
     await assert.rejects(pollReviews(db, ["o/r"], deps), /error \(529\)/);
     assert.equal(calls.length, 1, "doesn't burn through the rest of the queue");
     const row = db.prepare("SELECT state, attempts FROM reviews WHERE sha = ?").get(r.head) as any;
@@ -309,17 +309,17 @@ test("the daily limit stops the queue without losing the work", async () => {
     const gh = fakeGithub([pr({ sha: r.head, baseSha: r.base })]);
     db.prepare("INSERT INTO reviews (repo, number, sha, base_sha, base_ref, title, url, state, cost_usd, created_at, reviewed_at) VALUES ('o/x', 9, 'old', 'b', 'main', 't', 'u', 'passed', 1, ?, ?)").run(new Date().toISOString(), new Date().toISOString());
     const { client, calls } = scripted();
-    assert.equal((await pollReviews(db, ["o/r"], { github: gh.github, client, repoPath: () => r.clone, baseUrl: null })).reviewed, 0);
+    assert.equal((await pollReviews(db, ["o/r"], { github: gh.github, engine: apiEngine(client), repoPath: () => r.clone, baseUrl: null })).reviewed, 0);
     assert.equal(calls.length, 0);
     assert.equal(stateOf(db, r.head).state, "queued");
-    assert.equal(reviewsView(db, { managed: true, lastError: null, lastPollAt: null }).totals.waiting, 1);
+    assert.equal(reviewsView(db, { managed: true, engine: "api", lastError: null, lastPollAt: null }).totals.waiting, 1);
   } finally { r.cleanup(); }
 });
 
 test("nothing happens while reviews are off, and a restart requeues interrupted work", async () => {
   const db = openDb(":memory:");
   const gh = fakeGithub([pr()]);
-  assert.deepEqual(await pollReviews(db, ["o/r"], { github: gh.github, client: scripted().client, repoPath: () => null, baseUrl: null }), { reviewed: 0, queued: 0 });
+  assert.deepEqual(await pollReviews(db, ["o/r"], { github: gh.github, engine: apiEngine(scripted().client), repoPath: () => null, baseUrl: null }), { reviewed: 0, queued: 0 });
   assert.equal(stateOf(db), undefined);
   live(db);
   recordOpenPrs(db, [pr()]);
@@ -327,4 +327,47 @@ test("nothing happens while reviews are off, and a restart requeues interrupted 
   resetInterrupted(db);
   assert.equal(stateOf(db).state, "queued");
   assert.ok(reviewOne);
+});
+
+// ---------------------------------------------------------------- through Claude Code, on your own plan
+
+test("Claude Code runs with its own tools off and only the read-only server allowed", () => {
+  const args = claudeCodeArgs("/clones/r", "abc1234", "/app/review-tools.ts");
+  const after = (flag: string) => args[args.indexOf(flag) + 1];
+  assert.equal(after("--tools"), "");
+  assert.equal(after("--setting-sources"), "");
+  assert.equal(after("--permission-mode"), "dontAsk");
+  assert.ok(args.includes("--strict-mcp-config"));
+  assert.deepEqual(after("--allowedTools").split(","), ["mcp__review__read_file", "mcp__review__search", "mcp__review__list_files"]);
+  assert.ok(!args.some((a) => /bypassPermissions|dangerously/.test(a)));
+  const server = JSON.parse(after("--mcp-config")).mcpServers.review;
+  assert.deepEqual(server.args.slice(-2), ["/clones/r", "abc1234"]);
+  assert.deepEqual(JSON.parse(after("--json-schema")).properties.findings.items.properties.severity.enum, ["critical", "high", "medium", "low"]);
+});
+
+test("only a finished, valid Claude Code answer counts", () => {
+  const ok = (extra: object) => JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "", ...extra });
+  const review = { summary: "s", findings: [finding("high")] };
+  assert.equal(parseClaudeCodeOutput(ok({ structured_output: review })).findings.length, 1);
+  assert.throws(() => parseClaudeCodeOutput("not json"), ReviewFailed);
+  assert.throws(() => parseClaudeCodeOutput(ok({})), ReviewFailed, "plain text with no structured answer isn't a pass");
+  assert.throws(() => parseClaudeCodeOutput(ok({ structured_output: { verdict: "approve" } })), ReviewFailed);
+  assert.throws(() => parseClaudeCodeOutput(JSON.stringify({ subtype: "error_max_turns", is_error: true, structured_output: { summary: "s", findings: [] } })), ReviewFailed);
+  assert.throws(() => parseClaudeCodeOutput(JSON.stringify({ subtype: "success", is_error: true, result: "You've hit your limit", structured_output: review })), EngineTrouble);
+  assert.throws(() => parseClaudeCodeOutput(JSON.stringify({ is_error: true, api_error_status: 429, result: "x" })), /usage limit/);
+  assert.throws(() => parseClaudeCodeOutput(JSON.stringify({ is_error: true, api_error_status: 401, result: "x" })), /isn't logged in/);
+});
+
+test("hitting the plan's limit keeps the PR queued and stops the poll", async () => {
+  const r = prRepo();
+  try {
+    const db = openDb(":memory:");
+    live(db);
+    const gh = fakeGithub([pr({ sha: r.head, baseSha: r.base })]);
+    let runs = 0;
+    const engine = async () => { runs++; throw new EngineTrouble("Your Claude plan's usage limit was reached."); };
+    await assert.rejects(pollReviews(db, ["o/r"], { github: gh.github, engine, repoPath: () => r.clone, baseUrl: null }), /usage limit/);
+    assert.equal(runs, 1);
+    assert.deepEqual({ ...(db.prepare("SELECT state, attempts FROM reviews").get() as any) }, { state: "queued", attempts: 0 });
+  } finally { r.cleanup(); }
 });

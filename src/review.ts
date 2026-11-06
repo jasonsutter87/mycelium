@@ -10,6 +10,10 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import { execFile } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
@@ -21,6 +25,8 @@ export const REVIEW_MODEL = process.env.MYCELIUM_REVIEW_MODEL || "claude-opus-5-
 export const STATUS_CONTEXT = "Mycelium review";
 const MARKER = "<!-- mycelium-review -->";
 const MAX_TURNS = 16;
+export const MAX_TOOL_CALLS = 60;
+const CLAUDE_CODE_TIMEOUT_MS = 20 * 60_000;
 const MAX_DIFF_CHARS = 400_000;
 const LOCKFILE_DIFF_CHARS = 20_000;
 const FILE_CHARS = 120_000;
@@ -77,7 +83,6 @@ const setJson = (db: DatabaseSync, key: string, value: unknown) =>
   db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT DO UPDATE SET value = excluded.value").run(key, JSON.stringify(value));
 
 export const loadReviewSettings = (db: DatabaseSync) => getJson<ReviewSettings>(db, "reviews", DEFAULT_REVIEWS);
-export const reviewConfigured = (env = process.env) => !!env.ANTHROPIC_API_KEY;
 
 export function saveReviewSettings(db: DatabaseSync, input: Partial<ReviewSettings>): ReviewSettings {
   const prev = loadReviewSettings(db);
@@ -212,6 +217,90 @@ export interface ReviewClient {
 
 /** A review that couldn't finish: never a pass. */
 export class ReviewFailed extends Error {}
+/** Trouble with the login or its limits, nothing to do with this PR: it keeps its place in the queue. */
+export class EngineTrouble extends Error {}
+
+/** Runs one review. Returns a cost only when one is actually billed per use. */
+export type ReviewEngine = (input: ReviewInput, repo: string, sha: string) => Promise<{ result: ReviewResult; costUsd: number | null }>;
+export type EngineKind = "api" | "claude-code";
+
+export const apiEngine = (client: ReviewClient): ReviewEngine => (input, repo, sha) => runReviewAgent(client, input, (name, args) => runTool(repo, sha, name, args));
+
+/**
+ * An API key if there is one, since setting one is a deliberate choice. Otherwise a logged-in Claude Code on this machine,
+ * which runs on that person's own plan: fine for their own install, but a product can't offer it to its customers.
+ */
+export async function detectEngine(env = process.env): Promise<EngineKind | null> {
+  if (env.ANTHROPIC_API_KEY) return "api";
+  try {
+    const { stdout } = await execFileP("claude", ["auth", "status"], { encoding: "utf8", timeout: 20_000 });
+    return JSON.parse(stdout).loggedIn ? "claude-code" : null;
+  } catch {
+    return null;
+  }
+}
+
+const CLAUDE_TOOLS = ["read_file", "search", "list_files"].map((t) => `mcp__review__${t}`);
+
+/** The whole command line. Claude Code's own tools are off: all it can use is the read-only server, for this one commit. */
+export function claudeCodeArgs(repo: string, sha: string, toolsScript: string): string[] {
+  const mcp = { mcpServers: { review: { type: "stdio", command: process.execPath, args: ["--experimental-strip-types", "--no-warnings=ExperimentalWarning", toolsScript, repo, sha] } } };
+  return [
+    "-p", "--output-format", "json", "--no-session-persistence",
+    "--model", REVIEW_MODEL, "--effort", "high",
+    "--system-prompt", SYSTEM_PROMPT,
+    "--json-schema", JSON.stringify(REVIEW_JSON_SCHEMA),
+    "--tools", "",
+    "--mcp-config", JSON.stringify(mcp), "--strict-mcp-config",
+    "--allowedTools", CLAUDE_TOOLS.join(","),
+    "--permission-mode", "dontAsk",
+    "--setting-sources", "", // no hooks, plugins, or instructions from this machine's own setup
+    "--disable-slash-commands",
+  ];
+}
+
+/** Reads what `claude -p --output-format json` printed. Only a finished answer that fits the schema comes back. */
+export function parseClaudeCodeOutput(stdout: string): ReviewResult {
+  let out: any;
+  try {
+    out = JSON.parse(stdout);
+  } catch {
+    throw new ReviewFailed("The review didn't come back in the expected format.");
+  }
+  const said = String(out?.result ?? "");
+  if (out?.api_error_status === 429 || out?.api_error_status === 401 || out?.api_error_status === 403 || (out?.api_error_status ?? 0) >= 500 || /usage limit|limit reached|hit your limit|not logged in|please run \/login|invalid api key/i.test(out?.is_error ? said : "")) {
+    throw new EngineTrouble(out?.api_error_status === 429 || /limit/i.test(said) ? "Your Claude plan's usage limit was reached. Reviews continue when it resets." : out?.api_error_status >= 500 ? "Anthropic's service returned an error." : "Claude Code on this server isn't logged in. Run claude there to log in.");
+  }
+  if (out?.is_error || out?.subtype !== "success") throw new ReviewFailed("The review didn't finish.");
+  const checked = ReviewSchema.safeParse(out.structured_output);
+  if (!checked.success) throw new ReviewFailed("The review didn't come back in the expected format.");
+  return checked.data;
+}
+
+/** Keeps other services' keys out: Claude Code needs its login, which lives under HOME, and little else. */
+const claudeCodeEnv = (env = process.env) => {
+  const keep: Record<string, string> = { CI: "1" };
+  for (const k of ["HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"]) if (env[k]) keep[k] = env[k]!;
+  return keep;
+};
+
+export const claudeCodeEngine: ReviewEngine = async (input, repo, sha) => {
+  const toolsScript = fileURLToPath(new URL("./review-tools.ts", import.meta.url));
+  const cwd = mkdtempSync(join(tmpdir(), "mycelium-review-")); // an empty folder, so no project's instructions get picked up
+  try {
+    const stdout = await new Promise<string>((resolve, reject) => {
+      const child = execFile("claude", claudeCodeArgs(repo, sha, toolsScript), { cwd, env: claudeCodeEnv(), encoding: "utf8", timeout: CLAUDE_CODE_TIMEOUT_MS, maxBuffer: 1 << 26 }, (err, out, stderr) => {
+        // A failed run still prints its JSON, and that says why. No JSON at all is the CLI itself failing.
+        if (err && !String(out).trim()) reject(new EngineTrouble(`Claude Code couldn't run: ${String(stderr || err.message).trim().split("\n")[0].slice(0, 200)}`));
+        else resolve(out);
+      });
+      child.stdin!.end(buildPrompt(input));
+    });
+    return { result: parseClaudeCodeOutput(stdout), costUsd: null }; // the JSON's cost is notional here: nothing is billed per review
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+};
 
 const usageCost = (u: any) =>
   ((u?.input_tokens ?? 0) * PRICE.input + (u?.output_tokens ?? 0) * PRICE.output + (u?.cache_read_input_tokens ?? 0) * PRICE.cacheRead + (u?.cache_creation_input_tokens ?? 0) * PRICE.cacheWrite) / 1e6;
@@ -416,7 +505,7 @@ const reviewedLastDay = (db: DatabaseSync, now: number) =>
 
 export interface ReviewDeps {
   github: GithubPort;
-  client: ReviewClient;
+  engine: ReviewEngine;
   repoPath(slug: string): string | null;
   baseUrl: string | null;
   send?: Sender;
@@ -429,7 +518,7 @@ const setRow = (db: DatabaseSync, r: Pick<Row, "repo" | "number" | "sha">, field
 };
 
 const noteFor = (e: unknown) => {
-  if (e instanceof ReviewFailed) return e.message;
+  if (e instanceof ReviewFailed || e instanceof EngineTrouble) return e.message;
   if (e instanceof Anthropic.AuthenticationError) return "The Anthropic API rejected the key. Check ANTHROPIC_API_KEY.";
   if (e instanceof Anthropic.RateLimitError) return "The Anthropic API is rate limiting this key.";
   if (e instanceof Anthropic.APIError) return `The Anthropic API returned an error (${e.status ?? "no status"}).`;
@@ -438,7 +527,7 @@ const noteFor = (e: unknown) => {
 
 /** Trouble with the API or the key says nothing about this PR: it keeps its place and the poll stops until the next one. */
 const apiTrouble = (e: unknown) =>
-  e instanceof Anthropic.AuthenticationError || e instanceof Anthropic.PermissionDeniedError || e instanceof Anthropic.RateLimitError || e instanceof Anthropic.APIConnectionError || (e instanceof Anthropic.APIError && (e.status ?? 0) >= 500);
+  e instanceof EngineTrouble || e instanceof Anthropic.AuthenticationError || e instanceof Anthropic.PermissionDeniedError || e instanceof Anthropic.RateLimitError || e instanceof Anthropic.APIConnectionError || (e instanceof Anthropic.APIError && (e.status ?? 0) >= 500);
 
 /** Reviews one queued commit. It ends as a verdict or an error on GitHub, or stays pending while the API itself is down. */
 export async function reviewOne(db: DatabaseSync, row: Row, deps: ReviewDeps): Promise<void> {
@@ -457,7 +546,7 @@ export async function reviewOne(db: DatabaseSync, row: Row, deps: ReviewDeps): P
       await deps.github.setStatus(row.repo, row.sha, "error", "Too large to review automatically", target);
       return;
     }
-    const { result, costUsd } = await runReviewAgent(deps.client, { repo: row.repo, number: row.number, title: row.title, body: row.body, author: row.author, baseRef: row.base_ref, diff, omitted }, (name, input) => runTool(repo, row.sha, name, input));
+    const { result, costUsd } = await deps.engine({ repo: row.repo, number: row.number, title: row.title, body: row.body, author: row.author, baseRef: row.base_ref, diff, omitted }, repo, row.sha);
     const verdict = verdictOf(result.findings);
     const previous = db.prepare("SELECT comment_id FROM reviews WHERE repo = ? AND number = ? AND comment_id IS NOT NULL ORDER BY created_at DESC LIMIT 1").get(row.repo, row.number) as { comment_id: number } | undefined;
     const commentId = await deps.github.comment(row.repo, row.number, previous?.comment_id ?? null, buildComment(row.repo, row.sha, result));
@@ -521,24 +610,25 @@ export function requeueReview(db: DatabaseSync, repo: string, number: number) {
   db.prepare("UPDATE reviews SET state = 'queued', attempts = 0, note = NULL WHERE repo = ? AND number = ? AND sha = ? AND state != 'running'").run(repo, number, row.sha);
 }
 
-export function reviewsView(db: DatabaseSync, opts: { managed: boolean; lastError: string | null; lastPollAt: string | null }) {
+export function reviewsView(db: DatabaseSync, opts: { managed: boolean; engine: EngineKind | null; lastError: string | null; lastPollAt: string | null }) {
   const rows = db.prepare("SELECT * FROM reviews ORDER BY COALESCE(reviewed_at, created_at) DESC LIMIT 200").all() as unknown as Row[];
   const dayAgo = new Date(Date.now() - 86_400_000).toISOString();
   const totals = db.prepare(`SELECT sum(state = 'passed') AS passed, sum(state = 'sent_back') AS sentBack, sum(state = 'queued' OR state = 'running') AS waiting, COALESCE(sum(cost_usd), 0) AS cost,
     COALESCE(sum(CASE WHEN reviewed_at > ? THEN cost_usd END), 0) AS costDay FROM reviews`).get(dayAgo) as Record<string, number | null>;
   return {
-    settings: loadReviewSettings(db), configured: reviewConfigured(), managed: opts.managed, lastError: opts.lastError, lastPollAt: opts.lastPollAt, model: REVIEW_MODEL,
+    settings: loadReviewSettings(db), configured: !!opts.engine, engine: opts.engine, managed: opts.managed, lastError: opts.lastError, lastPollAt: opts.lastPollAt, model: REVIEW_MODEL,
     totals: { passed: totals.passed ?? 0, sentBack: totals.sentBack ?? 0, waiting: totals.waiting ?? 0, cost: totals.cost ?? 0, costDay: totals.costDay ?? 0, reviewedDay: reviewedLastDay(db, Date.now()) },
     reviews: rows.map((r) => ({ repo: r.repo, number: r.number, sha: r.sha, title: r.title, url: r.url, author: r.author, state: r.state, summary: r.summary, note: r.note, findings: JSON.parse(r.findings) as ReviewFinding[], costUsd: r.cost_usd, at: r.reviewed_at ?? r.created_at })),
   };
 }
 
 /** `mycelium review`: one real review, printed. Nothing goes to GitHub: for trying it out on a PR before turning it on. */
-export async function previewReview(repoPath: string, slug: string, number: number, client: ReviewClient): Promise<{ result: ReviewResult; costUsd: number; omitted: string[] }> {
-  const p = JSON.parse(await gh(["pr", "view", String(number), "--repo", slug, "--json", "title,body,author,headRefOid,baseRefOid,baseRefName"]));
+export async function previewReview(repoPath: string, slug: string, number: number, engine: ReviewEngine): Promise<{ result: ReviewResult; costUsd: number | null; omitted: string[] }> {
+  const pull = JSON.parse(await gh(["api", `repos/${slug}/pulls/${number}`]));
+  const p = { title: pull.title, body: pull.body, author: pull.user, headRefOid: pull.head.sha, baseRefOid: pull.base.sha, baseRefName: pull.base.ref };
   await git(repoPath, ["fetch", "-q", "origin", `+refs/pull/${number}/head:refs/mycelium/pr/${number}`, p.baseRefName]);
   const { diff, omitted, tooLarge } = prepareDiff(await git(repoPath, ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames", `${p.baseRefOid}...${p.headRefOid}`]));
   if (tooLarge) throw new ReviewFailed("Too large to review automatically.");
-  const out = await runReviewAgent(client, { repo: slug, number, title: p.title, body: p.body ?? "", author: p.author?.login ?? null, baseRef: p.baseRefName, diff, omitted }, (name, input) => runTool(repoPath, p.headRefOid, name, input));
+  const out = await engine({ repo: slug, number, title: p.title, body: p.body ?? "", author: p.author?.login ?? null, baseRef: p.baseRefName, diff, omitted }, repoPath, p.headRefOid);
   return { ...out, omitted };
 }

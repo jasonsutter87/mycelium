@@ -678,19 +678,19 @@ function renderReviews() {
       <div class="pwho"><h2>PR reviews</h2><p class="muted">An AI reviewer tries to break every pull request on your watched repos. It either clears the PR for a person to merge or sends it back with notes. It never merges.</p></div>
     </header>
     ${d.managed ? "" : `<div class="warn-box"><b>Reviews run on a server install.</b> They use the repo list and clones from the Repos page, which this install doesn't have.</div>`}
-    ${d.managed && !d.configured ? `<div class="warn-box"><b>Reviews need an API key.</b> Add <span class="mono">ANTHROPIC_API_KEY</span> to Mycelium's environment, then restart it.</div>` : ""}
+    ${d.managed && !d.configured ? `<div class="warn-box"><b>Reviews need Claude.</b> Log in to Claude Code on this server, or add <span class="mono">ANTHROPIC_API_KEY</span> to Mycelium's environment and restart it.</div>` : ""}
     ${d.lastError ? `<div class="errbox">The last check for PRs failed: ${esc(d.lastError)} It tries again in a couple of minutes.</div>` : ""}
     <div class="ptiles">
       <div class="ptile static"><b class="${on ? "ok-text" : ""}">${on ? "On" : "Off"}</b><span>${on ? (d.lastPollAt ? `checked for PRs ${esc(ago(d.lastPollAt))}` : "checking every 2 minutes") : "PR reviews"}</span></div>
       <div class="ptile static"><b>${t.sentBack + t.passed}</b><span>${t.sentBack} sent back, ${t.passed} ready to merge</span></div>
-      <div class="ptile static"><b>${money(t.costDay)}</b><span>last 24 hours, about ${money(t.cost)} in all</span></div>
+      ${d.engine === "api" ? `<div class="ptile static"><b>${money(t.costDay)}</b><span>last 24 hours, about ${money(t.cost)} in all</span></div>` : `<div class="ptile static"><b>${t.reviewedDay}</b><span>${d.engine === "claude-code" ? "reviews in 24 hours, on your Claude plan" : "reviews in 24 hours"}</span></div>`}
     </div>
     <section class="pcard">
       <h3>Settings</h3>
       <label class="row"><input type="checkbox" id="rOn" ${on ? "checked" : ""} ${d.configured && d.managed ? "" : "disabled"}> <b>Review new pull requests</b></label>
       <label class="row"><span>Stop after <input class="field num-in" id="rLimit" type="number" min="1" max="1000" value="${esc(d.settings.dailyLimit)}" aria-label="Most reviews in 24 hours"> reviews in 24 hours</span></label>
       <label class="row"><input type="checkbox" id="rEmail" ${d.settings.emailSentBack ? "checked" : ""}> <span>Email the alert list when a PR is sent back</span></label>
-      <p class="small muted">PRs already open when you turn this on aren't reviewed until they change. PRs from forks and dependency bots like Dependabot are skipped, but you can still review one by hand. PR code goes to Anthropic (${esc(d.model)}), without files that may hold secrets. To block merging on a failed review, make the <span class="mono">Mycelium review</span> check required in GitHub's branch rules.</p>
+      <p class="small muted">PRs already open when you turn this on aren't reviewed until they change. PRs from forks and dependency bots like Dependabot are skipped, but you can still review one by hand. PR code goes to Anthropic (${esc(d.model)}${d.engine === "claude-code" ? ", through Claude Code on this server" : ""}), without files that may hold secrets. To block merging on a failed review, make the <span class="mono">Mycelium review</span> check required in GitHub's branch rules.</p>
       <div class="actions"><button class="btn primary" id="rSave">Save</button>${state.reviewMsg ? `<span class="small ${state.reviewMsg.err ? "warn-text" : "ok-text"}" role="status">${esc(state.reviewMsg.text)}</span>` : ""}</div>
     </section>
     <div class="filters rfilters"><div class="chips" role="group" aria-label="Filter reviews">${chips.map(([id, label, c]) => `<button data-rfilter="${id}" class="${state.reviewFilter === id ? "on" : ""}">${label}<i>${c}</i></button>`).join("")}</div></div>

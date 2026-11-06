@@ -216,7 +216,7 @@ PR opened or updated → reviewer tries to break it → "Mycelium review" check 
                                                      red: sent back with notes (and an email to the alert list)
 ```
 
-Add `ANTHROPIC_API_KEY` to Mycelium's environment, restart, and turn it on. Try it on one PR first, without posting anything:
+It runs through a logged-in Claude Code on the server, on that person's own plan, or through `ANTHROPIC_API_KEY` if that's set. The key is what to use anywhere you're offering Mycelium to other people, since a product can't run its customers on someone's Claude plan. Try it on one PR first, without posting anything:
 
 ```sh
 mycelium review owner/name 123
@@ -224,7 +224,7 @@ mycelium review owner/name 123
 
 - **Mycelium never merges.** To block merging on a failed review, make the `Mycelium review` check required in GitHub's branch rules.
 - **It polls** every two minutes, so GitHub needs no way in to your server.
-- **The reviewer can only read.** Its tools read git objects from that one commit. It can't run code or write anywhere, and
+- **The reviewer can only read.** Its tools read git objects from that one commit, and Claude Code's own tools are switched off. It can't run code or write anywhere, and
   everything in a PR is treated as data. The verdict is computed from its findings, and a review that doesn't finish is never a pass.
 - **Spending has a limit.** A daily cap (50 reviews by default) holds the rest in the queue, and the page shows the estimated cost.
   PRs from forks and dependency bots, and PRs already open when you turn this on, are skipped until you ask or they change.
@@ -269,7 +269,7 @@ risk = severity × exposure × (1 + log2(projects affected))
 
 - Everything lives in `~/.mycelium/mycelium.db` (override with `MYCELIUM_DB`).
 - Only package names and versions are sent to OSV.dev and deps.dev.
-- Source code stays on your machine unless you turn on PR reviews. Then PR titles, descriptions, diffs and the files the reviewer opens go to the Anthropic API. Files that may hold secrets (`.env`, private keys, credentials) are left out, and known token formats are blanked first.
+- Source code stays on your machine unless you turn on PR reviews. Then PR titles, descriptions, diffs and the files the reviewer opens go to Anthropic. Files that may hold secrets (`.env`, private keys, credentials) are left out, and known token formats are blanked first.
 - `.env` files are flagged when committed to git, but their contents are never read.
 - GitHub access goes through your own `gh` CLI login.
 
@@ -291,6 +291,7 @@ src/
   fix.ts              plan → worktree → apply → rescan → verify → commit → PR
   prs.ts              PR sync, which findings each PR fixes, safe pull
   review.ts           adversarial PR review: agent, read-only tools, queue, GitHub status + comment
+  review-tools.ts     those read-only tools as an MCP server, when reviews run through Claude Code
   serve.ts, report.ts dashboard server + HTML
   mcp.ts              MCP tools
 agents/               Claude Code subagent definition
