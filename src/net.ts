@@ -3,6 +3,12 @@
 
 const describe = (e: any): string => e?.cause?.code ?? e?.cause?.message ?? (e?.name === "TimeoutError" ? "timed out" : e?.message ?? String(e));
 
+/** The environment for anything that runs repo or dependency code: builds and install scripts have no business with these keys. */
+export function withoutServiceKeys(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const { ANTHROPIC_API_KEY: _a, ANTHROPIC_AUTH_TOKEN: _b, CLAUDE_CODE_OAUTH_TOKEN: _c, RESEND_API_KEY: _d, ...rest } = env;
+  return rest;
+}
+
 export async function fetchRetry(
   url: string,
   init: RequestInit = {},

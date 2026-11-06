@@ -1,13 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { openDb } from "../src/db.ts";
+import { withoutServiceKeys } from "../src/net.ts";
 import {
-  apiEngine, buildComment, buildPrompt, claudeCodeArgs, EngineTrouble, parseClaudeCodeOutput, ReviewFailed, neutralise, openPrsQuery, pollReviews, prepareDiff, recordOpenPrs, redactSecrets, requeueReview, resetInterrupted, reviewOne, runReviewAgent, runTool,
+  apiEngine, fetchPrObjects, statusDescription, withheldFindings, buildComment, buildPrompt, claudeCodeArgs, EngineTrouble, parseClaudeCodeOutput, ReviewFailed, neutralise, openPrsQuery, pollReviews, prepareDiff, recordOpenPrs, redactSecrets, requeueReview, resetInterrupted, reviewOne, runReviewAgent, runTool,
   saveReviewSettings, reviewsView, verdictOf, type GithubPort, type OpenPr, type ReviewClient, type ReviewFinding, type ReviewInput,
 } from "../src/review.ts";
 
@@ -138,14 +139,15 @@ test("tools read the commit, not the working folder, and refuse secrets", async 
 
 const pr = (over: Partial<OpenPr> = {}): OpenPr => ({ repo: "o/r", number: 1, title: "T", body: "B", url: "https://github.com/o/r/pull/1", author: "a", draft: false, fork: false, sha: "s1", baseSha: "b1", baseRef: "main", ...over });
 const stateOf = (db: any, sha = "s1") => db.prepare("SELECT state, note FROM reviews WHERE sha = ?").get(sha);
-const live = (db: any) => { saveReviewSettings(db, { enabled: true }); recordOpenPrs(db, []); };
+const rec = (db: any, prs: OpenPr[]) => recordOpenPrs(db, { prs, answered: ["o/r"], partial: [] });
+const live = (db: any) => { saveReviewSettings(db, { enabled: true }); rec(db, []); };
 
 test("turning reviews on leaves open PRs alone until they change", () => {
   const db = openDb(":memory:");
   saveReviewSettings(db, { enabled: true });
-  assert.deepEqual(recordOpenPrs(db, [pr()]), { queued: 0, baselined: 1 });
+  assert.deepEqual(rec(db, [pr()]), { queued: 0, baselined: 1 });
   assert.equal(stateOf(db).state, "skipped");
-  assert.deepEqual(recordOpenPrs(db, [pr({ sha: "s2" })]), { queued: 1, baselined: 0 });
+  assert.deepEqual(rec(db, [pr({ sha: "s2" })]), { queued: 1, baselined: 0 });
   assert.equal(stateOf(db, "s2").state, "queued");
   assert.equal(stateOf(db).state, "skipped");
 });
@@ -153,28 +155,28 @@ test("turning reviews on leaves open PRs alone until they change", () => {
 test("drafts wait, forks are skipped, and a new push replaces queued work", () => {
   const db = openDb(":memory:");
   live(db);
-  recordOpenPrs(db, [pr({ draft: true }), pr({ number: 2, sha: "fork", fork: true }), pr({ number: 3, sha: "q1" }), pr({ number: 4, sha: "bot", author: "dependabot" }), pr({ number: 5, sha: "bot2", author: "renovate[bot]" })]);
+  rec(db, [pr({ draft: true }), pr({ number: 2, sha: "fork", fork: true }), pr({ number: 3, sha: "q1" }), pr({ number: 4, sha: "bot", author: "dependabot" }), pr({ number: 5, sha: "bot2", author: "renovate[bot]" })]);
   assert.equal(stateOf(db), undefined);
   assert.match(stateOf(db, "fork").note, /fork/);
   assert.match(stateOf(db, "bot").note, /dependency bot/);
   assert.match(stateOf(db, "bot2").note, /dependency bot/);
-  recordOpenPrs(db, [pr({ number: 3, sha: "q2" })]);
+  rec(db, [pr({ number: 3, sha: "q2" })]);
   assert.equal(stateOf(db, "q1").state, "skipped");
   assert.equal(stateOf(db, "q2").state, "queued");
-  recordOpenPrs(db, []);
+  rec(db, []);
   assert.equal(stateOf(db, "q2").state, "skipped", "a closed PR isn't reviewed");
 });
 
 test("settings are checked", () => {
   const db = openDb(":memory:");
   assert.throws(() => saveReviewSettings(db, { dailyLimit: 0 }), /daily limit/);
-  assert.equal(saveReviewSettings(db, { enabled: true }).baselinePending, true);
+  assert.deepEqual(saveReviewSettings(db, { enabled: true }).seenRepos, []);
 });
 
 function fakeGithub(open: OpenPr[]) {
   const statuses: { sha: string; state: string; description: string }[] = [], comments: { number: number; id: number | null; body: string }[] = [];
   const github: GithubPort = {
-    listOpenPrs: async () => open,
+    listOpenPrs: async () => ({ prs: open, answered: ["o/r"], partial: [] }),
     setStatus: async (_r, sha, state, description) => void statuses.push({ sha, state, description }),
     comment: async (_r, number, id, body) => { comments.push({ number, id, body }); return id ?? 99; },
   };
@@ -305,9 +307,9 @@ test("the daily limit stops the queue without losing the work", async () => {
   const r = prRepo();
   try {
     const db = openDb(":memory:");
-    saveReviewSettings(db, { enabled: true, dailyLimit: 1 }); recordOpenPrs(db, []);
+    saveReviewSettings(db, { enabled: true, dailyLimit: 1 }); rec(db, []);
     const gh = fakeGithub([pr({ sha: r.head, baseSha: r.base })]);
-    db.prepare("INSERT INTO reviews (repo, number, sha, base_sha, base_ref, title, url, state, cost_usd, created_at, reviewed_at) VALUES ('o/x', 9, 'old', 'b', 'main', 't', 'u', 'passed', 1, ?, ?)").run(new Date().toISOString(), new Date().toISOString());
+    db.prepare("INSERT INTO review_runs (at) VALUES (?)").run(new Date().toISOString());
     const { client, calls } = scripted();
     assert.equal((await pollReviews(db, ["o/r"], { github: gh.github, engine: apiEngine(client), repoPath: () => r.clone, baseUrl: null })).reviewed, 0);
     assert.equal(calls.length, 0);
@@ -322,7 +324,7 @@ test("nothing happens while reviews are off, and a restart requeues interrupted 
   assert.deepEqual(await pollReviews(db, ["o/r"], { github: gh.github, engine: apiEngine(scripted().client), repoPath: () => null, baseUrl: null }), { reviewed: 0, queued: 0 });
   assert.equal(stateOf(db), undefined);
   live(db);
-  recordOpenPrs(db, [pr()]);
+  rec(db, [pr()]);
   db.prepare("UPDATE reviews SET state = 'running'").run();
   resetInterrupted(db);
   assert.equal(stateOf(db).state, "queued");
@@ -369,5 +371,132 @@ test("hitting the plan's limit keeps the PR queued and stops the poll", async ()
     await assert.rejects(pollReviews(db, ["o/r"], { github: gh.github, engine, repoPath: () => r.clone, baseUrl: null }), /usage limit/);
     assert.equal(runs, 1);
     assert.deepEqual({ ...(db.prepare("SELECT state, attempts FROM reviews").get() as any) }, { state: "queued", attempts: 0 });
+  } finally { r.cleanup(); }
+});
+
+// ---------------------------------------------------------------- what its first real review of itself found
+
+test("a failed or partial listing doesn't drop queued work", () => {
+  const db = openDb(":memory:");
+  live(db);
+  rec(db, [pr({ sha: "q1" })]);
+  recordOpenPrs(db, { prs: [], answered: [], partial: [] });
+  assert.equal(stateOf(db, "q1").state, "queued", "no answer isn't the same as closed");
+  recordOpenPrs(db, { prs: [], answered: ["o/r"], partial: ["o/r"] });
+  assert.equal(stateOf(db, "q1").state, "queued", "more PRs than we were given");
+  recordOpenPrs(db, { prs: [], answered: ["o/r"], partial: [] });
+  assert.equal(stateOf(db, "q1").state, "skipped");
+});
+
+test("a newly watched repo's open PRs wait, and turning reviews back on starts over", () => {
+  const db = openDb(":memory:");
+  live(db);
+  assert.equal(recordOpenPrs(db, { prs: [pr({ repo: "o/new", sha: "n1" })], answered: ["o/r", "o/new"], partial: [] }).baselined, 1);
+  assert.equal(stateOf(db, "n1").state, "skipped");
+  assert.equal(recordOpenPrs(db, { prs: [pr({ repo: "o/new", sha: "n2" })], answered: ["o/r", "o/new"], partial: [] }).queued, 1);
+  saveReviewSettings(db, { enabled: false }); saveReviewSettings(db, { enabled: true });
+  assert.equal(recordOpenPrs(db, { prs: [pr({ repo: "o/new", sha: "n3" })], answered: ["o/new"], partial: [] }).baselined, 1);
+});
+
+test("a missing clone keeps its place and uses none of the limit", async () => {
+  const db = openDb(":memory:");
+  live(db);
+  const gh = fakeGithub([pr()]);
+  let ran = 0;
+  const engine = async () => { ran++; return { result: { summary: "s", findings: [] }, costUsd: null }; };
+  await pollReviews(db, ["o/r"], { github: gh.github, engine, repoPath: () => null, baseUrl: null });
+  assert.equal(ran, 0);
+  assert.equal(stateOf(db).state, "queued");
+  assert.equal(gh.statuses.length, 0);
+  assert.equal((db.prepare("SELECT count(*) AS n FROM review_runs").get() as any).n, 0);
+});
+
+test("if GitHub fails after a review, only the posting is retried, and with the same comment", async () => {
+  const r = prRepo();
+  try {
+    const db = openDb(":memory:");
+    live(db);
+    const gh = fakeGithub([pr({ sha: r.head, baseSha: r.base })]);
+    let ran = 0, broken = true;
+    const github: GithubPort = { ...gh.github, setStatus: async (a, b, state, ...rest) => { if (broken && state !== "pending") throw new Error("HTTP 502"); return gh.github.setStatus(a, b, state, ...rest); } };
+    const engine = async () => { ran++; return { result: { summary: "Fine", findings: [] }, costUsd: null }; };
+    const deps = { github, engine, repoPath: () => r.clone, baseUrl: null };
+    await pollReviews(db, ["o/r"], deps);
+    assert.equal(ran, 1);
+    assert.equal(stateOf(db, r.head).state, "passed");
+    broken = false;
+    await pollReviews(db, ["o/r"], deps);
+    assert.equal(ran, 1, "the model isn't asked again");
+    assert.equal(gh.statuses.at(-1)!.state, "success");
+    assert.equal(gh.comments.length, 2);
+    assert.equal(gh.comments[1].id, 99, "edits the comment it already posted");
+  } finally { r.cleanup(); }
+});
+
+test("an account or settings error stops the poll without using up attempts", async () => {
+  const r = prRepo();
+  try {
+    const db = openDb(":memory:");
+    live(db);
+    const gh = fakeGithub([pr({ sha: r.head, baseSha: r.base })]);
+    const { client } = scripted(new Anthropic.BadRequestError(400, undefined, "credit balance too low", new Headers()));
+    await assert.rejects(pollReviews(db, ["o/r"], { github: gh.github, engine: apiEngine(client), repoPath: () => r.clone, baseUrl: null }));
+    assert.deepEqual({ ...(db.prepare("SELECT state, attempts FROM reviews").get() as any) }, { state: "queued", attempts: 0 });
+    assert.throws(() => parseClaudeCodeOutput(JSON.stringify({ is_error: true, api_error_status: 404, result: "model not found" })), EngineTrouble);
+    assert.throws(() => parseClaudeCodeOutput(JSON.stringify({ is_error: true, api_error_status: 400, result: "Prompt is too long" })), ReviewFailed);
+  } finally { r.cleanup(); }
+});
+
+test("a withheld secret-looking file needs a person, and a big lockfile is only noted", () => {
+  const clean = { summary: "s", findings: [] };
+  assert.equal(verdictOf(withheldFindings(clean, [".npmrc (may hold secrets)"]).findings), "sent_back");
+  assert.equal(verdictOf(withheldFindings(clean, ["package-lock.json (large lockfile)"]).findings), "passed");
+  assert.match(buildComment("o/r", "abc", clean, ["package-lock.json (large lockfile)"]), /Not reviewed:.*package-lock/);
+  assert.match(statusDescription("passed", [], ["x"]), /1 file not reviewed/);
+});
+
+test("renames from secret files, unusual paths, and more secret names are held back", () => {
+  const sec = (path: string, extra = "") => `diff --git a/${path} b/${path}\n${extra}+x\n`;
+  assert.equal(prepareDiff(sec("settings.txt", "rename from .env\nrename to settings.txt\n")).diff, "");
+  assert.equal(prepareDiff('diff --git "a/caf\\303\\251/.env" "b/caf\\303\\251/.env"\n+x\n').diff, "");
+  for (const f of ["prod.env", ".envrc", ".git-credentials", "terraform.tfvars"]) assert.equal(prepareDiff(sec(f)).diff, "", f);
+});
+
+test("a colon in a file name can't hide a secret file from search, and long lines are cut", async () => {
+  const { dir, g } = repoWithCommit();
+  try {
+    mkdirSync(join(dir, "a:b"));
+    writeFileSync(join(dir, "a:b/.env"), "needle-in-secret\n");
+    writeFileSync(join(dir, "long.txt"), `needle ${"x".repeat(5000)}\n`);
+    g("add", "-A"); g("commit", "-qm", "two");
+    const out = await runTool(dir, g("rev-parse", "HEAD"), "search", { text: "needle" });
+    assert.ok(!out.includes("needle-in-secret"));
+    assert.match(out, /^long\.txt:1:needle/);
+    assert.ok(out.length < 700 && out.includes("[line cut off]"));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a very long review keeps the worst findings, and bare links and issue references are broken up", () => {
+  const big = "y".repeat(25_000);
+  const c = buildComment("o/r", "abc", { summary: "s", findings: [finding("low", { detail: big }), finding("critical", { detail: big }), finding("high", { detail: big })] });
+  assert.ok(c.length < 65_536);
+  assert.match(c, /CRITICAL/);
+  assert.match(c, /1 lower-severity note left out/);
+  const n = neutralise("see https://evil.test/?d=x and other-org/repo#12 and #34");
+  assert.ok(!n.includes("https://") && !n.includes("repo#12") && !/(^|\s)#34/.test(n));
+});
+
+test("repo builds and install scripts don't get the service's keys", () => {
+  assert.deepEqual(withoutServiceKeys({ PATH: "/bin", RESEND_API_KEY: "a", ANTHROPIC_API_KEY: "b", CLAUDE_CODE_OAUTH_TOKEN: "c" }), { PATH: "/bin" });
+});
+
+test("fetching a PR leaves FETCH_HEAD and remote branches alone", async () => {
+  const r = prRepo();
+  try {
+    const before = execFileSync("git", ["for-each-ref", "refs/remotes"], { cwd: r.clone, encoding: "utf8" });
+    await fetchPrObjects(r.clone, 1, "main");
+    assert.equal(execFileSync("git", ["for-each-ref", "refs/remotes"], { cwd: r.clone, encoding: "utf8" }), before);
+    assert.ok(!existsSync(join(r.clone, ".git/FETCH_HEAD")));
+    assert.equal(execFileSync("git", ["cat-file", "-e", `${r.head}^{commit}`], { cwd: r.clone, encoding: "utf8" }), "");
   } finally { r.cleanup(); }
 });

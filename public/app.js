@@ -675,18 +675,39 @@ function renderReviews() {
   $("canvas").innerHTML = `<div class="profile">
     <header class="phead">
       <div class="pavatar" aria-hidden="true">✓</div>
-      <div class="pwho"><h2>PR reviews</h2><p class="muted">An AI reviewer tries to break every pull request on your watched repos. It either clears the PR for a person to merge or sends it back with notes. It never merges.</p></div>
+      <div class="pwho"><h2>Agents</h2><p class="muted">Three agents watch every pull request on your watched repos, each with its own check on GitHub. None of them ever merges.</p></div>
     </header>
     ${d.managed ? "" : `<div class="warn-box"><b>Reviews run on a server install.</b> They use the repo list and clones from the Repos page, which this install doesn't have.</div>`}
     ${d.managed && !d.configured ? `<div class="warn-box"><b>Reviews need Claude.</b> Log in to Claude Code on this server, or add <span class="mono">ANTHROPIC_API_KEY</span> to Mycelium's environment and restart it.</div>` : ""}
     ${d.lastError ? `<div class="errbox">The last check for PRs failed: ${esc(d.lastError)} It tries again in a couple of minutes.</div>` : ""}
     <div class="ptiles">
-      <div class="ptile static"><b class="${on ? "ok-text" : ""}">${on ? "On" : "Off"}</b><span>${on ? (d.lastPollAt ? `checked for PRs ${esc(ago(d.lastPollAt))}` : "checking every 2 minutes") : "PR reviews"}</span></div>
-      <div class="ptile static"><b>${t.sentBack + t.passed}</b><span>${t.sentBack} sent back, ${t.passed} ready to merge</span></div>
+      <div class="ptile static"><b class="${on ? "ok-text" : ""}">${on ? "On" : "Off"}</b><span>${on ? (d.lastPollAt ? `AI reviewer, checked for PRs ${esc(ago(d.lastPollAt))}` : "AI reviewer, checking every 2 minutes") : "AI reviewer"}</span></div>
+      <div class="ptile static"><b>${t.sentBack + t.passed}</b><span>AI reviews: ${t.sentBack} sent back, ${t.passed} ready to merge</span></div>
       ${d.engine === "api" ? `<div class="ptile static"><b>${money(t.costDay)}</b><span>last 24 hours, about ${money(t.cost)} in all</span></div>` : `<div class="ptile static"><b>${t.reviewedDay}</b><span>${d.engine === "claude-code" ? "reviews in 24 hours, on your Claude plan" : "reviews in 24 hours"}</span></div>`}
     </div>
-    <section class="pcard">
-      <h3>Settings</h3>
+    ${(() => {
+      const ag = d.agents;
+      const hit = (p) => p.agent === "keys"
+        ? p.details.map((h) => `<div class="small"><b>${esc(h.kind)}</b> <span class="mono muted">${esc(h.file)}${h.line ? `:${h.line}` : ""}</span></div>`).join("")
+        : p.details.map((v) => `<div class="small"><span class="sev ${esc(v.severity)}">${esc(v.vulnId.startsWith("MAL-") ? "malicious" : v.severity.toLowerCase())}</span> <b>${esc(v.name)}</b> <span class="mono muted">${esc(v.version)}</span> ${v.fixed ? `<span class="muted">fixed in ${esc(v.fixed)}</span>` : ""}</div>`).join("");
+      return `<div class="pgrid">
+        <section class="pcard">
+          <h3>🔑 Key watcher</h3>
+          <label class="row"><input type="checkbox" id="gKeys" ${ag.settings.keys ? "checked" : ""} ${d.managed ? "" : "disabled"}> <b>Check every PR for API keys</b></label>
+          <p class="small muted">Looks through every commit in a PR, so a key that was added and then deleted is still caught. It never shows the key itself. Free, with no AI. ${ag.totals.keys.checked} checked, ${ag.totals.keys.failed} flagged.</p>
+          <p class="small muted">To stop keys before they're pushed, run <span class="mono">mycelium keys --install-hook</span> in a repo on your own computer.</p>
+        </section>
+        <section class="pcard">
+          <h3>🍄 Fungi</h3>
+          <label class="row"><input type="checkbox" id="gFungi" ${ag.settings.fungi ? "checked" : ""} ${d.managed ? "" : "disabled"}> <b>Check PRs for new vulnerable packages</b></label>
+          <label class="row"><input type="checkbox" id="gFix" ${ag.settings.fungiAutoFix ? "checked" : ""} ${d.managed ? "" : "disabled"}> <span>Every night, open fix PRs for high and critical findings</span></label>
+          <p class="small muted">A PR only fails for what it adds. Nightly fixes skip major upgrades and dev dependencies. Free, with no AI. ${ag.totals.fungi.checked} checked, ${ag.totals.fungi.failed} flagged.</p>
+        </section>
+      </div>
+      ${ag.problems.length ? `<section class="pcard rproblems"><h3>Flagged by these two</h3><ul class="plain">${ag.problems.map((p) => `<li class="rfinding"><a href="${safeUrl(p.url)}" target="_blank" rel="noopener noreferrer"><b>${esc(p.title)}</b></a> <span class="small muted">${esc(p.repo)}#${p.number} · ${esc(ago(p.at))}</span>${hit(p)}</li>`).join("")}</ul></section>` : ""}`;
+    })()}
+    <section class="pcard rcard">
+      <h3>🕵️ Adversarial reviewer</h3>
       <label class="row"><input type="checkbox" id="rOn" ${on ? "checked" : ""} ${d.configured && d.managed ? "" : "disabled"}> <b>Review new pull requests</b></label>
       <label class="row"><span>Stop after <input class="field num-in" id="rLimit" type="number" min="1" max="1000" value="${esc(d.settings.dailyLimit)}" aria-label="Most reviews in 24 hours"> reviews in 24 hours</span></label>
       <label class="row"><input type="checkbox" id="rEmail" ${d.settings.emailSentBack ? "checked" : ""}> <span>Email the alert list when a PR is sent back</span></label>
@@ -696,6 +717,13 @@ function renderReviews() {
     <div class="filters rfilters"><div class="chips" role="group" aria-label="Filter reviews">${chips.map(([id, label, c]) => `<button data-rfilter="${id}" class="${state.reviewFilter === id ? "on" : ""}">${label}<i>${c}</i></button>`).join("")}</div></div>
     ${shown.length ? `<ul class="plain rlist">${shown.map(row).join("")}</ul>` : `<div class="empty">${d.reviews.length ? "No reviews match this filter." : on ? "No PRs yet. New ones show up here within a couple of minutes." : "Turn reviews on, and new PRs show up here."}</div>`}
   </div>`;
+  [["gKeys", "keys"], ["gFungi", "fungi"], ["gFix", "fungiAutoFix"]].forEach(([id, field]) => {
+    $(id).onchange = async (e) => {
+      try { state.tabs.reviews = await api("/api/agents", { [field]: e.target.checked }); }
+      catch (err) { state.reviewMsg = { text: err.message, err: true }; }
+      renderReviews();
+    };
+  });
   $("rSave").onclick = async () => {
     try {
       state.tabs.reviews = await api("/api/reviews", { enabled: $("rOn").checked, dailyLimit: Number($("rLimit").value), emailSentBack: $("rEmail").checked });
@@ -714,8 +742,8 @@ function renderReviews() {
 
 // Reviews take minutes and finish on their own, so this page keeps itself current, unless someone's mid-edit in its settings.
 setInterval(async () => {
-  if (state.view !== "reviews" || !state.tabs.reviews || !state.tabs.reviews.settings.enabled || document.hidden) return;
-  if (["rLimit", "rOn", "rEmail"].includes(document.activeElement?.id)) return;
+  if (state.view !== "reviews" || !state.tabs.reviews || document.hidden) return;
+  if (["rLimit", "rOn", "rEmail", "gKeys", "gFungi", "gFix"].includes(document.activeElement?.id)) return;
   try {
     const next = await api("/api/reviews");
     if (state.view === "reviews") { state.tabs.reviews = next; renderReviews(); }

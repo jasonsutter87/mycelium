@@ -16,6 +16,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { createAuth } from "./auth.ts";
 import { auditView, clearPrCache, findingsView, fixedView, infraView, overview, PIPELINE, projectDetail, stepOf, withDowngradeHints, type Step } from "./dashboard.ts";
 import { checkAll } from "./osv.ts";
+import { withoutServiceKeys } from "./net.ts";
 import { saveProject, scanProject, scanRoots, setIgnored } from "./scan.ts";
 import { enrich } from "./depsdev.ts";
 import { pullProject, syncPrs } from "./prs.ts";
@@ -24,6 +25,7 @@ import { applyRepoChange, cleanError, fetchRepos, listGithubRepos, loadAutoWatch
 import { companyName, saveCompanyName } from "./db.ts";
 import { cloneDirs, readRepoList } from "./sync.ts";
 import Anthropic from "@anthropic-ai/sdk";
+import { agentsView, pollAgents, saveAgentSettings } from "./agents.ts";
 import { apiEngine, claudeCodeEngine, detectEngine, githubPort, loadReviewSettings, pollReviews, requeueReview, resetInterrupted, reviewsView, saveReviewSettings, type EngineKind, type ReviewClient } from "./review.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -188,20 +190,33 @@ export function serve(db: DatabaseSync, port: number) {
     if (!engineCache || Date.now() - engineCache.at > 60_000) engineCache = { at: Date.now(), kind: await detectEngine() };
     return engineCache.kind;
   };
+  const reviewRepoPath = (slug: string) => {
+    if (!cfg.repos) return null;
+    const folder = cloneDirs(watchedList()).get(slug);
+    const path = folder && join(cfg.repos.dir, folder);
+    return path && existsSync(join(path, ".git")) ? path : null;
+  };
+  const agentPoll: { running: boolean; lastError: string | null } = { running: false, lastError: null };
+  const pollAgentsNow = async () => {
+    if (agentPoll.running || !cfg.repos) return;
+    agentPoll.running = true;
+    try {
+      await pollAgents(db, watchedList(), { github: githubPort, repoPath: reviewRepoPath, baseUrl, log: (s) => console.error(s) });
+      agentPoll.lastError = null;
+    } catch (e) {
+      console.error("PR agents:", e);
+      agentPoll.lastError = cleanError(e);
+    } finally {
+      agentPoll.running = false;
+    }
+  };
   const pollReviewsNow = async () => {
     if (reviewPoll.running || !cfg.repos || !loadReviewSettings(db).enabled) return;
     reviewPoll.running = true;
     try {
       const kind = await reviewEngine();
       if (!kind) return;
-      const { dir } = cfg.repos;
-      const repos = watchedList();
-      const folders = cloneDirs(repos);
-      const repoPath = (slug: string) => {
-        const path = folders.get(slug) && join(dir, folders.get(slug)!);
-        return path && existsSync(join(path, ".git")) ? path : null;
-      };
-      await pollReviews(db, repos, { github: githubPort, engine: kind === "api" ? apiEngine(new Anthropic() as unknown as ReviewClient) : claudeCodeEngine, repoPath, baseUrl, log: (s) => console.error(s) });
+      await pollReviews(db, watchedList(), { github: githubPort, engine: kind === "api" ? apiEngine(new Anthropic() as unknown as ReviewClient) : claudeCodeEngine, repoPath: reviewRepoPath, baseUrl, log: (s) => console.error(s) });
       reviewPoll.lastError = null;
     } catch (e) {
       console.error("reviewing PRs:", e);
@@ -211,7 +226,7 @@ export function serve(db: DatabaseSync, port: number) {
       reviewPoll.lastPollAt = new Date().toISOString();
     }
   };
-  const reviewView = async () => reviewsView(db, { managed: !!cfg.repos, engine: await reviewEngine(), lastError: reviewPoll.lastError, lastPollAt: reviewPoll.lastPollAt });
+  const reviewView = async () => ({ ...reviewsView(db, { managed: !!cfg.repos, engine: await reviewEngine(), lastError: reviewPoll.lastError ?? agentPoll.lastError, lastPollAt: reviewPoll.lastPollAt }), agents: agentsView(db) });
 
   const page = (file: string, res: ServerResponse) => {
     const html = readFileSync(join(PUBLIC, file), "utf8").replace("__TOKEN__", token!);
@@ -228,7 +243,7 @@ export function serve(db: DatabaseSync, port: number) {
     const current: Job = { id: ++jobCount, project: body.project, state: "running", reached: [], lines: [], result: null, error: null, startedAt: new Date().toISOString() };
     job = current;
     busy = `fixing ${body.project}`;
-    const child = spawn(process.execPath, args, { env: { ...process.env, NO_COLOR: "1" }, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(process.execPath, args, { env: { ...withoutServiceKeys(), NO_COLOR: "1" }, stdio: ["ignore", "pipe", "pipe"] });
     let buf = "", errors = "";
     child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
       buf += chunk;
@@ -362,7 +377,13 @@ export function serve(db: DatabaseSync, port: number) {
       }
       if (p === "/api/reviews") {
         saveReviewSettings(db, body);
-        void pollReviewsNow();
+        void pollAgentsNow();
+    void pollReviewsNow();
+        return send(res, 200, await reviewView());
+      }
+      if (p === "/api/agents") {
+        saveAgentSettings(db, body);
+        void pollAgentsNow();
         return send(res, 200, await reviewView());
       }
       if (p === "/api/reviews/again") {
@@ -450,7 +471,7 @@ export function serve(db: DatabaseSync, port: number) {
   });
 
   resetInterrupted(db);
-  setInterval(() => void pollReviewsNow(), 2 * 60_000).unref();
+  setInterval(() => { void pollAgentsNow(); void pollReviewsNow(); }, 2 * 60_000).unref();
 
   server.listen(port, cfg.host, () => {
     void pollReviewsNow();
