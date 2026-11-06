@@ -618,3 +618,18 @@ test("the reviewer skips a repo it's off for, and PRs there wait again when it's
   await pollReviews(db, all, deps);
   assert.match(stateOf(db, "o1").note, /Already open/);
 });
+
+
+test("a review stopped by a safety classifier fails closed, never a green check", async () => {
+  const r = prRepo();
+  try {
+    const db = openDb(":memory:");
+    live(db);
+    const gh = fakeGithub([pr({ sha: r.head, baseSha: r.base })]);
+    // The model couldn't finish: it returns no findings and says so. That must not read as a pass.
+    const engine = async () => ({ result: { summary: "This review was stopped by a safety classifier before it finished, so no findings are recorded.", findings: [] }, costUsd: null });
+    await pollReviews(db, ["o/r"], { github: gh.github, engine, repoPath: () => r.clone, baseUrl: null });
+    assert.equal(stateOf(db, r.head).state, "error", "an unfinished review is not a pass");
+    assert.notEqual(gh.statuses.at(-1)!.state, "success");
+  } finally { r.cleanup(); }
+});

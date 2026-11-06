@@ -12,7 +12,7 @@ import { emailConfigured, loadAlertSettings, resendSender, type Sender } from ".
 import { scanPatch, type KeyHit } from "./keys.ts";
 import { checkPackages, severityRank, type PackageVuln } from "./osv.ts";
 import { agentOnFor, loadRepoChoices } from "./repos.ts";
-import { aiBudgetLeft, dropAiRun, EngineTrouble, fetchPrObjects, neutralise, prepareDiff, recordAiRun, ReviewFailed, type GithubPort, type OpenPr, type ReviewEngine, type ReviewFinding, type ReviewResult } from "./review.ts";
+import { aiBudgetLeft, dropAiRun, EngineTrouble, fetchPrObjects, INCOMPLETE_REVIEW, neutralise, prepareDiff, recordAiRun, ReviewFailed, type GithubPort, type OpenPr, type ReviewEngine, type ReviewFinding, type ReviewResult } from "./review.ts";
 import { AI_LENSES, aiLens, type AiLens } from "./lenses.ts";
 import { parseLockText } from "./scan.ts";
 
@@ -194,9 +194,6 @@ export function lensComment(lens: AiLens, repo: string, sha: string, result: Rev
 
 // A review that stopped early says so in its summary and brings back no findings. These are the phrasings the model
 // uses when a safety classifier or a limit cut it off; matching them lets an unfinished review fail closed, not pass.
-// Matches the model saying THIS REVIEW stopped early — not the PR's own content. "a worker was stopped by SIGTERM"
-// describes the code and must not match; "this review was stopped by a safety classifier" must.
-export const INCOMPLETE_REVIEW = /\b(this|the) (review|assessment|analysis)\b[^.]{0,90}(stopped|halted|cut off|interrupted|incomplete|did ?n.t (finish|complete)|could ?n.t (finish|complete)|not complete)|safety classifier (stopped|halted|interrupted|cut|ended|prevented)|stopped by (a |the )?safety|no findings (were|are) recorded|assessment of [^.]{0,40} withheld/i;
 
 interface LensOutcome { bad: boolean; description: string; details: ReviewFinding[]; body: string | null; note: string | null }
 

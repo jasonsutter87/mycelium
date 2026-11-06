@@ -48,7 +48,7 @@ test("an advisory lens comment says so and never says sent back", () => {
 // The fail-closed behavior lives in agents.ts (runAiLens), but the regex that detects an unfinished
 // review is the crux, so assert the phrasings the model actually used are caught and clean ones aren't.
 test("a stopped-early summary is recognised, a PR about stopping is not (uses the real regex)", async () => {
-  const { INCOMPLETE_REVIEW } = await import("../src/agents.ts");
+  const { INCOMPLETE_REVIEW } = await import("../src/review.ts");
   const stopped = [
     "This review was stopped by a safety classifier before it finished, so no findings are recorded.",
     "This review did not complete: a safety classifier stopped the response.",
