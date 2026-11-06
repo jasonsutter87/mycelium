@@ -48,6 +48,9 @@ const state = {
   repoJob: null,
   alertDraft: null,
   alertMsg: null,
+  reviewFilter: "all",
+  reviewMsg: null,
+  reviewOpen: new Set(), // which reviews are expanded: the page re-renders while work is running
 };
 
 function banner(msg, isErr) {
@@ -635,8 +638,92 @@ function renderAlerts() {
   };
 }
 
+// ---------------------------------------------------------------- PR reviews
+
+const REVIEW_STATE = { passed: ["Ready to merge", "ok"], sent_back: ["Sent back", "bad"], queued: ["Waiting", "wait"], running: ["Reviewing", "wait"], error: ["Couldn't review", "warn"], skipped: ["Not reviewed", "off"] };
+const FINDING_SEV = { critical: "CRITICAL", high: "HIGH", medium: "MODERATE", low: "LOW" };
+
+function renderReviews() {
+  const d = state.tabs.reviews;
+  if (!d) return ($("canvas").innerHTML = `<div class="empty"><span class="spin"></span>Loading reviews</div>`);
+  const on = d.settings.enabled;
+  const t = d.totals;
+  const money = (n) => (n > 0 && n < 0.01 ? "under $0.01" : `$${n.toFixed(2)}`);
+  const matches = (r) => state.reviewFilter === "all" || r.state === state.reviewFilter || (state.reviewFilter === "queued" && r.state === "running");
+  const chips = [["all", "All", d.reviews.length], ["sent_back", "Sent back", t.sentBack], ["passed", "Ready to merge", t.passed], ["queued", "Waiting", t.waiting], ["error", "Couldn't review", d.reviews.filter((r) => r.state === "error").length]];
+  const shown = d.reviews.filter(matches);
+  const findingHtml = (f) => `<li class="rfinding"><div><span class="sev ${FINDING_SEV[f.severity]}">${esc(f.severity)}</span> <b>${esc(f.title)}</b></div>
+    <div class="small muted mono">${esc(f.category)}${f.file ? ` · ${esc(f.file)}${f.line > 0 ? `:${f.line}` : ""}` : ""}</div>
+    <p>${esc(f.detail)}</p>${f.suggestion ? `<p><b>Fix:</b> ${esc(f.suggestion)}</p>` : ""}</li>`;
+  const row = (r) => {
+    const [label, tone] = REVIEW_STATE[r.state] ?? [r.state, "off"];
+    const key = `${r.repo}#${r.number}@${r.sha}`;
+    const blockers = r.findings.filter((f) => f.severity === "critical" || f.severity === "high").length;
+    const counts = r.findings.length ? `${blockers} to fix${r.findings.length > blockers ? `, ${r.findings.length - blockers} minor` : ""}` : "";
+    return `<li class="rrow">
+      <div class="rmain">
+        <span class="rstate ${tone}">${r.state === "running" ? '<span class="spin"></span>' : ""}${esc(label)}</span>
+        <div class="rtitle"><a href="${safeUrl(r.url)}" target="_blank" rel="noopener noreferrer"><b>${esc(r.title)}</b></a>
+          <div class="small muted">${esc(r.repo)}#${r.number}${r.author ? ` · ${esc(r.author)}` : ""} · <span class="mono">${esc(r.sha.slice(0, 7))}</span> · ${esc(ago(r.at))}${r.costUsd != null ? ` · ${money(r.costUsd)}` : ""}${counts ? ` · ${esc(counts)}` : ""}</div></div>
+        ${["queued", "running"].includes(r.state) ? "" : `<button class="btn small" data-again="${esc(r.repo)}" data-num="${r.number}" ${on && d.configured ? "" : "disabled"}>${r.state === "skipped" ? "Review now" : "Review again"}</button>`}
+      </div>
+      ${r.note ? `<p class="small ${r.state === "error" ? "warn-text" : "muted"}">${esc(r.note)}</p>` : ""}
+      ${r.summary || r.findings.length ? `<details data-rkey="${esc(key)}" ${state.reviewOpen.has(key) ? "open" : ""}><summary>${r.findings.length ? `${r.findings.length} note${r.findings.length === 1 ? "" : "s"}` : "Summary"}</summary>
+        ${r.summary ? `<p>${esc(r.summary)}</p>` : ""}${r.findings.length ? `<ul class="plain">${r.findings.map(findingHtml).join("")}</ul>` : ""}</details>` : ""}
+    </li>`;
+  };
+  $("canvas").innerHTML = `<div class="profile">
+    <header class="phead">
+      <div class="pavatar" aria-hidden="true">✓</div>
+      <div class="pwho"><h2>PR reviews</h2><p class="muted">An AI reviewer tries to break every pull request on your watched repos. It either clears the PR for a person to merge or sends it back with notes. It never merges.</p></div>
+    </header>
+    ${d.managed ? "" : `<div class="warn-box"><b>Reviews run on a server install.</b> They use the repo list and clones from the Repos page, which this install doesn't have.</div>`}
+    ${d.managed && !d.configured ? `<div class="warn-box"><b>Reviews need an API key.</b> Add <span class="mono">ANTHROPIC_API_KEY</span> to Mycelium's environment, then restart it.</div>` : ""}
+    ${d.lastError ? `<div class="errbox">The last check for PRs failed: ${esc(d.lastError)} It tries again in a couple of minutes.</div>` : ""}
+    <div class="ptiles">
+      <div class="ptile static"><b class="${on ? "ok-text" : ""}">${on ? "On" : "Off"}</b><span>${on ? (d.lastPollAt ? `checked for PRs ${esc(ago(d.lastPollAt))}` : "checking every 2 minutes") : "PR reviews"}</span></div>
+      <div class="ptile static"><b>${t.sentBack + t.passed}</b><span>${t.sentBack} sent back, ${t.passed} ready to merge</span></div>
+      <div class="ptile static"><b>${money(t.costDay)}</b><span>last 24 hours, about ${money(t.cost)} in all</span></div>
+    </div>
+    <section class="pcard">
+      <h3>Settings</h3>
+      <label class="row"><input type="checkbox" id="rOn" ${on ? "checked" : ""} ${d.configured && d.managed ? "" : "disabled"}> <b>Review new pull requests</b></label>
+      <label class="row"><span>Stop after <input class="field num-in" id="rLimit" type="number" min="1" max="1000" value="${esc(d.settings.dailyLimit)}" aria-label="Most reviews in 24 hours"> reviews in 24 hours</span></label>
+      <label class="row"><input type="checkbox" id="rEmail" ${d.settings.emailSentBack ? "checked" : ""}> <span>Email the alert list when a PR is sent back</span></label>
+      <p class="small muted">PRs already open when you turn this on aren't reviewed until they change. PRs from forks and dependency bots like Dependabot are skipped, but you can still review one by hand. PR code goes to Anthropic (${esc(d.model)}), without files that may hold secrets. To block merging on a failed review, make the <span class="mono">Mycelium review</span> check required in GitHub's branch rules.</p>
+      <div class="actions"><button class="btn primary" id="rSave">Save</button>${state.reviewMsg ? `<span class="small ${state.reviewMsg.err ? "warn-text" : "ok-text"}" role="status">${esc(state.reviewMsg.text)}</span>` : ""}</div>
+    </section>
+    <div class="filters rfilters"><div class="chips" role="group" aria-label="Filter reviews">${chips.map(([id, label, c]) => `<button data-rfilter="${id}" class="${state.reviewFilter === id ? "on" : ""}">${label}<i>${c}</i></button>`).join("")}</div></div>
+    ${shown.length ? `<ul class="plain rlist">${shown.map(row).join("")}</ul>` : `<div class="empty">${d.reviews.length ? "No reviews match this filter." : on ? "No PRs yet. New ones show up here within a couple of minutes." : "Turn reviews on, and new PRs show up here."}</div>`}
+  </div>`;
+  $("rSave").onclick = async () => {
+    try {
+      state.tabs.reviews = await api("/api/reviews", { enabled: $("rOn").checked, dailyLimit: Number($("rLimit").value), emailSentBack: $("rEmail").checked });
+      state.reviewMsg = { text: "Saved." };
+    } catch (e) { state.reviewMsg = { text: e.message, err: true }; }
+    renderReviews();
+  };
+  document.querySelectorAll("[data-rfilter]").forEach((b) => (b.onclick = () => { state.reviewFilter = b.dataset.rfilter; renderReviews(); }));
+  document.querySelectorAll("details[data-rkey]").forEach((el) => (el.ontoggle = () => { el.open ? state.reviewOpen.add(el.dataset.rkey) : state.reviewOpen.delete(el.dataset.rkey); }));
+  document.querySelectorAll("[data-again]").forEach((b) => (b.onclick = async () => {
+    try { state.tabs.reviews = await api("/api/reviews/again", { repo: b.dataset.again, number: Number(b.dataset.num) }); }
+    catch (e) { state.reviewMsg = { text: e.message, err: true }; }
+    renderReviews();
+  }));
+}
+
+// Reviews take minutes and finish on their own, so this page keeps itself current, unless someone's mid-edit in its settings.
+setInterval(async () => {
+  if (state.view !== "reviews" || !state.tabs.reviews || !state.tabs.reviews.settings.enabled || document.hidden) return;
+  if (["rLimit", "rOn", "rEmail"].includes(document.activeElement?.id)) return;
+  try {
+    const next = await api("/api/reviews");
+    if (state.view === "reviews") { state.tabs.reviews = next; renderReviews(); }
+  } catch { /* the next tick tries again */ }
+}, 15_000);
+
 function renderCanvas() {
-  ({ projects: renderProjects, findings: renderFindings, fixed: renderFixed, audit: renderAudit, infra: renderInfra, repos: renderRepos, profile: renderProfile, alerts: renderAlerts })[state.view]();
+  ({ projects: renderProjects, findings: renderFindings, fixed: renderFixed, reviews: renderReviews, audit: renderAudit, infra: renderInfra, repos: renderRepos, profile: renderProfile, alerts: renderAlerts })[state.view]();
 }
 
 // ---------------------------------------------------------------- inspector: Check → Fix

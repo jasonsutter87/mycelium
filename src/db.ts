@@ -164,6 +164,29 @@ CREATE TABLE IF NOT EXISTS alerted (
   alerted_at TEXT NOT NULL
 );
 
+-- One row per PR head commit: a new push is a new review.
+CREATE TABLE IF NOT EXISTS reviews (
+  repo        TEXT NOT NULL,
+  number      INTEGER NOT NULL,
+  sha         TEXT NOT NULL,
+  base_sha    TEXT NOT NULL,
+  base_ref    TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  body        TEXT NOT NULL DEFAULT '',
+  url         TEXT NOT NULL,
+  author      TEXT,
+  state       TEXT NOT NULL,        -- queued | running | passed | sent_back | error | skipped
+  summary     TEXT,
+  findings    TEXT NOT NULL DEFAULT '[]',
+  note        TEXT,                 -- why it was skipped or couldn't be reviewed
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  comment_id  INTEGER,
+  cost_usd    REAL,
+  created_at  TEXT NOT NULL,
+  reviewed_at TEXT,
+  PRIMARY KEY (repo, number, sha)
+);
+
 CREATE INDEX IF NOT EXISTS idx_edges_child ON edges(child_id);
 CREATE INDEX IF NOT EXISTS idx_uses_pkg ON uses(package_id);
 `;

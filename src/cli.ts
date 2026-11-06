@@ -15,7 +15,7 @@ import { acceptanceCovers, acceptedCount, findings, fixCommand, impact, loadAcce
 import { writeHtmlReport } from "./report.ts";
 
 const [cmd = "help", ...rest] = process.argv.slice(2);
-const VALUE_FLAGS = new Set(["--top", "--hour", "--project", "--html", "--min", "--only", "--port", "--category", "--reason", "--days", "--list"]);
+const VALUE_FLAGS = new Set(["--top", "--hour", "--project", "--html", "--min", "--only", "--port", "--category", "--reason", "--days", "--list", "--dir"]);
 const flags = new Set<string>();
 const values = new Map<string, string>();
 const args: string[] = [];
@@ -66,6 +66,24 @@ async function sync(dir?: string) {
   const { syncPrs } = await import("./prs.ts");
   await syncPrs(db);
   await sendAlerts();
+}
+
+/** One real review, printed. Nothing is posted to GitHub. */
+async function reviewCmd(slug?: string, number?: string) {
+  if (!slug || !/^[\w.-]+\/[\w.-]+$/.test(slug) || !/^\d+$/.test(number ?? "")) return fail("Usage: mycelium review <owner/name> <PR number> [--dir <folder of clones>]");
+  const { existsSync } = await import("node:fs");
+  const { default: Anthropic } = await import("@anthropic-ai/sdk");
+  const { previewReview, reviewConfigured, verdictOf } = await import("./review.ts");
+  if (!reviewConfigured()) return fail("ANTHROPIC_API_KEY isn't set.");
+  const dir = resolve(flagValue("--dir") ?? process.env.MYCELIUM_REPOS_DIR ?? join(homedir(), "mycelium-repos"));
+  const [owner, name] = slug.split("/");
+  const path = [join(dir, name), join(dir, `${owner}__${name}`)].find((p) => existsSync(join(p, ".git")));
+  if (!path) return fail(`No clone of ${slug} in ${dir}.`);
+  const { result, costUsd, omitted } = await previewReview(path, slug, Number(number), new Anthropic() as any);
+  console.log(c.bold(verdictOf(result.findings) === "passed" ? c.green("READY FOR A PERSON TO MERGE") : c.red("SENT BACK")), c.dim(`· about $${costUsd.toFixed(2)} · nothing posted to GitHub`));
+  console.log(`\n${result.summary}`);
+  if (omitted.length) console.log(c.dim(`\nNot sent to the model: ${omitted.join(", ")}`));
+  for (const f of result.findings) console.log(`\n${c.bold(f.severity.toUpperCase())} ${f.title}\n${c.dim(`${f.category} ${f.file}${f.line > 0 ? `:${f.line}` : ""}`)}\n${f.detail}${f.suggestion ? `\nFix: ${f.suggestion}` : ""}`);
 }
 
 async function sendAlerts() {
@@ -609,6 +627,7 @@ const HELP = `${c.bold("mycelium")}: map every dependency under everything you o
   ${c.cyan("pull")} <project>       Fast-forward a merged fix into your folder (only when safe), then rescan.
   ${c.cyan("serve")} [--port 4747] Local report with Fix buttons at http://mycelium.localhost:4747
                        --install keeps it always on (login item) · --uninstall turns that off
+  ${c.cyan("review")} <owner/name> <n>  Review one PR and print it, posting nothing. Reviews run on the dashboard's Reviews page.
   ${c.cyan("mcp")}                  Run as an MCP server (stdio) so Claude Code can scan, plan and fix.
   ${c.cyan("watch")} [folders…]     scan + check + macOS notification for new findings (for cron/launchd).
   ${c.cyan("schedule")} [--hour 9]  Install a daily launchd job that runs watch.
@@ -665,6 +684,7 @@ switch (cmd) {
     break;
   }
   case "fix": flags.has("--all") ? await fixAll() : args[0] ? await fix(args[0]) : console.log("usage: mycelium fix <project> [--apply] [--verify] [--pr] [--major] [--min high] [--only a,b]"); break;
+  case "review": await reviewCmd(args[0], args[1]); break;
   case "mcp": await import("./mcp.ts"); break;
   case "serve":
     if (flags.has("--install")) installServe(Number(flagValue("--port") ?? 4747));
