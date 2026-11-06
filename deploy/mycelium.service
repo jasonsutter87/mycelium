@@ -18,7 +18,7 @@ Environment=GATEKEEP_ISSUER=https://id.gatekeepauth.com GATEKEEP_CLIENT_ID=mycel
 Environment=GATEKEEP_ALLOWED_EMAILS=jasonsutter87@gmail.com
 # Rescan pulls these clones first, the same ones sync.service keeps fresh overnight.
 Environment=MYCELIUM_REPOS_DIR=%h/mycelium-repos MYCELIUM_REPOS_LIST=%h/.config/mycelium/repos.txt
-# Alert email: RESEND_API_KEY and MYCELIUM_EMAIL_FROM live in this file, outside the repo.
+# Secrets live in this file, outside the repo: RESEND_API_KEY and MYCELIUM_EMAIL_FROM for alert email, ANTHROPIC_API_KEY for PR reviews.
 EnvironmentFile=-%h/.config/mycelium/env
 Environment=CI=1 PATH=%h/.local/opt/node22/bin:%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 

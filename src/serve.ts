@@ -23,6 +23,8 @@ import { alertsView, loadAlertSettings, runAlerts, saveAlertSettings, sendTestEm
 import { applyRepoChange, cleanError, fetchRepos, listGithubRepos, loadAutoWatch, loadHiddenAccounts, loadRepoIssues, parseRepoInput, saveAutoWatch, saveHiddenAccounts, updateRepoIssues, validSlug, type GithubRepo } from "./repos.ts";
 import { companyName, saveCompanyName } from "./db.ts";
 import { cloneDirs, readRepoList } from "./sync.ts";
+import Anthropic from "@anthropic-ai/sdk";
+import { githubPort, loadReviewSettings, pollReviews, requeueReview, resetInterrupted, reviewConfigured, reviewsView, saveReviewSettings, type ReviewClient } from "./review.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PUBLIC = join(HERE, "..", "public");
@@ -177,6 +179,32 @@ export function serve(db: DatabaseSync, port: number) {
     return { ok: true, warnings };
   };
 
+  // PR reviews: polling, so GitHub never needs a way in to this machine. Doesn't take `busy`: it only reads git objects,
+  // so it can run beside a fix or a rescan. One poll at a time.
+  const reviewPoll: { running: boolean; lastPollAt: string | null; lastError: string | null } = { running: false, lastPollAt: null, lastError: null };
+  const pollReviewsNow = async () => {
+    if (reviewPoll.running || !cfg.repos || !reviewConfigured() || !loadReviewSettings(db).enabled) return;
+    reviewPoll.running = true;
+    try {
+      const { dir } = cfg.repos;
+      const repos = watchedList();
+      const folders = cloneDirs(repos);
+      const repoPath = (slug: string) => {
+        const path = folders.get(slug) && join(dir, folders.get(slug)!);
+        return path && existsSync(join(path, ".git")) ? path : null;
+      };
+      await pollReviews(db, repos, { github: githubPort, client: new Anthropic() as unknown as ReviewClient, repoPath, baseUrl, log: (s) => console.error(s) });
+      reviewPoll.lastError = null;
+    } catch (e) {
+      console.error("reviewing PRs:", e);
+      reviewPoll.lastError = cleanError(e);
+    } finally {
+      reviewPoll.running = false;
+      reviewPoll.lastPollAt = new Date().toISOString();
+    }
+  };
+  const reviewView = () => reviewsView(db, { managed: !!cfg.repos, lastError: reviewPoll.lastError, lastPollAt: reviewPoll.lastPollAt });
+
   const page = (file: string, res: ServerResponse) => {
     const html = readFileSync(join(PUBLIC, file), "utf8").replace("__TOKEN__", token!);
     res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": CSP, "x-content-type-options": "nosniff", "referrer-policy": "no-referrer" });
@@ -266,6 +294,7 @@ export function serve(db: DatabaseSync, port: number) {
         if (p === "/api/audit") return send(res, 200, auditView(db));
         if (p === "/api/infra") return send(res, 200, infraView(db));
         if (p === "/api/alerts") return send(res, 200, alertsView(db));
+        if (p === "/api/reviews") return send(res, 200, reviewView());
         if (p === "/api/repos") {
           if (!cfg.repos) return send(res, 200, { managed: false, roots: JSON.parse(setting("roots") ?? "[]") });
           const list = watchedList();
@@ -322,6 +351,17 @@ export function serve(db: DatabaseSync, port: number) {
       if (p === "/api/alerts/test") {
         await sendTestEmail(db, baseUrl, Array.isArray(body.recipients) ? body.recipients.map(String).filter(Boolean) : []);
         return send(res, 200, { ok: true });
+      }
+      if (p === "/api/reviews") {
+        saveReviewSettings(db, body);
+        void pollReviewsNow();
+        return send(res, 200, reviewView());
+      }
+      if (p === "/api/reviews/again") {
+        if (!validSlug(body.repo) || !Number.isInteger(body.number)) return send(res, 400, { error: "Which PR?" });
+        requeueReview(db, body.repo, body.number);
+        void pollReviewsNow();
+        return send(res, 200, reviewView());
       }
       if (["/api/check", "/api/fix", "/api/pull"].includes(p) && typeof body.project !== "string") return send(res, 400, { error: "which project? (missing project name)" });
       if (busy) return send(res, 409, { error: `Mycelium is busy (${busy}). Try again when that finishes.` });
@@ -401,7 +441,11 @@ export function serve(db: DatabaseSync, port: number) {
     }
   });
 
+  resetInterrupted(db);
+  setInterval(() => void pollReviewsNow(), 2 * 60_000).unref();
+
   server.listen(port, cfg.host, () => {
+    void pollReviewsNow();
     setImmediate(() => overview(db)); // warm the slow part, so the first page load is quick
     console.log(`🍄 Mycelium at ${baseUrl}/  ${auth ? "(sign-in on)" : "(this computer only)"}  (Ctrl-C to stop)`);
     if (process.platform === "darwin" && localUrl && !process.env.MYCELIUM_NO_OPEN) execFile("open", [baseUrl + "/"]);
