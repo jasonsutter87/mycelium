@@ -309,3 +309,49 @@ test("each agent only runs on its chosen repos, and a repo turned off leaves the
     assert.equal(gh.statuses.length, before);
   } finally { r.cleanup(); }
 });
+
+// ---------------------------------------------------------------- found on the first real run
+
+test("a repo this account can't post to records its result once and stops retrying", async () => {
+  const r = repo();
+  try {
+    const db = openDb(":memory:");
+    saveAgentSettings(db, { keys: true });
+    await pollAgents(db, ["o/r"], { github: fake([]).github, repoPath: () => r.dir, baseUrl: null });
+    const sha = r.commit({ "a.ts": "export const a = 2;\n" });
+    withOrigin(r, sha);
+    const gh = fake([pr(r, sha)]);
+    let posts = 0;
+    const github: GithubPort = { ...gh.github, setStatus: async () => { posts++; throw Object.assign(new Error("Command failed"), { stderr: "gh: Not Found (HTTP 404)" }); } };
+    const deps: AgentDeps = { github, repoPath: () => r.dir, baseUrl: null };
+    assert.deepEqual(await pollAgents(db, ["o/r"], deps), { checked: 1, failed: 0 });
+    await pollAgents(db, ["o/r"], deps);
+    assert.equal(posts, 1, "no retry");
+    assert.equal(gh.comments.length, 0);
+    assert.match((db.prepare("SELECT note FROM agent_checks").get() as any).note, /can't post/);
+    const other: GithubPort = { ...gh.github, setStatus: async () => { throw Object.assign(new Error("Command failed"), { stderr: "gh: Server Error (HTTP 502)" }); } };
+    const next = r.commit({ "a.ts": "export const a = 3;\n" });
+    execFileSync("git", ["update-ref", "refs/pull/1/head", next], { cwd: r.dir, stdio: "ignore" });
+    const moved: GithubPort = { ...other, listOpenPrs: async () => ({ prs: [pr(r, next, { baseSha: sha })], answered: ["o/r"], partial: [] }) };
+    await assert.rejects(pollAgents(db, ["o/r"], { ...deps, github: moved }), /Command failed/);
+    assert.equal((db.prepare("SELECT count(*) AS n FROM agent_checks WHERE sha = ?").get(next) as any).n, 0, "a passing outage is retried");
+  } finally { r.cleanup(); }
+});
+
+test("an agent switched on during a pass still leaves open PRs alone", async () => {
+  const r = repo();
+  try {
+    const db = openDb(":memory:");
+    saveAgentSettings(db, { keys: true });
+    const sha = r.commit({ "package-lock.json": lock({ fresh: "1.0.0" }) });
+    withOrigin(r, sha);
+    const gh = fake([pr(r, sha)]);
+    const github: GithubPort = { ...gh.github, listOpenPrs: async (repos) => { saveAgentSettings(db, { fungi: true }); return gh.github.listOpenPrs(repos); } };
+    await pollAgents(db, ["o/r"], { github, repoPath: () => r.dir, baseUrl: null });
+    let ran = 0;
+    const check = async () => { ran++; return []; };
+    await pollAgents(db, ["o/r"], { github: gh.github, repoPath: () => r.dir, baseUrl: null, check });
+    assert.equal(ran, 0, "the PR was already open, so fungi waits for it to change");
+    assert.equal((db.prepare("SELECT state FROM agent_checks WHERE agent = 'fungi'").get() as any).state, "skipped");
+  } finally { r.cleanup(); }
+});
