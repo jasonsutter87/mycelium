@@ -66,6 +66,35 @@ async function sync(dir?: string) {
   const { syncPrs } = await import("./prs.ts");
   await syncPrs(db);
   await sendAlerts();
+  // Fungi's nightly job: open fix PRs for what's fixable. Never merges, and a fix already in an open PR isn't repeated.
+  const { loadAgentSettings } = await import("./agents.ts");
+  if (loadAgentSettings(db).fungiAutoFix) {
+    flags.add("--apply"); flags.add("--no-refresh"); flags.add("--respect-closed");
+    if (!flagValue("--min")) values.set("--min", "high");
+    await fixAll().catch((e) => console.log(c.yellow(`fungi: couldn't open fix PRs: ${(e as Error).message}`)));
+  }
+}
+
+/** Key watcher, on this machine: `--staged` for what's about to be committed, `--install-hook` to run that on every commit. */
+async function keysCmd() {
+  const { describeHits, preCommitHook, scanPatch } = await import("./keys.ts");
+  const run = (...a: string[]) => execFileSync("git", a, { encoding: "utf8", maxBuffer: 1 << 28 });
+  if (flags.has("--install-hook")) {
+    const { existsSync, chmodSync, mkdirSync } = await import("node:fs");
+    const { dirname } = await import("node:path");
+    // --git-path follows core.hooksPath and worktrees, so this is the file git will really run.
+    const hook = resolve(run("rev-parse", "--git-path", "hooks/pre-commit").trim());
+    if (existsSync(hook)) return fail(`${hook} already exists, so it was left alone. Add this line to it: mycelium keys --staged`);
+    mkdirSync(dirname(hook), { recursive: true });
+    writeFileSync(hook, preCommitHook(join(import.meta.dirname, "..", "bin", "mycelium")));
+    chmodSync(hook, 0o755);
+    return console.log(`Installed ${hook}`);
+  }
+  if (!flags.has("--staged")) return fail("Usage: mycelium keys --staged | --install-hook");
+  const hits = scanPatch(run("-c", "core.quotePath=false", "diff", "--cached", "--text", "--no-ext-diff", "--no-textconv", "--no-color", "-U0"));
+  if (!hits.length) return;
+  console.error(`${c.red("Commit stopped: possible API key.")}\n${describeHits(hits)}\n\nRemove it, or add mycelium:allow-key to the line if it's a test value.`);
+  process.exitCode = 1;
 }
 
 /** One real review, printed. Nothing is posted to GitHub. */
@@ -73,14 +102,15 @@ async function reviewCmd(slug?: string, number?: string) {
   if (!slug || !/^[\w.-]+\/[\w.-]+$/.test(slug) || !/^\d+$/.test(number ?? "")) return fail("Usage: mycelium review <owner/name> <PR number> [--dir <folder of clones>]");
   const { existsSync } = await import("node:fs");
   const { default: Anthropic } = await import("@anthropic-ai/sdk");
-  const { previewReview, reviewConfigured, verdictOf } = await import("./review.ts");
-  if (!reviewConfigured()) return fail("ANTHROPIC_API_KEY isn't set.");
+  const { apiEngine, claudeCodeEngine, detectEngine, previewReview, verdictOf } = await import("./review.ts");
+  const kind = await detectEngine();
+  if (!kind) return fail("Reviews need a logged-in Claude Code on this machine, or ANTHROPIC_API_KEY.");
   const dir = resolve(flagValue("--dir") ?? process.env.MYCELIUM_REPOS_DIR ?? join(homedir(), "mycelium-repos"));
   const [owner, name] = slug.split("/");
   const path = [join(dir, name), join(dir, `${owner}__${name}`)].find((p) => existsSync(join(p, ".git")));
   if (!path) return fail(`No clone of ${slug} in ${dir}.`);
-  const { result, costUsd, omitted } = await previewReview(path, slug, Number(number), new Anthropic() as any);
-  console.log(c.bold(verdictOf(result.findings) === "passed" ? c.green("READY FOR A PERSON TO MERGE") : c.red("SENT BACK")), c.dim(`· about $${costUsd.toFixed(2)} · nothing posted to GitHub`));
+  const { result, costUsd, omitted } = await previewReview(path, slug, Number(number), kind === "api" ? apiEngine(new Anthropic() as any) : claudeCodeEngine);
+  console.log(c.bold(verdictOf(result.findings) === "passed" ? c.green("READY FOR A PERSON TO MERGE") : c.red("SENT BACK")), c.dim(`· ${costUsd === null ? "on your Claude plan" : `about $${costUsd.toFixed(2)}`} · nothing posted to GitHub`));
   console.log(`\n${result.summary}`);
   if (omitted.length) console.log(c.dim(`\nNot sent to the model: ${omitted.join(", ")}`));
   for (const f of result.findings) console.log(`\n${c.bold(f.severity.toUpperCase())} ${f.title}\n${c.dim(`${f.category} ${f.file}${f.line > 0 ? `:${f.line}` : ""}`)}\n${f.detail}${f.suggestion ? `\nFix: ${f.suggestion}` : ""}`);
@@ -462,6 +492,12 @@ async function fixAll() {
       rows.push({ project: name, status: "failed", autoFixable: 0, fixed: [], prs: [], failed: [], manual: 0, skippedNotes: [], branch: null, error: (e as Error).message });
       continue;
     }
+    // A fix PR someone closed unmerged was a decision: the nightly job doesn't ask again until a newer fix exists.
+    if (flags.has("--respect-closed")) {
+      const closed = new Set((db.prepare("SELECT fixes FROM pr_history WHERE project = ? AND state = 'CLOSED'").all(name) as { fixes: string }[])
+        .flatMap((r) => (JSON.parse(r.fixes) as { name: string; to: string | null }[]).map((f) => `${f.name}@${f.to}`)));
+      plan = { ...plan, fixes: plan.fixes.filter((f) => !closed.has(`${f.name}@${f.to}`)) };
+    }
     const auto = plan.fixes.filter((f) => f.strategy !== "manual" && (allowMajor || !f.breaking));
     const manual = plan.fixes.length - auto.length;
     const row: Row = { project: name, status: "nothing", autoFixable: auto.length, fixed: [], prs: [], failed: [], manual, skippedNotes: [], branch: null };
@@ -627,6 +663,7 @@ const HELP = `${c.bold("mycelium")}: map every dependency under everything you o
   ${c.cyan("pull")} <project>       Fast-forward a merged fix into your folder (only when safe), then rescan.
   ${c.cyan("serve")} [--port 4747] Local report with Fix buttons at http://mycelium.localhost:4747
                        --install keeps it always on (login item) · --uninstall turns that off
+  ${c.cyan("keys")} --staged|--install-hook  Stop API keys before they're committed (--install-hook runs it on every commit in this repo).
   ${c.cyan("review")} <owner/name> <n>  Review one PR and print it, posting nothing. Reviews run on the dashboard's Reviews page.
   ${c.cyan("mcp")}                  Run as an MCP server (stdio) so Claude Code can scan, plan and fix.
   ${c.cyan("watch")} [folders…]     scan + check + macOS notification for new findings (for cron/launchd).
@@ -685,6 +722,7 @@ switch (cmd) {
   }
   case "fix": flags.has("--all") ? await fixAll() : args[0] ? await fix(args[0]) : console.log("usage: mycelium fix <project> [--apply] [--verify] [--pr] [--major] [--min high] [--only a,b]"); break;
   case "review": await reviewCmd(args[0], args[1]); break;
+  case "keys": await keysCmd(); break;
   case "mcp": await import("./mcp.ts"); break;
   case "serve":
     if (flags.has("--install")) installServe(Number(flagValue("--port") ?? 4747));

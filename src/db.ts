@@ -187,6 +187,9 @@ CREATE TABLE IF NOT EXISTS reviews (
   PRIMARY KEY (repo, number, sha)
 );
 
+-- Every time the reviewer actually ran, retries included: what the daily limit counts.
+CREATE TABLE IF NOT EXISTS review_runs (at TEXT NOT NULL);
+
 CREATE INDEX IF NOT EXISTS idx_edges_child ON edges(child_id);
 CREATE INDEX IF NOT EXISTS idx_uses_pkg ON uses(package_id);
 `;
@@ -199,6 +202,7 @@ export function openDb(path = DB_PATH): DatabaseSync {
   for (const sql of [
     "ALTER TABLE projects ADD COLUMN license TEXT",
     "ALTER TABLE packages ADD COLUMN install_script INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE reviews ADD COLUMN published INTEGER NOT NULL DEFAULT 1", // 0: finished, but GitHub hasn't got the result yet
   ]) {
     try {
       db.exec(sql);

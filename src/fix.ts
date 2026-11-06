@@ -7,6 +7,7 @@
 //   - Major-version bumps are planned but skipped unless allowMajor (they can break your code).
 //   - Success is measured by re-reading the lockfiles, not by trusting that a command exited 0.
 
+import { withoutServiceKeys } from "./net.ts";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1211,7 +1212,7 @@ function verifyCommands(dir: string): string[][] {
 
 function run(cmd: string, args: string[], cwd: string, timeout = 10 * 60_000, env: Record<string, string> = {}): { ok: boolean; output: string } {
   try {
-    const output = execFileSync(cmd, args, { cwd, timeout, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, CI: "1", ...env } });
+    const output = execFileSync(cmd, args, { cwd, timeout, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...withoutServiceKeys(), CI: "1", ...env } });
     return { ok: true, output };
   } catch (e: any) {
     if (e.code === "ENOENT") return { ok: false, output: `${cmd} is not installed` };

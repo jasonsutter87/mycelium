@@ -10,10 +10,15 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import { execFile } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
 import { resendSender, loadAlertSettings, emailConfigured, type Sender } from "./alerts.ts";
+import { redactKeys } from "./keys.ts";
 
 const execFileP = promisify(execFile);
 
@@ -21,9 +26,13 @@ export const REVIEW_MODEL = process.env.MYCELIUM_REVIEW_MODEL || "claude-opus-5-
 export const STATUS_CONTEXT = "Mycelium review";
 const MARKER = "<!-- mycelium-review -->";
 const MAX_TURNS = 16;
+export const MAX_TOOL_CALLS = 60;
+const CLAUDE_CODE_TIMEOUT_MS = 20 * 60_000;
 const MAX_DIFF_CHARS = 400_000;
 const LOCKFILE_DIFF_CHARS = 20_000;
 const FILE_CHARS = 120_000;
+const SEARCH_CHARS = 40_000;
+const COMMENT_CHARS = 60_000; // GitHub refuses comments over 65,536
 const MAX_ATTEMPTS = 3;
 // claude-opus-5-5, dollars per million tokens. Only used for the estimate shown on the page.
 const PRICE = { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 };
@@ -65,9 +74,9 @@ export interface ReviewSettings {
   enabled: boolean;
   dailyLimit: number; // most reviews in any 24 hours: a safety net on the API bill
   emailSentBack: boolean; // GitHub doesn't notify you about comments on your own PRs, and here both come from one account
-  baselinePending: boolean; // PRs already open when reviews are turned on aren't reviewed until they change
+  seenRepos: string[]; // repos that have answered since this was turned on. A repo's PRs open at that first answer wait until they change
 }
-export const DEFAULT_REVIEWS: ReviewSettings = { enabled: false, dailyLimit: 50, emailSentBack: true, baselinePending: false };
+export const DEFAULT_REVIEWS: ReviewSettings = { enabled: false, dailyLimit: 50, emailSentBack: true, seenRepos: [] };
 
 const getJson = <T>(db: DatabaseSync, key: string, fallback: T): T => {
   const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | undefined;
@@ -77,46 +86,39 @@ const setJson = (db: DatabaseSync, key: string, value: unknown) =>
   db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT DO UPDATE SET value = excluded.value").run(key, JSON.stringify(value));
 
 export const loadReviewSettings = (db: DatabaseSync) => getJson<ReviewSettings>(db, "reviews", DEFAULT_REVIEWS);
-export const reviewConfigured = (env = process.env) => !!env.ANTHROPIC_API_KEY;
 
 export function saveReviewSettings(db: DatabaseSync, input: Partial<ReviewSettings>): ReviewSettings {
   const prev = loadReviewSettings(db);
   const dailyLimit = Number(input.dailyLimit ?? prev.dailyLimit);
   if (!Number.isInteger(dailyLimit) || dailyLimit < 1 || dailyLimit > 1000) throw new Error("The daily limit has to be a whole number from 1 to 1000.");
   const enabled = !!(input.enabled ?? prev.enabled);
-  const settings: ReviewSettings = { enabled, dailyLimit, emailSentBack: !!(input.emailSentBack ?? prev.emailSentBack), baselinePending: enabled && (prev.baselinePending || !prev.enabled) };
+  const settings: ReviewSettings = { enabled, dailyLimit, emailSentBack: !!(input.emailSentBack ?? prev.emailSentBack), seenRepos: enabled && prev.enabled ? prev.seenRepos : [] };
   setJson(db, "reviews", settings);
   return settings;
 }
 
 // ---------------------------------------------------------------- keeping secrets out
 
-const SENSITIVE_PATH = /(^|\/)(\.env(\.[^/]*)?|\.npmrc|\.pypirc|\.netrc|id_(rsa|dsa|ecdsa|ed25519)|credentials(\.[^/]*)?|secrets?\.(json|ya?ml|toml))$|\.(pem|key|p12|pfx|jks|keystore)$/i;
+const SENSITIVE_PATH = /(^|\/)(\.env(\.[^/]*)?|\.envrc|[^/]*\.env|\.pypirc|\.netrc|\.git-credentials|id_(rsa|dsa|ecdsa|ed25519)|credentials(\.(json|ya?ml|toml|ini|txt|csv))?|secrets?\.(json|ya?ml|toml))$|\.(pem|key|p12|pfx|jks|keystore|tfvars|tfstate)$/i;
+const SAFE_EXAMPLE = /\.(example|sample|template|dist|defaults?|ts|tsx|js|jsx|mjs|cjs|py|rb|go|rs|java|cs|php|sh|md)$/i; // examples and source code, like .env.ts
 const LOCKFILE = /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lock|Cargo\.lock|poetry\.lock|uv\.lock|Gemfile\.lock|composer\.lock|go\.sum|packages\.lock\.json|gradle\.lockfile)$/;
-const SECRET_VALUES = [
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z ]*PRIVATE KEY-----|$)/g,
-  /\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b/g,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
-  /\bsk-ant-[A-Za-z0-9_-]{16,}\b/g,
-  /\b(sk|rk)_(live|test)_[A-Za-z0-9]{16,}\b/g,
-  /\bre_[A-Za-z0-9_]{20,}\b/g,
-  /\b(AKIA|ASIA)[A-Z0-9]{16}\b/g,
-  /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/g,
-  /\bAIza[A-Za-z0-9_-]{30,}\b/g,
-];
-export const isSensitivePath = (path: string) => SENSITIVE_PATH.test(path);
-export const redactSecrets = (text: string) => SECRET_VALUES.reduce((t, re) => t.replace(re, "[REDACTED]"), text);
+export const isSensitivePath = (path: string) => SENSITIVE_PATH.test(path) && !SAFE_EXAMPLE.test(path);
+export const redactSecrets = redactKeys;
 
 /** What's sent as the diff: no sensitive files, big lockfiles reduced to a name, known token shapes blanked out. */
 export function prepareDiff(raw: string): { diff: string; omitted: string[]; tooLarge: boolean } {
   const omitted: string[] = [];
   const kept = raw.split(/^(?=diff --git )/m).filter(Boolean).filter((section) => {
-    const path = /^diff --git a\/.* b\/(.*)$/m.exec(section)?.[1] ?? "";
-    if (isSensitivePath(path)) return omitted.push(`${path} (may hold secrets)`), false;
+    const header = section.split("\n", 1)[0];
+    // git quotes unusual names. They're still judged by name, so an odd name can't be used to dodge either way.
+    const path = /^diff --git a\/.* b\/(.*)$/.exec(header)?.[1] ?? /"b\/(.*)"$/.exec(header)?.[1] ?? /"a\/.*" "?b\/(.*?)"?$/.exec(header)?.[1] ?? "";
+    const from = /^(?:rename|copy) from (.*)$/m.exec(section)?.[1]?.replace(/^"|"$/g, "") ?? "";
+    if (isSensitivePath(path.replace(/"$/, "")) || isSensitivePath(from)) return omitted.push(`${path.replace(/"$/, "")} (may hold secrets)`), false;
     if (LOCKFILE.test(path) && section.length > LOCKFILE_DIFF_CHARS) return omitted.push(`${path} (large lockfile)`), false;
     return true;
   });
-  const diff = redactSecrets(kept.join(""));
+  // One file at a time, so nothing in one file can affect what's sent for another.
+  const diff = kept.map(redactSecrets).join("");
   return { diff, omitted, tooLarge: diff.length > MAX_DIFF_CHARS };
 }
 
@@ -138,7 +140,7 @@ export async function runTool(repo: string, sha: string, name: string, input: an
     return redactSecrets(text.length > FILE_CHARS ? `${text.slice(0, FILE_CHARS)}\n[File cut off here: it continues for ${text.length - FILE_CHARS} more characters.]` : text);
   }
   if (name === "search") {
-    const args = ["--literal-pathspecs", "grep", "-n", "-I", "-F", "-e", str(input?.text, "text"), sha];
+    const args = ["--literal-pathspecs", "-c", "core.quotePath=false", "grep", "-z", "-n", "-I", "-F", "-e", str(input?.text, "text"), sha];
     if (input?.path) args.push("--", str(input.path, "path"));
     let out = "";
     try {
@@ -147,8 +149,15 @@ export async function runTool(repo: string, sha: string, name: string, input: an
       if (e.code === 1) return "No matches.";
       throw e;
     }
-    const lines = out.split("\n").filter(Boolean).map((l) => l.slice(sha.length + 1)).filter((l) => !isSensitivePath(l.split(":")[0]));
-    return redactSecrets(lines.slice(0, 200).join("\n") + (lines.length > 200 ? `\n[${lines.length - 200} more matches not shown. Narrow the search.]` : "")) || "No matches.";
+    // -z puts a NUL after the path and the line number, so a colon in a file name can't hide what file this is.
+    const lines = out.split("\n").filter(Boolean).map((l) => {
+      const [path, lineNo = "", ...more] = l.slice(sha.length + 1).split("\0");
+      const rest = more.join(" ");
+      return { path, text: `${path}:${lineNo}:${rest.length > 500 ? `${rest.slice(0, 500)} [line cut off]` : rest}` };
+    }).filter((l) => !isSensitivePath(l.path)).map((l) => l.text);
+    const shown = lines.slice(0, 200).join("\n");
+    const clipped = shown.length > SEARCH_CHARS ? `${shown.slice(0, SEARCH_CHARS)}\n[Output cut off. Narrow the search.]` : shown;
+    return redactSecrets(clipped + (lines.length > 200 ? `\n[${lines.length - 200} more matches not shown. Narrow the search.]` : "")) || "No matches.";
   }
   if (name === "list_files") {
     const args = ["--literal-pathspecs", "ls-tree", "-r", "--name-only", sha];
@@ -212,6 +221,98 @@ export interface ReviewClient {
 
 /** A review that couldn't finish: never a pass. */
 export class ReviewFailed extends Error {}
+/** Trouble with the login or its limits, nothing to do with this PR: it keeps its place in the queue. */
+export class EngineTrouble extends Error {}
+
+/** Runs one review. Returns a cost only when one is actually billed per use. */
+export type ReviewEngine = (input: ReviewInput, repo: string, sha: string) => Promise<{ result: ReviewResult; costUsd: number | null }>;
+export type EngineKind = "api" | "claude-code";
+
+export const apiEngine = (client: ReviewClient): ReviewEngine => (input, repo, sha) => runReviewAgent(client, input, (name, args) => runTool(repo, sha, name, args));
+
+/**
+ * An API key if there is one, since setting one is a deliberate choice. Otherwise a logged-in Claude Code on this machine,
+ * which runs on that person's own plan: fine for their own install, but a product can't offer it to its customers.
+ */
+export async function detectEngine(env = process.env): Promise<EngineKind | null> {
+  if (env.ANTHROPIC_API_KEY) return "api";
+  try {
+    const { stdout } = await execFileP("claude", ["auth", "status"], { encoding: "utf8", timeout: 20_000 });
+    return JSON.parse(stdout).loggedIn ? "claude-code" : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Stops the whole queue: nothing about the PR would change the answer. Any other 4xx counts against that one PR. */
+const accountError = (status: number, message: string) =>
+  [401, 403, 429].includes(status) || status >= 500 || (status >= 400 && /credit|balance|billing|model/i.test(message));
+const CLAUDE_TOOLS = ["read_file", "search", "list_files"].map((t) => `mcp__review__${t}`);
+
+/** The whole command line. Claude Code's own tools are off: all it can use is the read-only server, for this one commit. */
+export function claudeCodeArgs(repo: string, sha: string, toolsScript: string): string[] {
+  const mcp = { mcpServers: { review: { type: "stdio", command: process.execPath, args: ["--experimental-strip-types", "--no-warnings=ExperimentalWarning", toolsScript, repo, sha] } } };
+  return [
+    "-p", "--output-format", "json", "--no-session-persistence",
+    "--model", REVIEW_MODEL, "--effort", "high",
+    "--system-prompt", SYSTEM_PROMPT,
+    "--json-schema", JSON.stringify(REVIEW_JSON_SCHEMA),
+    "--tools", "",
+    "--mcp-config", JSON.stringify(mcp), "--strict-mcp-config",
+    "--allowedTools", CLAUDE_TOOLS.join(","),
+    "--permission-mode", "dontAsk",
+    "--setting-sources", "", // no hooks, plugins, or instructions from this machine's own setup
+    "--disable-slash-commands",
+  ];
+}
+
+/** Reads what `claude -p --output-format json` printed. Only a finished answer that fits the schema comes back. */
+export function parseClaudeCodeOutput(stdout: string): ReviewResult {
+  let out: any;
+  try {
+    out = JSON.parse(stdout);
+  } catch {
+    throw new ReviewFailed("The review didn't come back in the expected format.");
+  }
+  const said = String(out?.result ?? "");
+  if (accountError(out?.api_error_status ?? 0, said) || /usage limit|limit reached|hit your limit|not logged in|please run \/login|invalid api key/i.test(out?.is_error ? said : "")) {
+    throw new EngineTrouble(out?.api_error_status === 429 || /limit/i.test(said) ? "Your Claude plan's usage limit was reached. Reviews continue when it resets." : out?.api_error_status === 401 || out?.api_error_status === 403 || /log/i.test(said) ? "Claude Code on this server isn't logged in. Run claude there to log in." : `Anthropic returned an error (${out?.api_error_status ?? "no status"}).`);
+  }
+  if (/prompt is too long|too many tokens/i.test(said) || /^error_max/.test(String(out?.subtype))) throw new ReviewFailed("The review didn't finish: this PR was too big for it.");
+  // Anything else unexplained could just be the network, so it's a normal failed attempt and gets retried.
+  if (out?.is_error || out?.subtype !== "success") throw new Error("Claude Code reported an error.");
+  const checked = ReviewSchema.safeParse(out.structured_output);
+  if (!checked.success) throw new ReviewFailed("The review didn't come back in the expected format.");
+  return checked.data;
+}
+
+/** Keeps other services' keys out: Claude Code needs its login, which lives under HOME, and little else. */
+const claudeCodeEnv = (env = process.env) => {
+  const keep: Record<string, string> = { CI: "1" };
+  for (const k of ["HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"]) if (env[k]) keep[k] = env[k]!;
+  return keep;
+};
+
+export const claudeCodeEngine: ReviewEngine = async (input, repo, sha) => {
+  const toolsScript = fileURLToPath(new URL("./review-tools.ts", import.meta.url));
+  const cwd = mkdtempSync(join(tmpdir(), "mycelium-review-")); // an empty folder, so no project's instructions get picked up
+  try {
+    const stdout = await new Promise<string>((resolve, reject) => {
+      const child = execFile("claude", claudeCodeArgs(repo, sha, toolsScript), { cwd, env: claudeCodeEnv(), encoding: "utf8", timeout: CLAUDE_CODE_TIMEOUT_MS, maxBuffer: 1 << 26 }, (err, out, stderr) => {
+        // Nothing is printed until the end, so a timeout looks empty too. That's about this PR, not the login.
+        if (err && (err as any).killed) reject(new Error(`The review didn't finish within ${CLAUDE_CODE_TIMEOUT_MS / 60_000} minutes.`));
+        // A failed run still prints its JSON, and that says why. No JSON at all is the CLI itself failing.
+        else if (err && !String(out).trim()) reject(new EngineTrouble(`Claude Code couldn't run: ${String(stderr || err.message).trim().split("\n")[0].slice(0, 200)}`));
+        else resolve(out);
+      });
+      child.stdin!.on("error", () => {}); // it exiting early is reported by the callback, and must not take the server down
+      child.stdin!.end(buildPrompt(input));
+    });
+    return { result: parseClaudeCodeOutput(stdout), costUsd: null }; // the JSON's cost is notional here: nothing is billed per review
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+};
 
 const usageCost = (u: any) =>
   ((u?.input_tokens ?? 0) * PRICE.input + (u?.output_tokens ?? 0) * PRICE.output + (u?.cache_read_input_tokens ?? 0) * PRICE.cacheRead + (u?.cache_creation_input_tokens ?? 0) * PRICE.cacheWrite) / 1e6;
@@ -280,6 +381,9 @@ export function neutralise(s: string): string {
     .replace(/<!--/g, "&lt;!--")
     .replace(/</g, "&lt;")
     .replace(/@(?=[\w-])/g, "@​")
+    .replace(/:\/\//g, ":​//")
+    .replace(/\bwww\./gi, "www​.")
+    .replace(/#(?=\d)/g, "#​")
     .replace(/!\[/g, "!​[")
     .replace(/\]\(/g, "] (")
     .replace(/\]\[/g, "] [")
@@ -289,7 +393,7 @@ export function neutralise(s: string): string {
 const RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
 const validRepoPath = (p: string) => !!p && !p.startsWith("/") && !p.split("/").includes("..") && /^[\w./ @+()-]+$/.test(p);
 
-export function buildComment(repo: string, sha: string, result: ReviewResult): string {
+export function buildComment(repo: string, sha: string, result: ReviewResult, omitted: string[] = []): string {
   const verdict = verdictOf(result.findings);
   const place = (f: ReviewFinding) => {
     if (!validRepoPath(f.file)) return "";
@@ -298,17 +402,28 @@ export function buildComment(repo: string, sha: string, result: ReviewResult): s
     return ` · [\`${label}\`](https://github.com/${repo}/blob/${sha}/${path}${f.line > 0 ? `#L${f.line}` : ""})`;
   };
   const ordered = [...result.findings].sort((a, b) => RANK[a.severity] - RANK[b.severity]);
-  const body = ordered.map((f) => `### ${f.severity.toUpperCase()}: ${neutralise(f.title).replace(/\s+/g, " ")}\n${neutralise(f.category).replace(/\s+/g, " ")}${place(f)}\n\n${neutralise(f.detail)}${f.suggestion ? `\n\n**Fix:** ${neutralise(f.suggestion)}` : ""}`).join("\n\n");
+  const sections = ordered.map((f) => `### ${f.severity.toUpperCase()}: ${neutralise(f.title).replace(/\s+/g, " ")}\n${neutralise(f.category).replace(/\s+/g, " ")}${place(f)}\n\n${neutralise(f.detail)}${f.suggestion ? `\n\n**Fix:** ${neutralise(f.suggestion)}` : ""}`);
+  // Worst first, so what gets cut from a very long review is the least important part.
+  let body = "", dropped = 0;
+  for (const section of sections) {
+    if (body.length + section.length > COMMENT_CHARS) dropped++;
+    else body += (body ? "\n\n" : "") + section;
+  }
+  if (dropped) body += `\n\n_${dropped} lower-severity note${dropped === 1 ? "" : "s"} left out because this comment got too long. All of them are on the Mycelium dashboard._`;
+  const notSeen = omitted.length ? `**Not reviewed:** ${neutralise(omitted.slice(0, 40).join(", "))}${omitted.length > 40 ? `, and ${omitted.length - 40} more` : ""}\n\n` : "";
   const head = verdict === "passed"
     ? `## ✅ Mycelium review: ready for a person to merge${ordered.length ? ` (${ordered.length} minor note${ordered.length === 1 ? "" : "s"})` : ""}`
     : `## ❌ Mycelium review: sent back with notes`;
-  return `${MARKER}\n${head}\n\n${neutralise(result.summary)}\n\n${body}${body ? "\n\n" : ""}<sub>Reviewed \`${sha.slice(0, 7)}\`. An AI review can miss things, and Mycelium never merges on its own.</sub>`;
+  return `${MARKER}\n${head}\n\n${neutralise(result.summary).slice(0, 2000)}\n\n${body}${body ? "\n\n" : ""}${notSeen}<sub>Reviewed \`${sha.slice(0, 7)}\`. An AI review can miss things, and Mycelium never merges on its own.</sub>`;
 }
 
-export const statusDescription = (verdict: "passed" | "sent_back", findings: ReviewFinding[]) => {
+export const statusDescription = (verdict: "passed" | "sent_back", findings: ReviewFinding[], omitted: string[] = []) => {
   const blockers = findings.filter((f) => f.severity === "critical" || f.severity === "high").length;
-  return verdict === "passed" ? "Ready for a person to merge" : `Sent back: ${blockers} issue${blockers === 1 ? "" : "s"} to fix`;
+  return verdict === "passed" ? (omitted.length ? `Ready for a person to merge, ${omitted.length} file${omitted.length === 1 ? "" : "s"} not reviewed` : "Ready for a person to merge") : `Sent back: ${blockers} issue${blockers === 1 ? "" : "s"} to fix`;
 };
+
+/** `answered`: repos GitHub told us about. `partial`: those with more open PRs than we were given. Anything else is unknown, not empty. */
+export interface PrListing { prs: OpenPr[]; answered: string[]; partial: string[] }
 
 export interface OpenPr {
   repo: string; number: number; title: string; body: string; url: string; author: string | null; draft: boolean; fork: boolean;
@@ -317,20 +432,21 @@ export interface OpenPr {
 
 /** Everything that touches GitHub, so tests can stand in for it. */
 export interface GithubPort {
-  listOpenPrs(repos: string[]): Promise<OpenPr[]>;
-  setStatus(repo: string, sha: string, state: "pending" | "success" | "failure" | "error", description: string, targetUrl: string | null): Promise<void>;
+  listOpenPrs(repos: string[]): Promise<PrListing>;
+  setStatus(repo: string, sha: string, state: "pending" | "success" | "failure" | "error", description: string, targetUrl: string | null, context?: string): Promise<void>;
   comment(repo: string, number: number, commentId: number | null, body: string): Promise<number>;
 }
 
 const gh = async (args: string[], stdin?: string): Promise<string> => {
   return await new Promise((resolve, reject) => {
     const child = execFile("gh", args, { encoding: "utf8", timeout: 60_000, maxBuffer: 1 << 26 }, (err, stdout, stderr) => (err ? reject(Object.assign(err, { stdout, stderr })) : resolve(stdout)));
+    child.stdin!.on("error", () => {}); // it exiting early is reported by the callback, and must not take the server down
     if (stdin !== undefined) child.stdin!.end(stdin);
   });
 };
 
 export function openPrsQuery(repos: string[]): string {
-  const fields = "pullRequests(states: OPEN, first: 50, orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { number title body url isDraft isCrossRepository headRefOid baseRefOid baseRefName author { login } } }";
+  const fields = "pullRequests(states: OPEN, first: 50, orderBy: {field: UPDATED_AT, direction: DESC}) { pageInfo { hasNextPage } nodes { number title body url isDraft isCrossRepository headRefOid baseRefOid baseRefName author { login } } }";
   return `query { ${repos.map((slug, i) => {
     const [owner, name] = slug.split("/");
     return `r${i}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { ${fields} }`;
@@ -339,7 +455,7 @@ export function openPrsQuery(repos: string[]): string {
 
 export const githubPort: GithubPort = {
   async listOpenPrs(repos) {
-    const out: OpenPr[] = [];
+    const out: PrListing = { prs: [], answered: [], partial: [] };
     for (let i = 0; i < repos.length; i += 40) {
       const batch = repos.slice(i, i + 40);
       let raw: string;
@@ -353,15 +469,19 @@ export const githubPort: GithubPort = {
       }
       const data = JSON.parse(raw).data ?? {};
       batch.forEach((repo, n) => {
-        for (const p of data[`r${n}`]?.pullRequests?.nodes ?? []) {
-          out.push({ repo, number: p.number, title: p.title, body: p.body ?? "", url: p.url, author: p.author?.login ?? null, draft: p.isDraft, fork: p.isCrossRepository, sha: p.headRefOid, baseSha: p.baseRefOid, baseRef: p.baseRefName });
+        const list = data[`r${n}`]?.pullRequests;
+        if (!list) return;
+        out.answered.push(repo);
+        if (list.pageInfo?.hasNextPage) out.partial.push(repo);
+        for (const p of list.nodes ?? []) {
+          out.prs.push({ repo, number: p.number, title: p.title, body: p.body ?? "", url: p.url, author: p.author?.login ?? null, draft: p.isDraft, fork: p.isCrossRepository, sha: p.headRefOid, baseSha: p.baseRefOid, baseRef: p.baseRefName });
         }
       });
     }
     return out;
   },
-  async setStatus(repo, sha, state, description, targetUrl) {
-    const args = ["api", "-X", "POST", `repos/${repo}/statuses/${sha}`, "-f", `state=${state}`, "-f", `context=${STATUS_CONTEXT}`, "-f", `description=${description.slice(0, 140)}`];
+  async setStatus(repo, sha, state, description, targetUrl, context = STATUS_CONTEXT) {
+    const args = ["api", "-X", "POST", `repos/${repo}/statuses/${sha}`, "-f", `state=${state}`, "-f", `context=${context}`, "-f", `description=${description.slice(0, 140)}`];
     if (targetUrl) args.push("-f", `target_url=${targetUrl}`);
     await gh(args);
   },
@@ -371,7 +491,9 @@ export const githubPort: GithubPort = {
       try {
         await gh(["api", "-X", "PATCH", `repos/${repo}/issues/comments/${commentId}`, "--input", "-"], payload);
         return commentId;
-      } catch { /* deleted by someone: post a new one */ }
+      } catch (e: any) {
+        if (!/HTTP 404|Not Found/i.test(`${e.stderr ?? ""} ${e.message ?? ""}`)) throw e; // only a deleted comment gets replaced
+      }
     }
     return JSON.parse(await gh(["api", "-X", "POST", `repos/${repo}/issues/${number}/comments`, "--input", "-"], payload)).id;
   },
@@ -381,42 +503,63 @@ export const githubPort: GithubPort = {
 
 interface Row {
   repo: string; number: number; sha: string; base_sha: string; base_ref: string; title: string; body: string; url: string; author: string | null;
-  state: string; summary: string | null; findings: string; note: string | null; attempts: number; comment_id: number | null; cost_usd: number | null; created_at: string; reviewed_at: string | null;
+  state: string; summary: string | null; findings: string; note: string | null; attempts: number; comment_id: number | null; cost_usd: number | null; created_at: string; reviewed_at: string | null; published: number;
 }
 
 // These open and rebase PRs by the dozen, and each new commit would be a paid review. Mycelium's own fix PRs come from your account, so they're still reviewed.
 const DEPENDENCY_BOT = /^(dependabot|renovate|github-actions)(\[bot\])?$/i;
 
-/** Records new PR heads. Drafts and forks wait; queued work for a commit that's no longer a PR's head is dropped. */
-export function recordOpenPrs(db: DatabaseSync, open: OpenPr[], now = new Date().toISOString()): { queued: number; baselined: number } {
+/**
+ * Records new PR heads. Drafts wait. The first time a repo answers, its open PRs are left until they change, which covers both
+ * turning reviews on and newly watched repos. Queued work is only dropped when GitHub gave a full answer for that repo:
+ * a failed or partial listing says nothing about whether a PR closed.
+ */
+export function recordOpenPrs(db: DatabaseSync, listing: PrListing, now = new Date().toISOString()): { queued: number; baselined: number } {
   const settings = loadReviewSettings(db);
+  const seen = new Set(settings.seenRepos);
   const ins = db.prepare(`INSERT OR IGNORE INTO reviews (repo, number, sha, base_sha, base_ref, title, body, url, author, state, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-  const heads = new Set(open.map((p) => `${p.repo}#${p.number}@${p.sha}`));
+  const heads = new Set(listing.prs.map((p) => `${p.repo}#${p.number}@${p.sha}`));
   let queued = 0, baselined = 0;
-  for (const p of open) {
+  for (const p of listing.prs) {
     if (p.draft) continue;
+    const baseline = !seen.has(p.repo);
     const skipReason = p.fork ? "From a fork, so it isn't reviewed automatically."
       : DEPENDENCY_BOT.test(p.author ?? "") ? "From a dependency bot, so it isn't reviewed automatically."
-      : settings.baselinePending ? "Already open when reviews were turned on." : null;
+      : baseline ? "Already open when reviews started on this repo." : null;
     const added = ins.run(p.repo, p.number, p.sha, p.baseSha, p.baseRef, p.title, p.body, p.url, p.author, skipReason ? "skipped" : "queued", skipReason, now).changes;
     if (added && !skipReason) queued++;
-    else if (added && settings.baselinePending) baselined++;
+    else if (added && baseline) baselined++;
   }
+  const complete = new Set(listing.answered.filter((r) => !listing.partial.includes(r)));
+  const listedPrs = new Set(listing.prs.map((p) => `${p.repo}#${p.number}`));
   for (const r of db.prepare("SELECT repo, number, sha FROM reviews WHERE state = 'queued'").all() as { repo: string; number: number; sha: string }[]) {
-    if (!heads.has(`${r.repo}#${r.number}@${r.sha}`)) {
+    // Seen with a newer commit counts even from a partial list. Absence only means closed when the list was complete.
+    const gone = !heads.has(`${r.repo}#${r.number}@${r.sha}`) && (complete.has(r.repo) || listedPrs.has(`${r.repo}#${r.number}`));
+    if (gone) {
       db.prepare("UPDATE reviews SET state = 'skipped', note = 'Replaced by a newer commit, or the PR closed.' WHERE repo = ? AND number = ? AND sha = ?").run(r.repo, r.number, r.sha);
     }
   }
-  if (settings.baselinePending) setJson(db, "reviews", { ...settings, baselinePending: false });
+  const nowSeen = [...new Set([...seen, ...listing.answered])];
+  if (nowSeen.length !== seen.size) setJson(db, "reviews", { ...settings, seenRepos: nowSeen });
   return { queued, baselined };
 }
 
 const reviewedLastDay = (db: DatabaseSync, now: number) =>
-  (db.prepare("SELECT count(*) AS n FROM reviews WHERE reviewed_at IS NOT NULL AND reviewed_at > ?").get(new Date(now - 86_400_000).toISOString()) as { n: number }).n;
+  (db.prepare("SELECT count(*) AS n FROM review_runs WHERE at > ?").get(new Date(now - 86_400_000).toISOString()) as { n: number }).n;
+
+/** Private refs and no FETCH_HEAD: a pull running in the same clone at the same moment must not see any of this. */
+export function fetchPrObjects(repo: string, number: number, baseRef: string): Promise<string> {
+  const run = () => git(repo, ["fetch", "-q", "--no-write-fetch-head", "origin", `+refs/pull/${number}/head:refs/mycelium/pr/${number}`, `+refs/heads/${baseRef}:refs/mycelium/base/${number}`]);
+  // One at a time per clone: the reviewer and the rule-based agents both fetch a new PR at the same moment.
+  const next = (fetching.get(repo) ?? Promise.resolve("")).then(run, run);
+  fetching.set(repo, next);
+  return next;
+}
+const fetching = new Map<string, Promise<string>>();
 
 export interface ReviewDeps {
   github: GithubPort;
-  client: ReviewClient;
+  engine: ReviewEngine;
   repoPath(slug: string): string | null;
   baseUrl: string | null;
   send?: Sender;
@@ -429,7 +572,7 @@ const setRow = (db: DatabaseSync, r: Pick<Row, "repo" | "number" | "sha">, field
 };
 
 const noteFor = (e: unknown) => {
-  if (e instanceof ReviewFailed) return e.message;
+  if (e instanceof ReviewFailed || e instanceof EngineTrouble) return e.message;
   if (e instanceof Anthropic.AuthenticationError) return "The Anthropic API rejected the key. Check ANTHROPIC_API_KEY.";
   if (e instanceof Anthropic.RateLimitError) return "The Anthropic API is rate limiting this key.";
   if (e instanceof Anthropic.APIError) return `The Anthropic API returned an error (${e.status ?? "no status"}).`;
@@ -438,43 +581,76 @@ const noteFor = (e: unknown) => {
 
 /** Trouble with the API or the key says nothing about this PR: it keeps its place and the poll stops until the next one. */
 const apiTrouble = (e: unknown) =>
-  e instanceof Anthropic.AuthenticationError || e instanceof Anthropic.PermissionDeniedError || e instanceof Anthropic.RateLimitError || e instanceof Anthropic.APIConnectionError || (e instanceof Anthropic.APIError && (e.status ?? 0) >= 500);
+  e instanceof EngineTrouble || e instanceof Anthropic.AuthenticationError || e instanceof Anthropic.PermissionDeniedError || e instanceof Anthropic.RateLimitError || e instanceof Anthropic.APIConnectionError || (e instanceof Anthropic.APIError && accountError(e.status ?? 0, e.message));
 
 /** Reviews one queued commit. It ends as a verdict or an error on GitHub, or stays pending while the API itself is down. */
 export async function reviewOne(db: DatabaseSync, row: Row, deps: ReviewDeps): Promise<void> {
   const repo = deps.repoPath(row.repo);
+  if (!repo) return setRow(db, row, { note: "Waiting for the repo to be cloned." }); // keeps its place, and spends nothing
   const target = deps.baseUrl?.startsWith("https://") ? deps.baseUrl : null;
   const attempts = row.attempts + 1;
   setRow(db, row, { state: "running", attempts });
+  let runId: number | null = null, saved = false;
   try {
-    if (!repo) throw new ReviewFailed("There's no clone of this repo on the server yet.");
     await deps.github.setStatus(row.repo, row.sha, "pending", "Reviewing", target);
-    await git(repo, ["fetch", "-q", "origin", `+refs/pull/${row.number}/head:refs/mycelium/pr/${row.number}`, row.base_ref]);
-    const raw = await git(repo, ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames", `${row.base_sha}...${row.sha}`]);
+    await fetchPrObjects(repo, row.number, row.base_ref);
+    const raw = await git(repo, ["-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames", `${row.base_sha}...${row.sha}`]);
     const { diff, omitted, tooLarge } = prepareDiff(raw);
     if (tooLarge) {
       setRow(db, row, { state: "error", note: "Too large to review automatically.", reviewed_at: new Date().toISOString() });
       await deps.github.setStatus(row.repo, row.sha, "error", "Too large to review automatically", target);
       return;
     }
-    const { result, costUsd } = await runReviewAgent(deps.client, { repo: row.repo, number: row.number, title: row.title, body: row.body, author: row.author, baseRef: row.base_ref, diff, omitted }, (name, input) => runTool(repo, row.sha, name, input));
-    const verdict = verdictOf(result.findings);
-    const previous = db.prepare("SELECT comment_id FROM reviews WHERE repo = ? AND number = ? AND comment_id IS NOT NULL ORDER BY created_at DESC LIMIT 1").get(row.repo, row.number) as { comment_id: number } | undefined;
-    const commentId = await deps.github.comment(row.repo, row.number, previous?.comment_id ?? null, buildComment(row.repo, row.sha, result));
-    await deps.github.setStatus(row.repo, row.sha, verdict === "passed" ? "success" : "failure", statusDescription(verdict, result.findings), target);
-    setRow(db, row, { state: verdict, summary: neutralise(result.summary), findings: JSON.stringify(result.findings), note: null, comment_id: commentId, cost_usd: costUsd, reviewed_at: new Date().toISOString() });
-    if (verdict === "sent_back") await emailSentBack(db, row, result.findings, deps.send ?? resendSender, deps.log);
+    runId = Number(db.prepare("INSERT INTO review_runs (at) VALUES (?)").run(new Date().toISOString()).lastInsertRowid);
+    const { result, costUsd } = await deps.engine({ repo: row.repo, number: row.number, title: row.title, body: row.body, author: row.author, baseRef: row.base_ref, diff, omitted }, repo, row.sha);
+    const full = withheldFindings(result, omitted);
+    // Saved before anything goes to GitHub, so trouble posting it never means paying for the same review again.
+    setRow(db, row, { state: verdictOf(full.findings), summary: neutralise(full.summary), findings: JSON.stringify(full.findings), note: omitted.length ? `Not reviewed: ${omitted.join(", ")}` : null, cost_usd: costUsd, reviewed_at: new Date().toISOString(), published: 0 });
+    saved = true;
+    await publishReview(db, db.prepare("SELECT * FROM reviews WHERE repo = ? AND number = ? AND sha = ?").get(row.repo, row.number, row.sha) as unknown as Row, deps);
   } catch (e) {
     const note = noteFor(e);
     deps.log?.(`review of ${row.repo}#${row.number} failed: ${note}`);
+    if (saved) return; // the verdict is saved: the next poll retries posting it
     if (apiTrouble(e)) {
       setRow(db, row, { state: "queued", attempts: row.attempts, note });
-      throw new Error(note, { cause: e });
+      if (runId !== null) db.prepare("DELETE FROM review_runs WHERE rowid = ?").run(runId); // an outage or a plan limit isn't a review
+      throw new EngineTrouble(note, { cause: e });
     }
     const giveUp = attempts >= MAX_ATTEMPTS || e instanceof ReviewFailed;
     setRow(db, row, giveUp ? { state: "error", note, reviewed_at: new Date().toISOString() } : { state: "queued", note });
     if (giveUp) await deps.github.setStatus(row.repo, row.sha, "error", "Couldn't finish the review", target).catch(() => {});
   }
+}
+
+/**
+ * A changed file the reviewer wasn't allowed to read goes on the PR for a person to look at. It doesn't fail the check, because nothing
+ * on a PR could ever clear it and a required check would stay red for good. Real keys in those files are the key watcher's job.
+ */
+export function withheldFindings(result: ReviewResult, omitted: string[]): ReviewResult {
+  const secret = omitted.filter((o) => o.endsWith("(may hold secrets)")).map((o) => o.replace(/ \(may hold secrets\)$/, ""));
+  if (!secret.length) return result;
+  return { ...result, findings: [...result.findings, ...secret.map((file): ReviewFinding => ({
+    severity: "medium", category: "not-reviewed", file, line: 0,
+    title: `Changed file wasn't reviewed: ${file}`,
+    detail: "This file may hold secrets, so it wasn't sent to the reviewer, and nothing has checked this change.",
+    suggestion: "Have a person read this file's change. If it holds real secrets, take it out of the PR and replace them.",
+  }))] };
+}
+
+/** Comment, then check, then the email. Safe to repeat: the comment is edited in place once it exists. */
+async function publishReview(db: DatabaseSync, row: Row, deps: ReviewDeps) {
+  const target = deps.baseUrl?.startsWith("https://") ? deps.baseUrl : null;
+  const findings = JSON.parse(row.findings) as ReviewFinding[];
+  const result = { summary: row.summary ?? "", findings };
+  const omitted = row.note?.startsWith("Not reviewed: ") ? row.note.slice(14).split(", ") : [];
+  const verdict = verdictOf(findings);
+  const previous = db.prepare("SELECT comment_id FROM reviews WHERE repo = ? AND number = ? AND comment_id IS NOT NULL ORDER BY created_at DESC LIMIT 1").get(row.repo, row.number) as { comment_id: number } | undefined;
+  const commentId = await deps.github.comment(row.repo, row.number, previous?.comment_id ?? null, buildComment(row.repo, row.sha, result, omitted));
+  setRow(db, row, { comment_id: commentId });
+  await deps.github.setStatus(row.repo, row.sha, verdict === "passed" ? "success" : "failure", statusDescription(verdict, findings, omitted), target);
+  setRow(db, row, { published: 1 });
+  if (verdict === "sent_back") await emailSentBack(db, row, findings, deps.send ?? resendSender, deps.log);
 }
 
 async function emailSentBack(db: DatabaseSync, row: Row, findings: ReviewFinding[], send: Sender, log?: (s: string) => void) {
@@ -495,19 +671,46 @@ async function emailSentBack(db: DatabaseSync, row: Row, findings: ReviewFinding
   }
 }
 
-/** One pass of the poller: find new PR heads, then work through the queue up to the daily limit. */
+/** One pass of the poller: post anything finished but not yet on GitHub, find new PR heads, then work through the queue up to the daily limit. */
 export async function pollReviews(db: DatabaseSync, repos: string[], deps: ReviewDeps, now = Date.now): Promise<{ reviewed: number; queued: number }> {
   if (!loadReviewSettings(db).enabled) return { reviewed: 0, queued: 0 };
-  const { queued } = recordOpenPrs(db, await deps.github.listOpenPrs(repos));
+  // One that can't be posted never holds up the rest. After a day it's given up on: the result stays on the dashboard.
+  for (const row of db.prepare("SELECT * FROM reviews WHERE published = 0").all() as unknown as Row[]) {
+    try {
+      await publishReview(db, row, deps);
+    } catch (e) {
+      deps.log?.(`couldn't post the review of ${row.repo}#${row.number}: ${noteFor(e)}`);
+      if (now() - Date.parse(row.reviewed_at ?? new Date(now()).toISOString()) > 86_400_000) setRow(db, row, { published: 1, note: `Couldn't post this to GitHub: ${noteFor(e)}` });
+    }
+  }
+  const watched = new Set(repos);
+  for (const r of db.prepare("SELECT repo, number, sha FROM reviews WHERE state = 'queued'").all() as { repo: string; number: number; sha: string }[]) {
+    if (!watched.has(r.repo)) setRow(db, r, { state: "skipped", note: "This repo is no longer being watched." });
+  }
+  const refresh = async () => {
+    const listing = await deps.github.listOpenPrs(repos);
+    if (repos.length && !listing.answered.length) throw new Error("GitHub didn't answer for any watched repo. Check that `gh auth status` works on this server.");
+    const missing = repos.length - listing.answered.length;
+    if (missing) deps.log?.(`GitHub didn't answer for ${missing} watched repo(s)`);
+    return recordOpenPrs(db, listing).queued;
+  };
+  let queued = await refresh(), listedAt = now();
   let reviewed = 0;
+  const tried = new Set<string>(); // each gets one go per poll: a failed attempt waits for the next one
   for (;;) {
     const settings = loadReviewSettings(db);
     if (!settings.enabled || reviewedLastDay(db, now()) >= settings.dailyLimit) break;
-    // Oldest first, and only what hasn't already been tried this pass: a failed attempt waits for the next one.
-    const row = db.prepare(`SELECT * FROM reviews WHERE state = 'queued' AND attempts <= ? ORDER BY created_at, repo, number LIMIT 1`).get(reviewed === 0 ? MAX_ATTEMPTS : 0) as Row | undefined;
+    // A long queue takes a while. Look again so a commit that's since been replaced isn't reviewed for nothing.
+    if (now() - listedAt > 3 * 60_000) {
+      queued += await refresh();
+      listedAt = now();
+    }
+    const row = (db.prepare("SELECT * FROM reviews WHERE state = 'queued' ORDER BY created_at, repo, number").all() as unknown as Row[]).find((r) => !tried.has(`${r.repo}#${r.number}@${r.sha}`));
     if (!row) break;
+    tried.add(`${row.repo}#${row.number}@${row.sha}`);
+    const before = reviewedLastDay(db, now());
     await reviewOne(db, row, deps);
-    reviewed++;
+    if (reviewedLastDay(db, now()) > before || (db.prepare("SELECT state FROM reviews WHERE repo = ? AND number = ? AND sha = ?").get(row.repo, row.number, row.sha) as { state: string }).state !== "queued") reviewed++;
   }
   return { reviewed, queued };
 }
@@ -518,27 +721,28 @@ export const resetInterrupted = (db: DatabaseSync) => void db.prepare("UPDATE re
 export function requeueReview(db: DatabaseSync, repo: string, number: number) {
   const row = db.prepare("SELECT sha FROM reviews WHERE repo = ? AND number = ? ORDER BY created_at DESC LIMIT 1").get(repo, number) as { sha: string } | undefined;
   if (!row) throw new Error("That PR hasn't been seen yet.");
-  db.prepare("UPDATE reviews SET state = 'queued', attempts = 0, note = NULL WHERE repo = ? AND number = ? AND sha = ? AND state != 'running'").run(repo, number, row.sha);
+  db.prepare("UPDATE reviews SET state = 'queued', attempts = 0, note = NULL, published = 1 WHERE repo = ? AND number = ? AND sha = ? AND state != 'running'").run(repo, number, row.sha);
 }
 
-export function reviewsView(db: DatabaseSync, opts: { managed: boolean; lastError: string | null; lastPollAt: string | null }) {
+export function reviewsView(db: DatabaseSync, opts: { managed: boolean; engine: EngineKind | null; lastError: string | null; lastPollAt: string | null }) {
   const rows = db.prepare("SELECT * FROM reviews ORDER BY COALESCE(reviewed_at, created_at) DESC LIMIT 200").all() as unknown as Row[];
   const dayAgo = new Date(Date.now() - 86_400_000).toISOString();
   const totals = db.prepare(`SELECT sum(state = 'passed') AS passed, sum(state = 'sent_back') AS sentBack, sum(state = 'queued' OR state = 'running') AS waiting, COALESCE(sum(cost_usd), 0) AS cost,
     COALESCE(sum(CASE WHEN reviewed_at > ? THEN cost_usd END), 0) AS costDay FROM reviews`).get(dayAgo) as Record<string, number | null>;
   return {
-    settings: loadReviewSettings(db), configured: reviewConfigured(), managed: opts.managed, lastError: opts.lastError, lastPollAt: opts.lastPollAt, model: REVIEW_MODEL,
+    settings: loadReviewSettings(db), configured: !!opts.engine, engine: opts.engine, managed: opts.managed, lastError: opts.lastError, lastPollAt: opts.lastPollAt, model: REVIEW_MODEL,
     totals: { passed: totals.passed ?? 0, sentBack: totals.sentBack ?? 0, waiting: totals.waiting ?? 0, cost: totals.cost ?? 0, costDay: totals.costDay ?? 0, reviewedDay: reviewedLastDay(db, Date.now()) },
     reviews: rows.map((r) => ({ repo: r.repo, number: r.number, sha: r.sha, title: r.title, url: r.url, author: r.author, state: r.state, summary: r.summary, note: r.note, findings: JSON.parse(r.findings) as ReviewFinding[], costUsd: r.cost_usd, at: r.reviewed_at ?? r.created_at })),
   };
 }
 
 /** `mycelium review`: one real review, printed. Nothing goes to GitHub: for trying it out on a PR before turning it on. */
-export async function previewReview(repoPath: string, slug: string, number: number, client: ReviewClient): Promise<{ result: ReviewResult; costUsd: number; omitted: string[] }> {
-  const p = JSON.parse(await gh(["pr", "view", String(number), "--repo", slug, "--json", "title,body,author,headRefOid,baseRefOid,baseRefName"]));
-  await git(repoPath, ["fetch", "-q", "origin", `+refs/pull/${number}/head:refs/mycelium/pr/${number}`, p.baseRefName]);
-  const { diff, omitted, tooLarge } = prepareDiff(await git(repoPath, ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames", `${p.baseRefOid}...${p.headRefOid}`]));
+export async function previewReview(repoPath: string, slug: string, number: number, engine: ReviewEngine): Promise<{ result: ReviewResult; costUsd: number | null; omitted: string[] }> {
+  const pull = JSON.parse(await gh(["api", `repos/${slug}/pulls/${number}`]));
+  const p = { title: pull.title, body: pull.body, author: pull.user, headRefOid: pull.head.sha, baseRefOid: pull.base.sha, baseRefName: pull.base.ref };
+  await fetchPrObjects(repoPath, number, p.baseRefName);
+  const { diff, omitted, tooLarge } = prepareDiff(await git(repoPath, ["-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames", `${p.baseRefOid}...${p.headRefOid}`]));
   if (tooLarge) throw new ReviewFailed("Too large to review automatically.");
-  const out = await runReviewAgent(client, { repo: slug, number, title: p.title, body: p.body ?? "", author: p.author?.login ?? null, baseRef: p.baseRefName, diff, omitted }, (name, input) => runTool(repoPath, p.headRefOid, name, input));
+  const out = await engine({ repo: slug, number, title: p.title, body: p.body ?? "", author: p.author?.login ?? null, baseRef: p.baseRefName, diff, omitted }, repoPath, p.headRefOid);
   return { ...out, omitted };
 }

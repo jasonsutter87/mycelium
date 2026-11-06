@@ -261,7 +261,7 @@ export function findProjects(root: string): string[] {
 }
 
 /** Parse one lockfile/manifest's text by its filename (used to read lockfiles straight out of git, e.g. a PR's head). */
-export function parseLockText(base: string, text: string): { name: string; version: string }[] {
+export function parseLockText(base: string, text: string): { ecosystem: string; name: string; version: string }[] {
   if (base === "package-lock.json" || base === "npm-shrinkwrap.json") return parsePackageLock(text).packages;
   if (base === "pnpm-lock.yaml") return parsePnpmLock(text).packages;
   if (base === "yarn.lock") return parseYarnLock(text).packages;

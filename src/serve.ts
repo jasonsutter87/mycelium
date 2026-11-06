@@ -16,6 +16,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { createAuth } from "./auth.ts";
 import { auditView, clearPrCache, findingsView, fixedView, infraView, overview, PIPELINE, projectDetail, stepOf, withDowngradeHints, type Step } from "./dashboard.ts";
 import { checkAll } from "./osv.ts";
+import { withoutServiceKeys } from "./net.ts";
 import { saveProject, scanProject, scanRoots, setIgnored } from "./scan.ts";
 import { enrich } from "./depsdev.ts";
 import { pullProject, syncPrs } from "./prs.ts";
@@ -24,7 +25,8 @@ import { applyRepoChange, cleanError, fetchRepos, listGithubRepos, loadAutoWatch
 import { companyName, saveCompanyName } from "./db.ts";
 import { cloneDirs, readRepoList } from "./sync.ts";
 import Anthropic from "@anthropic-ai/sdk";
-import { githubPort, loadReviewSettings, pollReviews, requeueReview, resetInterrupted, reviewConfigured, reviewsView, saveReviewSettings, type ReviewClient } from "./review.ts";
+import { agentsView, pollAgents, saveAgentSettings } from "./agents.ts";
+import { apiEngine, claudeCodeEngine, detectEngine, EngineTrouble, githubPort, loadReviewSettings, pollReviews, requeueReview, resetInterrupted, reviewsView, saveReviewSettings, type EngineKind, type ReviewClient } from "./review.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PUBLIC = join(HERE, "..", "public");
@@ -182,28 +184,51 @@ export function serve(db: DatabaseSync, port: number) {
   // PR reviews: polling, so GitHub never needs a way in to this machine. Doesn't take `busy`: it only reads git objects,
   // so it can run beside a fix or a rescan. One poll at a time.
   const reviewPoll: { running: boolean; lastPollAt: string | null; lastError: string | null } = { running: false, lastPollAt: null, lastError: null };
-  const pollReviewsNow = async () => {
-    if (reviewPoll.running || !cfg.repos || !reviewConfigured() || !loadReviewSettings(db).enabled) return;
+  // Asking Claude Code about its login takes a moment and rarely changes.
+  let engineCache: { at: number; kind: EngineKind | null } | null = null;
+  const reviewEngine = async () => {
+    if (!engineCache || Date.now() - engineCache.at > 60_000) engineCache = { at: Date.now(), kind: await detectEngine() };
+    return engineCache.kind;
+  };
+  const reviewRepoPath = (slug: string) => {
+    if (!cfg.repos) return null;
+    const folder = cloneDirs(watchedList()).get(slug);
+    const path = folder && join(cfg.repos.dir, folder);
+    return path && existsSync(join(path, ".git")) ? path : null;
+  };
+  const agentPoll: { running: boolean; lastError: string | null } = { running: false, lastError: null };
+  const pollAgentsNow = async () => {
+    if (agentPoll.running || !cfg.repos) return;
+    agentPoll.running = true;
+    try {
+      await pollAgents(db, watchedList(), { github: githubPort, repoPath: reviewRepoPath, baseUrl, log: (s) => console.error(s) });
+      agentPoll.lastError = null;
+    } catch (e) {
+      console.error("PR agents:", e);
+      agentPoll.lastError = cleanError(e);
+    } finally {
+      agentPoll.running = false;
+    }
+  };
+  let reviewsPausedUntil = 0; // after a plan limit or an outage, there's no point asking again every two minutes
+  const pollReviewsNow = async (manual = false) => {
+    if (reviewPoll.running || !cfg.repos || !loadReviewSettings(db).enabled || (!manual && Date.now() < reviewsPausedUntil)) return;
     reviewPoll.running = true;
     try {
-      const { dir } = cfg.repos;
-      const repos = watchedList();
-      const folders = cloneDirs(repos);
-      const repoPath = (slug: string) => {
-        const path = folders.get(slug) && join(dir, folders.get(slug)!);
-        return path && existsSync(join(path, ".git")) ? path : null;
-      };
-      await pollReviews(db, repos, { github: githubPort, client: new Anthropic() as unknown as ReviewClient, repoPath, baseUrl, log: (s) => console.error(s) });
+      const kind = await reviewEngine();
+      if (!kind) return;
+      await pollReviews(db, watchedList(), { github: githubPort, engine: kind === "api" ? apiEngine(new Anthropic() as unknown as ReviewClient) : claudeCodeEngine, repoPath: reviewRepoPath, baseUrl, log: (s) => console.error(s) });
       reviewPoll.lastError = null;
     } catch (e) {
       console.error("reviewing PRs:", e);
       reviewPoll.lastError = cleanError(e);
+      if (e instanceof EngineTrouble) reviewsPausedUntil = Date.now() + 15 * 60_000;
     } finally {
       reviewPoll.running = false;
       reviewPoll.lastPollAt = new Date().toISOString();
     }
   };
-  const reviewView = () => reviewsView(db, { managed: !!cfg.repos, lastError: reviewPoll.lastError, lastPollAt: reviewPoll.lastPollAt });
+  const reviewView = async () => ({ ...reviewsView(db, { managed: !!cfg.repos, engine: await reviewEngine(), lastError: reviewPoll.lastError ?? agentPoll.lastError, lastPollAt: reviewPoll.lastPollAt }), agents: agentsView(db) });
 
   const page = (file: string, res: ServerResponse) => {
     const html = readFileSync(join(PUBLIC, file), "utf8").replace("__TOKEN__", token!);
@@ -220,7 +245,7 @@ export function serve(db: DatabaseSync, port: number) {
     const current: Job = { id: ++jobCount, project: body.project, state: "running", reached: [], lines: [], result: null, error: null, startedAt: new Date().toISOString() };
     job = current;
     busy = `fixing ${body.project}`;
-    const child = spawn(process.execPath, args, { env: { ...process.env, NO_COLOR: "1" }, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(process.execPath, args, { env: { ...withoutServiceKeys(), NO_COLOR: "1" }, stdio: ["ignore", "pipe", "pipe"] });
     let buf = "", errors = "";
     child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
       buf += chunk;
@@ -294,7 +319,7 @@ export function serve(db: DatabaseSync, port: number) {
         if (p === "/api/audit") return send(res, 200, auditView(db));
         if (p === "/api/infra") return send(res, 200, infraView(db));
         if (p === "/api/alerts") return send(res, 200, alertsView(db));
-        if (p === "/api/reviews") return send(res, 200, reviewView());
+        if (p === "/api/reviews") return send(res, 200, await reviewView());
         if (p === "/api/repos") {
           if (!cfg.repos) return send(res, 200, { managed: false, roots: JSON.parse(setting("roots") ?? "[]") });
           const list = watchedList();
@@ -354,14 +379,19 @@ export function serve(db: DatabaseSync, port: number) {
       }
       if (p === "/api/reviews") {
         saveReviewSettings(db, body);
-        void pollReviewsNow();
-        return send(res, 200, reviewView());
+        void pollReviewsNow(true);
+        return send(res, 200, await reviewView());
+      }
+      if (p === "/api/agents") {
+        saveAgentSettings(db, body);
+        void pollAgentsNow();
+        return send(res, 200, await reviewView());
       }
       if (p === "/api/reviews/again") {
         if (!validSlug(body.repo) || !Number.isInteger(body.number)) return send(res, 400, { error: "Which PR?" });
         requeueReview(db, body.repo, body.number);
-        void pollReviewsNow();
-        return send(res, 200, reviewView());
+        void pollReviewsNow(true);
+        return send(res, 200, await reviewView());
       }
       if (["/api/check", "/api/fix", "/api/pull"].includes(p) && typeof body.project !== "string") return send(res, 400, { error: "which project? (missing project name)" });
       if (busy) return send(res, 409, { error: `Mycelium is busy (${busy}). Try again when that finishes.` });
@@ -442,12 +472,13 @@ export function serve(db: DatabaseSync, port: number) {
   });
 
   resetInterrupted(db);
-  setInterval(() => void pollReviewsNow(), 2 * 60_000).unref();
+  setInterval(() => { void pollAgentsNow(); void pollReviewsNow(); }, 2 * 60_000).unref();
 
   server.listen(port, cfg.host, () => {
-    void pollReviewsNow();
     setImmediate(() => overview(db)); // warm the slow part, so the first page load is quick
     console.log(`🍄 Mycelium at ${baseUrl}/  ${auth ? "(sign-in on)" : "(this computer only)"}  (Ctrl-C to stop)`);
+    void pollAgentsNow();
+    void pollReviewsNow();
     if (process.platform === "darwin" && localUrl && !process.env.MYCELIUM_NO_OPEN) execFile("open", [baseUrl + "/"]);
   });
 }

@@ -137,6 +137,36 @@ export async function checkAll(db: DatabaseSync, log: (s: string) => void = () =
   return fresh;
 }
 
+export interface PackageVuln { ecosystem: string; name: string; version: string; vulnId: string; severity: string; summary: string; fixed: string | null }
+
+/** Asks about packages that aren't in the graph, like the ones a PR would add. Stores nothing. */
+export async function checkPackages(list: { ecosystem: string; name: string; version: string }[]): Promise<PackageVuln[]> {
+  const out: PackageVuln[] = [];
+  const hits: { p: (typeof list)[number]; id: string }[] = [];
+  for (let i = 0; i < list.length; i += BATCH) {
+    let chunk = list.slice(i, i + BATCH).map((p) => ({ p, token: undefined as string | undefined }));
+    while (chunk.length) {
+      const res = await postJson(`${API}/querybatch`, { queries: chunk.map(({ p, token }) => ({ package: { ecosystem: p.ecosystem, name: p.name }, version: p.version, ...(token ? { page_token: token } : {}) })) });
+      const next: typeof chunk = [];
+      res.results.forEach((r: any, j: number) => {
+        for (const v of r.vulns ?? []) hits.push({ p: chunk[j].p, id: v.id });
+        if (r.next_page_token) next.push({ p: chunk[j].p, token: r.next_page_token });
+      });
+      chunk = next;
+    }
+  }
+  const details = new Map<string, any>();
+  await pool([...new Set(hits.map((h) => h.id))], CONCURRENCY, async (id) => {
+    details.set(id, await getJson(`${API}/vulns/${encodeURIComponent(id)}`));
+  });
+  for (const { p, id } of hits) {
+    const v = details.get(id);
+    if (!v || v.withdrawn) continue;
+    out.push({ ...p, vulnId: id, severity: severityOf(v), summary: summarize(v), fixed: fixedVersion(v, p) ?? null });
+  }
+  return out;
+}
+
 function summarize(v: any): string {
   return (v.summary || v.details?.split("\n")[0] || "").slice(0, 200);
 }
