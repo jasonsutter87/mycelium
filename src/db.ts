@@ -143,6 +143,27 @@ CREATE TABLE IF NOT EXISTS pr_fixes (
   version      TEXT NOT NULL
 );
 
+-- Every Mycelium PR, read from its own description. pr_fixes only knows what's still vulnerable in the current scan,
+-- so it empties once a fix is pulled; this is the permanent record. Keyed by URL: worktrees of one repo share PRs.
+CREATE TABLE IF NOT EXISTS pr_history (
+  url       TEXT PRIMARY KEY,
+  repo      TEXT NOT NULL,       -- owner/name on GitHub
+  number    INTEGER NOT NULL,
+  project   TEXT NOT NULL,
+  state     TEXT NOT NULL,       -- OPEN | MERGED | CLOSED
+  title     TEXT NOT NULL,
+  opened_at TEXT,
+  merged_at TEXT,
+  fixes     TEXT NOT NULL,       -- JSON array of FixedEntry
+  synced_at TEXT NOT NULL
+);
+
+-- Findings already emailed (or baselined when alerts were turned on). A text key, so it survives package rows being rebuilt.
+CREATE TABLE IF NOT EXISTS alerted (
+  key        TEXT PRIMARY KEY,     -- ecosystem|name@version|vuln id
+  alerted_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_edges_child ON edges(child_id);
 CREATE INDEX IF NOT EXISTS idx_uses_pkg ON uses(package_id);
 `;
@@ -161,6 +182,19 @@ export function openDb(path = DB_PATH): DatabaseSync {
     } catch {}
   }
   return db;
+}
+
+/** The company this install belongs to, shown in the top bar and alert subjects. "" when not set. */
+export function companyName(db: DatabaseSync): string {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'company'").get() as { value: string } | undefined;
+  return row?.value ?? "";
+}
+
+export function saveCompanyName(db: DatabaseSync, name: unknown): string {
+  const clean = String(name ?? "").replace(/[\x00-\x1f\x7f]+/g, " ").trim();
+  if (clean.length > 80) throw new Error("Keep the company name to 80 characters.");
+  db.prepare("INSERT INTO settings (key, value) VALUES ('company', ?) ON CONFLICT DO UPDATE SET value = excluded.value").run(clean);
+  return clean;
 }
 
 export function tx<T>(db: DatabaseSync, fn: () => T): T {

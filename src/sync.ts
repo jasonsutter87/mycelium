@@ -36,9 +36,9 @@ export function knownRepos(db: DatabaseSync): string[] {
 }
 
 /** Clone what's missing and fast-forward what's there. One failure doesn't stop the rest. Never force-updates. */
-export function syncRepos(dir: string, slugs: string[], log: (s: string) => void): { cloned: string[]; updated: string[]; failed: string[] } {
+export function syncRepos(dir: string, slugs: string[], log: (s: string) => void): { cloned: string[]; updated: string[]; failed: string[]; errors: { slug: string; error: string }[] } {
   mkdirSync(dir, { recursive: true });
-  const res = { cloned: [] as string[], updated: [] as string[], failed: [] as string[] };
+  const res = { cloned: [] as string[], updated: [] as string[], failed: [] as string[], errors: [] as { slug: string; error: string }[] };
   for (const [slug, folder] of cloneDirs(slugs)) {
     const path = join(dir, folder);
     try {
@@ -56,7 +56,9 @@ export function syncRepos(dir: string, slugs: string[], log: (s: string) => void
       }
     } catch (e: any) {
       res.failed.push(slug);
-      log(`✗ ${slug}: ${String(e.stderr || e.message).trim().split("\n")[0]}`);
+      const error = String(e.stderr || e.message).trim().split("\n")[0].replace(/\/\/[^/@\s]+@/g, "//");
+      res.errors.push({ slug, error });
+      log(`✗ ${slug}: ${error}`);
     }
   }
   return res;

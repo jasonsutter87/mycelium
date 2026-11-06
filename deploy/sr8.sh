@@ -5,7 +5,7 @@
 #
 # Needs first: `gh auth login` on the server, and the app registered in Gatekeep's control plane (not clients.toml,
 # which multi-tenant Gatekeep doesn't read for this). This script checks both and stops with the command if not.
-# Your repo list comes from this Mac (`mycelium repos`); the server keeps its own clones in ~/mycelium-repos.
+# Your repo list starts from this Mac (`mycelium repos`) and is managed on the Repos page after that; the server keeps its own clones in ~/mycelium-repos.
 set -euo pipefail
 TARGET="jason@100.83.4.49"
 BRANCH="${1:-$(git branch --show-current)}"
@@ -20,7 +20,8 @@ curl -fs -m 10 -o /dev/null -G https://id.gatekeepauth.com/authorize --data-urle
 
 ssh "$TARGET" 'mkdir -p ~/repos && [ -d ~/repos/mycelium.git ] || git init --quiet --bare ~/repos/mycelium.git'
 git push --quiet "$TARGET:repos/mycelium.git" "$BRANCH:refs/heads/deploy" --force-with-lease=deploy 2>/dev/null || git push --quiet "$TARGET:repos/mycelium.git" "$BRANCH:refs/heads/deploy"
-./bin/mycelium repos | ssh "$TARGET" 'mkdir -p ~/.config/mycelium && cat > ~/.config/mycelium/repos.txt'
+# First install only: after that, the list belongs to the dashboard's Repos page and a deploy must not undo it.
+./bin/mycelium repos | ssh "$TARGET" 'mkdir -p ~/.config/mycelium; f=~/.config/mycelium/repos.txt; if [ -s "$f" ]; then cat >/dev/null; else cat > "$f"; fi'
 
 ssh "$TARGET" 'bash -s' <<'REMOTE'
 set -euo pipefail
