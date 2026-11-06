@@ -197,8 +197,9 @@ export function serve(db: DatabaseSync, port: number) {
     return path && existsSync(join(path, ".git")) ? path : null;
   };
   const agentPoll: { running: boolean; lastError: string | null } = { running: false, lastError: null };
+  let agentsPausedUntil = 0; // after a plan limit or outage, the AI agents shouldn't hammer the engine every two minutes
   const pollAgentsNow = async () => {
-    if (agentPoll.running || !cfg.repos) return;
+    if (agentPoll.running || !cfg.repos || Date.now() < agentsPausedUntil) return;
     agentPoll.running = true;
     try {
       const kind = await reviewEngine();
@@ -208,6 +209,7 @@ export function serve(db: DatabaseSync, port: number) {
     } catch (e) {
       console.error("PR agents:", e);
       agentPoll.lastError = cleanError(e);
+      if (e instanceof EngineTrouble) agentsPausedUntil = Date.now() + 15 * 60_000;
     } finally {
       agentPoll.running = false;
     }

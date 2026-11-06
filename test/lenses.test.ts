@@ -47,15 +47,19 @@ test("an advisory lens comment says so and never says sent back", () => {
 
 // The fail-closed behavior lives in agents.ts (runAiLens), but the regex that detects an unfinished
 // review is the crux, so assert the phrasings the model actually used are caught and clean ones aren't.
-test("a stopped-early summary is recognisably not a clean review", () => {
+test("a stopped-early summary is recognised, a PR about stopping is not (uses the real regex)", async () => {
+  const { INCOMPLETE_REVIEW } = await import("../src/agents.ts");
   const stopped = [
     "This review was stopped by a safety classifier before it finished, so no findings are recorded.",
     "This review did not complete: a safety classifier stopped the response.",
     "Assessment of this file was withheld, so it needs human review.",
   ];
-  const clean = ["No malicious behaviour found.", "No accessibility issues: there is nothing to check.", "No active harm: the code is a plain refactor."];
-  // Mirror of INCOMPLETE_REVIEW in agents.ts.
-  const re = /safety classifier|did ?n.t (finish|complete)|could ?n.t (finish|complete)|was stopped|not (a )?clean result|no findings (are|were) recorded|assessment .{0,40}withheld|a human should review/i;
-  for (const s of stopped) assert.ok(re.test(s), s);
-  for (const s of clean) assert.ok(!re.test(s), s);
+  const clean = [
+    "No malicious behaviour found.",
+    "This change handles a worker that was stopped by SIGTERM; nothing harmful.",
+    "Adds a safety classifier to the upload path; looks fine.",
+    "No active harm: the code is a plain refactor.",
+  ];
+  for (const x of stopped) assert.ok(INCOMPLETE_REVIEW.test(x), x);
+  for (const x of clean) assert.ok(!INCOMPLETE_REVIEW.test(x), x);
 });

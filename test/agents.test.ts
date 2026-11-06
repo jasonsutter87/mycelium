@@ -10,6 +10,7 @@ import { saveRepoChoices } from "../src/repos.ts";
 import { describeHits, redactKeys, scanLine, scanPatch } from "../src/keys.ts";
 import type { GithubPort, OpenPr, ReviewEngine } from "../src/review.ts";
 import { loadAgentSettings } from "../src/agents.ts";
+import { EngineTrouble, ReviewFailed } from "../src/review.ts";
 
 // Assembled at run time, so this file doesn't trip the very check it tests.
 const GH = "ghp" + "_" + "Ab1".repeat(12);
@@ -429,4 +430,64 @@ test("AI lenses need an engine, and skip forks and dependency bots", async () =>
   } finally {
     r.cleanup();
   }
+});
+
+const seeChrimsonSeen = (db: any, repo = "o/r") => {
+  const cur = JSON.parse((db.prepare("SELECT value FROM settings WHERE key='agents'").get() as any).value);
+  db.prepare("UPDATE settings SET value=? WHERE key='agents'").run(JSON.stringify({ ...cur, seen: { ...cur.seen, crimson: [repo], a11y: [repo] } }));
+};
+
+test("a transient engine error retries, counts against the budget, then fails closed after the cap", async () => {
+  const r = repo();
+  try {
+    const db = openDb(":memory:");
+    let calls = 0;
+    const engine: ReviewEngine = async () => { calls++; throw new Error("network blip"); };
+    saveAgentSettings(db, { crimson: true });
+    seeChrimsonSeen(db);
+    const sha = r.commit({ "a.ts": "export const a = 2;\n" });
+    withOrigin(r, sha);
+    const open = [pr(r, sha, { baseSha: r.base, author: "alice" })];
+    const deps: AgentDeps = { github: fake(open).github, repoPath: () => r.dir, baseUrl: null, engine };
+    let last: any;
+    for (let i = 0; i < 3; i++) { const gh = fake(open); await pollAgents(db, ["o/r"], { ...deps, github: gh.github }); last = gh; }
+    assert.equal(calls, 3, "it retried up to the cap");
+    assert.equal((db.prepare("SELECT count(*) AS n FROM review_runs").get() as any).n, 3, "each attempt counts against the shared budget");
+    const row = db.prepare("SELECT state FROM agent_checks WHERE agent='crimson'").get() as any;
+    assert.equal(row.state, "failed", "after the cap it fails closed, not silently");
+    assert.equal(last.statuses.at(-1).state, "failure");
+  } finally { r.cleanup(); }
+});
+
+test("engine trouble refunds the run and stops the pass (so the caller can pause)", async () => {
+  const r = repo();
+  try {
+    const db = openDb(":memory:");
+    const engine: ReviewEngine = async () => { throw new EngineTrouble("Your Claude plan's usage limit was reached."); };
+    saveAgentSettings(db, { crimson: true });
+    seeChrimsonSeen(db);
+    const sha = r.commit({ "a.ts": "export const a = 2;\n" });
+    withOrigin(r, sha);
+    const gh = fake([pr(r, sha, { baseSha: r.base, author: "alice" })]);
+    await assert.rejects(pollAgents(db, ["o/r"], { github: gh.github, repoPath: () => r.dir, baseUrl: null, engine }), /usage limit/);
+    assert.equal((db.prepare("SELECT count(*) AS n FROM review_runs").get() as any).n, 0, "an outage doesn't burn the budget");
+    assert.equal(gh.statuses.length, 0, "nothing is posted");
+  } finally { r.cleanup(); }
+});
+
+test("a non-blocking Crimson finding reads as notes for a person, not a pass", async () => {
+  const r = repo();
+  try {
+    const db = openDb(":memory:");
+    const engine: ReviewEngine = async () => ({ result: { summary: "one medium smell", findings: [{ severity: "medium", category: "obfuscation", file: "a.ts", line: 1, title: "base64 eval", detail: "d", suggestion: "s" }] }, costUsd: null });
+    saveAgentSettings(db, { crimson: true });
+    seeChrimsonSeen(db);
+    const sha = r.commit({ "a.ts": "export const a = 2;\n" });
+    withOrigin(r, sha);
+    const gh = fake([pr(r, sha, { baseSha: r.base, author: "alice" })]);
+    await pollAgents(db, ["o/r"], { github: gh.github, repoPath: () => r.dir, baseUrl: null, engine });
+    const st = gh.statuses.find((s: any) => s.context === "Mycelium crimson");
+    assert.equal(st.state, "success", "a medium finding doesn't block");
+    assert.match(st.description, /note/, "but it's not reported as 'nothing suspicious'");
+  } finally { r.cleanup(); }
 });
