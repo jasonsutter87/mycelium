@@ -50,6 +50,7 @@ const state = {
   alertMsg: null,
   reviewFilter: "all",
   reviewMsg: null,
+  reviewDraft: null, // unsaved reviewer settings: the page redraws itself every 15 seconds and mustn't lose them
   reviewOpen: new Set(), // which reviews are expanded: the page re-renders while work is running
   repoScopeOpen: false,
   repoScopeQ: "",
@@ -649,6 +650,7 @@ function renderReviews() {
   const d = state.tabs.reviews;
   if (!d) return ($("canvas").innerHTML = `<div class="empty"><span class="spin"></span>Loading reviews</div>`);
   const on = d.settings.enabled;
+  const draft = state.reviewDraft ?? d.settings;
   const t = d.totals;
   const money = (n) => (n > 0 && n < 0.01 ? "under $0.01" : `$${n.toFixed(2)}`);
   const matches = (r) => state.reviewFilter === "all" || r.state === state.reviewFilter || (state.reviewFilter === "queued" && r.state === "running");
@@ -711,9 +713,9 @@ function renderReviews() {
     })()}
     <section class="pcard rcard">
       <h3>🕵️ Adversarial reviewer</h3>
-      <label class="row"><input type="checkbox" id="rOn" ${on ? "checked" : ""} ${d.configured && d.managed ? "" : "disabled"}> <b>Review new pull requests</b></label>
-      <label class="row"><span>Stop after <input class="field num-in" id="rLimit" type="number" min="1" max="1000" value="${esc(d.settings.dailyLimit)}" aria-label="Most reviews in 24 hours"> reviews in 24 hours</span></label>
-      <label class="row"><input type="checkbox" id="rEmail" ${d.settings.emailSentBack ? "checked" : ""}> <span>Email the alert list when a PR is sent back</span></label>
+      <label class="row"><input type="checkbox" id="rOn" ${draft.enabled ? "checked" : ""} ${d.configured && d.managed ? "" : "disabled"}> <b>Review new pull requests</b></label>
+      <label class="row"><span>Stop after <input class="field num-in" id="rLimit" type="number" min="1" max="1000" value="${esc(draft.dailyLimit)}" aria-label="Most reviews in 24 hours"> reviews in 24 hours</span></label>
+      <label class="row"><input type="checkbox" id="rEmail" ${draft.emailSentBack ? "checked" : ""}> <span>Email the alert list when a PR is sent back</span></label>
       <p class="small muted">PRs already open when you turn this on or start watching a repo aren't reviewed until they change. PRs from forks and dependency bots like Dependabot are skipped, but you can still review one by hand. PR code goes to Anthropic (${esc(d.model)}${d.engine === "claude-code" ? ", through Claude Code on this server" : ""}), without files that may hold secrets. To block merging on a failed review, make the <span class="mono">Mycelium review</span> check required in GitHub's branch rules.</p>
       <div class="actions"><button class="btn primary" id="rSave">Save</button>${state.reviewMsg ? `<span class="small ${state.reviewMsg.err ? "warn-text" : "ok-text"}" role="status">${esc(state.reviewMsg.text)}</span>` : ""}</div>
     </section>
@@ -729,10 +731,14 @@ function renderReviews() {
     };
   });
   wireRepoScope(d);
+  const readReviewForm = () => ({ enabled: $("rOn").checked, dailyLimit: $("rLimit").value, emailSentBack: $("rEmail").checked });
+  ["rOn", "rLimit", "rEmail"].forEach((id) => ($(id).oninput = () => { state.reviewDraft = readReviewForm(); }));
   $("rSave").onclick = async () => {
     try {
-      state.tabs.reviews = await api("/api/reviews", { enabled: $("rOn").checked, dailyLimit: Number($("rLimit").value), emailSentBack: $("rEmail").checked });
-      state.reviewMsg = { text: "Saved." };
+      const form = readReviewForm();
+      state.tabs.reviews = await api("/api/reviews", { ...form, dailyLimit: Number(form.dailyLimit) });
+      state.reviewDraft = null;
+      state.reviewMsg = { text: `Saved. Reviews are ${state.tabs.reviews.settings.enabled ? "on" : "off"}.` };
     } catch (e) { state.reviewMsg = { text: e.message, err: true }; }
     renderReviews();
   };
