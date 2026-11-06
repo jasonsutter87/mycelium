@@ -693,7 +693,9 @@ function renderReviews() {
       const ag = d.agents;
       const hit = (p) => p.agent === "keys"
         ? p.details.map((h) => `<div class="small"><b>${esc(h.kind)}</b> <span class="mono muted">${esc(h.file)}${h.line ? `:${h.line}` : ""}</span></div>`).join("")
-        : p.details.map((v) => `<div class="small"><span class="sev ${esc(v.severity)}">${esc(v.vulnId.startsWith("MAL-") ? "malicious" : v.severity.toLowerCase())}</span> <b>${esc(v.name)}</b> <span class="mono muted">${esc(v.version)}</span> ${v.fixed ? `<span class="muted">fixed in ${esc(v.fixed)}</span>` : ""}</div>`).join("");
+        : p.agent === "fungi"
+        ? p.details.map((v) => `<div class="small"><span class="sev ${esc(v.severity)}">${esc(v.vulnId.startsWith("MAL-") ? "malicious" : v.severity.toLowerCase())}</span> <b>${esc(v.name)}</b> <span class="mono muted">${esc(v.version)}</span> ${v.fixed ? `<span class="muted">fixed in ${esc(v.fixed)}</span>` : ""}</div>`).join("")
+        : p.details.map((f) => `<div class="small"><span class="sev ${esc(FINDING_SEV[f.severity] || f.severity)}">${esc(f.severity)}</span> <b>${esc(f.title)}</b>${f.file ? ` <span class="mono muted">${esc(f.file)}${f.line > 0 ? `:${f.line}` : ""}</span>` : ""}${f.detail ? `<div class="small muted">${esc(f.detail)}</div>` : ""}</div>`).join("");
       return `<div class="pgrid">
         <section class="pcard">
           <h3>🔑 Key watcher</h3>
@@ -707,8 +709,18 @@ function renderReviews() {
           <label class="row"><input type="checkbox" id="gFix" ${ag.settings.fungiAutoFix ? "checked" : ""} ${d.managed ? "" : "disabled"}> <span>Every night, open fix PRs for high and critical findings</span></label>
           <p class="small muted">A PR only fails for what it adds. Nightly fixes skip major upgrades and dev dependencies. Free, with no AI. ${ag.totals.fungi.checked} checked, ${ag.totals.fungi.failed} flagged.</p>
         </section>
+        <section class="pcard">
+          <h3>🟥 Crimson</h3>
+          <label class="row"><input type="checkbox" id="gCrimson" ${ag.settings.crimson ? "checked" : ""} ${d.configured && d.managed ? "" : "disabled"}> <b>Red-team every PR</b></label>
+          <p class="small muted">An AI pass that assumes the author may be hostile: backdoors, exfiltration, logic bombs, obfuscation, code that runs on install. Fails the check on high or critical. Uses the plan, within the reviewer's daily limit. Forks and bots are skipped. ${ag.totals.crimson.checked} checked, ${ag.totals.crimson.failed} flagged.${d.configured ? "" : " Needs a Claude login or API key."}</p>
+        </section>
+        <section class="pcard">
+          <h3>♿ Accessibility</h3>
+          <label class="row"><input type="checkbox" id="gA11y" ${ag.settings.a11y ? "checked" : ""} ${d.configured && d.managed ? "" : "disabled"}> <b>Check every PR for accessibility</b></label>
+          <p class="small muted">An AI pass for WCAG issues it can see in the source: missing labels and alt text, misused ARIA, non-semantic markup, low-contrast tokens. Advisory — it never fails a check. Uses the plan, within the reviewer's daily limit. ${ag.totals.a11y.checked} checked.</p>
+        </section>
       </div>
-      ${ag.problems.length ? `<section class="pcard rproblems"><h3>Flagged by these two</h3><ul class="plain">${ag.problems.map((p) => `<li class="rfinding"><a href="${safeUrl(p.url)}" target="_blank" rel="noopener noreferrer"><b>${esc(p.title)}</b></a> <span class="small muted">${esc(p.repo)}#${p.number} · ${esc(ago(p.at))}</span>${hit(p)}${p.note ? `<div class="small muted">${esc(p.note)}</div>` : ""}</li>`).join("")}</ul></section>` : ""}
+      ${ag.problems.length ? `<section class="pcard rproblems"><h3>Flagged by the agents</h3><ul class="plain">${ag.problems.map((p) => `<li class="rfinding"><a href="${safeUrl(p.url)}" target="_blank" rel="noopener noreferrer"><b>${esc(p.title)}</b></a> <span class="small muted">${esc(p.repo)}#${p.number} · ${esc(ago(p.at))}</span>${hit(p)}${p.note ? `<div class="small muted">${esc(p.note)}</div>` : ""}</li>`).join("")}</ul></section>` : ""}
       ${ag.gaps.length ? `<section class="pcard rproblems"><h3>Fungi couldn't check everything</h3><ul class="plain">${ag.gaps.map((g) => `<li class="rfinding"><a href="${safeUrl(g.url)}" target="_blank" rel="noopener noreferrer"><b>${esc(g.title)}</b></a> <span class="small muted">${esc(g.repo)}#${g.number}</span><div class="small muted">${esc(g.note)}</div></li>`).join("")}</ul></section>` : ""}`;
     })()}
     <section class="pcard rcard">
@@ -723,7 +735,7 @@ function renderReviews() {
     <div class="filters rfilters"><div class="chips" role="group" aria-label="Filter reviews">${chips.map(([id, label, c]) => `<button data-rfilter="${id}" class="${state.reviewFilter === id ? "on" : ""}">${label}<i>${c}</i></button>`).join("")}</div></div>
     ${shown.length ? `<ul class="plain rlist">${shown.map(row).join("")}</ul>` : `<div class="empty">${d.reviews.length ? "No reviews match this filter." : on ? "No PRs yet. New ones show up here within a couple of minutes." : "Turn reviews on, and new PRs show up here."}</div>`}
   </div>`;
-  [["gKeys", "keys"], ["gFungi", "fungi"], ["gFix", "fungiAutoFix"]].forEach(([id, field]) => {
+  [["gKeys", "keys"], ["gFungi", "fungi"], ["gFix", "fungiAutoFix"], ["gCrimson", "crimson"], ["gA11y", "a11y"]].forEach(([id, field]) => {
     $(id).onchange = async (e) => {
       try { state.tabs.reviews = await api("/api/agents", { [field]: e.target.checked }); }
       catch (err) { state.reviewMsg = { text: err.message, err: true }; }
@@ -753,7 +765,7 @@ function renderReviews() {
 
 // ---- which agents run on which repo
 
-const SCOPE_AGENTS = [["review", "Reviewer"], ["keys", "Key watcher"], ["fungi", "Fungi"]];
+const SCOPE_AGENTS = [["review", "Reviewer"], ["keys", "Key watcher"], ["fungi", "Fungi"], ["crimson", "Crimson"], ["a11y", "a11y"]];
 
 function repoScopeRows(d) {
   const q = state.repoScopeQ.trim().toLowerCase();
@@ -763,7 +775,7 @@ function repoScopeRows(d) {
 function repoScopeBody(d) {
   const rows = repoScopeRows(d);
   return rows.map((r) => `<tr><td class="wrap">${esc(r.slug)}</td>${SCOPE_AGENTS.map(([a, label]) => `<td class="tick"><input type="checkbox" data-sslug="${esc(r.slug)}" data-sagent="${a}" aria-label="${label} on ${esc(r.slug)}" ${r[a] ? "checked" : ""}></td>`).join("")}</tr>`).join("")
-    || `<tr><td colspan="4" class="empty">${d.repoChoices.repos.length ? "No repos match." : "No repos are being watched yet."}</td></tr>`;
+    || `<tr><td colspan="${SCOPE_AGENTS.length + 1}" class="empty">${d.repoChoices.repos.length ? "No repos match." : "No repos are being watched yet."}</td></tr>`;
 }
 
 function repoScopeHtml(d) {
@@ -772,7 +784,7 @@ function repoScopeHtml(d) {
     <details id="rsBox" ${state.repoScopeOpen ? "open" : ""}><summary><b>Which repos</b> <span class="muted">${esc(counts)} of ${d.repoChoices.repos.length}</span></summary>
       <div class="rsTools">
         <input class="field" id="rsQ" type="search" placeholder="Search repos" aria-label="Search repos" value="${esc(state.repoScopeQ)}">
-        <label class="row"><input type="checkbox" id="rsNew" ${d.repoChoices.newRepos ? "checked" : ""}> <span>Repos you start watching later get all three</span></label>
+        <label class="row"><input type="checkbox" id="rsNew" ${d.repoChoices.newRepos ? "checked" : ""}> <span>Repos you start watching later get all of them</span></label>
       </div>
       <p class="small muted">All and None change the repos shown, so you can search first. When you turn an agent on for a repo, PRs already open there wait until they change.</p>
       <div class="tablewrap rsTable"><table><thead><tr><th>Repo</th>${SCOPE_AGENTS.map(([a, label]) => `<th><span class="rsHead">${label}<span><button class="linkish small" data-sall="${a}" data-son="1">All</button> · <button class="linkish small" data-sall="${a}" data-son="0">None</button></span></span></th>`).join("")}</tr></thead>
@@ -800,7 +812,7 @@ function wireRepoScope(d) {
 // Reviews take minutes and finish on their own, so this page keeps itself current, unless someone's mid-edit in its settings.
 setInterval(async () => {
   if (state.view !== "reviews" || !state.tabs.reviews || document.hidden) return;
-  if (["rLimit", "rOn", "rEmail", "gKeys", "gFungi", "gFix", "rsQ", "rsNew"].includes(document.activeElement?.id) || document.activeElement?.dataset?.sslug) return;
+  if (["rLimit", "rOn", "rEmail", "gKeys", "gFungi", "gFix", "gCrimson", "gA11y", "rsQ", "rsNew"].includes(document.activeElement?.id) || document.activeElement?.dataset?.sslug) return;
   try {
     const next = await api("/api/reviews");
     if (state.view === "reviews") { state.tabs.reviews = next; renderReviews(); }
