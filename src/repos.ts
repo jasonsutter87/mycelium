@@ -168,8 +168,8 @@ export function saveHiddenAccounts(db: DatabaseSync, accounts: unknown): string[
 
 // ---------------------------------------------------------------- which agents run on which repo
 
-export type RepoAgent = "review" | "keys" | "fungi";
-export const REPO_AGENTS: RepoAgent[] = ["review", "keys", "fungi"];
+export type RepoAgent = "review" | "keys" | "fungi" | "crimson" | "a11y";
+export const REPO_AGENTS: RepoAgent[] = ["review", "keys", "fungi", "crimson", "a11y"];
 
 /** Only what someone changed is stored. Anything else follows `newRepos`, so repos watched later get a deliberate answer too. */
 export interface RepoChoices { newRepos: boolean; repos: Record<string, Partial<Record<RepoAgent, boolean>>> }
@@ -201,5 +201,5 @@ export function saveRepoChoices(db: DatabaseSync, input: { changes?: unknown; ne
 
 export function repoChoicesView(db: DatabaseSync, watched: string[]) {
   const c = loadRepoChoices(db);
-  return { newRepos: c.newRepos, repos: watched.map((slug) => ({ slug, review: agentOnFor(c, slug, "review"), keys: agentOnFor(c, slug, "keys"), fungi: agentOnFor(c, slug, "fungi") })) };
+  return { newRepos: c.newRepos, repos: watched.map((slug) => ({ slug, ...Object.fromEntries(REPO_AGENTS.map((a) => [a, agentOnFor(c, slug, a)])) })) };
 }

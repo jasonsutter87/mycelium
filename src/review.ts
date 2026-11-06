@@ -226,10 +226,10 @@ export class ReviewFailed extends Error {}
 export class EngineTrouble extends Error {}
 
 /** Runs one review. Returns a cost only when one is actually billed per use. */
-export type ReviewEngine = (input: ReviewInput, repo: string, sha: string) => Promise<{ result: ReviewResult; costUsd: number | null }>;
+export type ReviewEngine = (input: ReviewInput, repo: string, sha: string, system?: string) => Promise<{ result: ReviewResult; costUsd: number | null }>;
 export type EngineKind = "api" | "claude-code";
 
-export const apiEngine = (client: ReviewClient): ReviewEngine => (input, repo, sha) => runReviewAgent(client, input, (name, args) => runTool(repo, sha, name, args));
+export const apiEngine = (client: ReviewClient): ReviewEngine => (input, repo, sha, system) => runReviewAgent(client, input, (name, args) => runTool(repo, sha, name, args), system);
 
 /**
  * An API key if there is one, since setting one is a deliberate choice. Otherwise a logged-in Claude Code on this machine,
@@ -251,12 +251,12 @@ const accountError = (status: number, message: string) =>
 const CLAUDE_TOOLS = ["read_file", "search", "list_files"].map((t) => `mcp__review__${t}`);
 
 /** The whole command line. Claude Code's own tools are off: all it can use is the read-only server, for this one commit. */
-export function claudeCodeArgs(repo: string, sha: string, toolsScript: string): string[] {
+export function claudeCodeArgs(repo: string, sha: string, toolsScript: string, system: string = SYSTEM_PROMPT): string[] {
   const mcp = { mcpServers: { review: { type: "stdio", command: process.execPath, args: ["--experimental-strip-types", "--no-warnings=ExperimentalWarning", toolsScript, repo, sha] } } };
   return [
     "-p", "--output-format", "json", "--no-session-persistence",
     "--model", REVIEW_MODEL, "--effort", "high",
-    "--system-prompt", SYSTEM_PROMPT,
+    "--system-prompt", system,
     "--json-schema", JSON.stringify(REVIEW_JSON_SCHEMA),
     "--tools", "",
     "--mcp-config", JSON.stringify(mcp), "--strict-mcp-config",
@@ -294,12 +294,12 @@ const claudeCodeEnv = (env = process.env) => {
   return keep;
 };
 
-export const claudeCodeEngine: ReviewEngine = async (input, repo, sha) => {
+export const claudeCodeEngine: ReviewEngine = async (input, repo, sha, system) => {
   const toolsScript = fileURLToPath(new URL("./review-tools.ts", import.meta.url));
   const cwd = mkdtempSync(join(tmpdir(), "mycelium-review-")); // an empty folder, so no project's instructions get picked up
   try {
     const stdout = await new Promise<string>((resolve, reject) => {
-      const child = execFile("claude", claudeCodeArgs(repo, sha, toolsScript), { cwd, env: claudeCodeEnv(), encoding: "utf8", timeout: CLAUDE_CODE_TIMEOUT_MS, maxBuffer: 1 << 26 }, (err, out, stderr) => {
+      const child = execFile("claude", claudeCodeArgs(repo, sha, toolsScript, system), { cwd, env: claudeCodeEnv(), encoding: "utf8", timeout: CLAUDE_CODE_TIMEOUT_MS, maxBuffer: 1 << 26 }, (err, out, stderr) => {
         // Nothing is printed until the end, so a timeout looks empty too. That's about this PR, not the login.
         if (err && (err as any).killed) reject(new Error(`The review didn't finish within ${CLAUDE_CODE_TIMEOUT_MS / 60_000} minutes.`));
         // A failed run still prints its JSON, and that says why. No JSON at all is the CLI itself failing.
@@ -319,7 +319,7 @@ const usageCost = (u: any) =>
   ((u?.input_tokens ?? 0) * PRICE.input + (u?.output_tokens ?? 0) * PRICE.output + (u?.cache_read_input_tokens ?? 0) * PRICE.cacheRead + (u?.cache_creation_input_tokens ?? 0) * PRICE.cacheWrite) / 1e6;
 
 /** The agent's loop. Only a finished answer that fits the schema comes back as a result; everything else throws. */
-export async function runReviewAgent(client: ReviewClient, input: ReviewInput, tools: (name: string, input: any) => Promise<string>): Promise<{ result: ReviewResult; costUsd: number }> {
+export async function runReviewAgent(client: ReviewClient, input: ReviewInput, tools: (name: string, input: any) => Promise<string>, system: string = SYSTEM_PROMPT): Promise<{ result: ReviewResult; costUsd: number }> {
   const messages: any[] = [{ role: "user", content: buildPrompt(input) }];
   let costUsd = 0;
   for (let turn = 0; turn < MAX_TURNS; turn++) {
@@ -330,7 +330,7 @@ export async function runReviewAgent(client: ReviewClient, input: ReviewInput, t
       fallbacks: "default", // a security-heavy diff can trip a safety classifier: another model finishes it instead of stopping
       cache_control: { type: "ephemeral" },
       output_config: { effort: "high", format: { type: "json_schema", schema: REVIEW_JSON_SCHEMA } },
-      system: SYSTEM_PROMPT,
+      system,
       tools: TOOLS,
       messages,
     });
@@ -545,8 +545,13 @@ export function recordOpenPrs(db: DatabaseSync, listing: PrListing, now = new Da
   return { queued, baselined };
 }
 
-const reviewedLastDay = (db: DatabaseSync, now: number) =>
+export const reviewedLastDay = (db: DatabaseSync, now: number) =>
   (db.prepare("SELECT count(*) AS n FROM review_runs WHERE at > ?").get(new Date(now - 86_400_000).toISOString()) as { n: number }).n;
+
+/** One shared daily budget for everything that spends the plan per PR: the reviewer and the AI agents. */
+export const aiBudgetLeft = (db: DatabaseSync, now = Date.now()) => loadReviewSettings(db).dailyLimit - reviewedLastDay(db, now);
+export const recordAiRun = (db: DatabaseSync): number => Number(db.prepare("INSERT INTO review_runs (at) VALUES (?)").run(new Date().toISOString()).lastInsertRowid);
+export const dropAiRun = (db: DatabaseSync, id: number) => { db.prepare("DELETE FROM review_runs WHERE rowid = ?").run(id); };
 
 /** Private refs and no FETCH_HEAD: a pull running in the same clone at the same moment must not see any of this. */
 export function fetchPrObjects(repo: string, number: number, baseRef: string): Promise<string> {

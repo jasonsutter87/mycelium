@@ -232,7 +232,7 @@ mycelium review owner/name 123
 
 ### Key watcher and Fungi
 
-Two more agents on the same page, each with its own check. They use plain rules with no AI, so they're free and also cover PRs from
+Two agents on the same page, each with its own check. They use plain rules with no AI, so they're free and also cover PRs from
 dependency bots and forks. They only read git objects and never run a PR's code.
 
 - **Key watcher** (`Mycelium keys`) looks for known API key formats and secret files in every commit of a PR, so a key added and then deleted is still caught.
@@ -240,9 +240,21 @@ dependency bots and forks. They only read git objects and never run a PR's code.
 - **Fungi** (`Mycelium fungi`) checks packages a PR's lockfile changes add against OSV, and fails on high, critical or malicious. Vulnerabilities that were already there
   stay with Findings. It reads npm, pnpm, yarn, Cargo, NuGet, Python, Go and Gradle dependency files. For others, or a `package.json` with no lockfile, the check says what it couldn't check. A lockfile that won't parse fails the check, and so does an advisory with no usable severity. With nightly fixes on, each `mycelium sync` also opens fix PRs for high and critical production findings, leaving out major upgrades.
 
+### Crimson and Accessibility
+
+Two AI agents on the same page. They ride the reviewer's pipeline (read-only tools, your Claude plan) but run as per-PR checks, so each one is a
+separate lens on the same diff. They need a Claude login or `ANTHROPIC_API_KEY`, skip forks and dependency bots, and share the reviewer's daily limit.
+Adding another AI agent later is one entry in `src/lenses.ts` plus a per-repo toggle — no new pipeline.
+
+- **Crimson** (`Mycelium crimson`) is a red-team pass: it assumes the author may be hostile and looks for backdoors, exfiltration, logic bombs, obfuscation,
+  dynamic code loading, secret access and install-time code. It follows calls across files, resolving names built from strings or config. It fails the check on
+  high or critical. Note: like the reviewer, it sees one PR at a time, so a payload split across several already-merged PRs can still get past it.
+- **Accessibility** (`Mycelium a11y`) checks the diff against WCAG for what's visible in the source: missing labels and alt text, misused ARIA, non-semantic
+  markup, low-contrast tokens. It's advisory — it posts its notes but never fails a check, because source alone can't prove the rendered page is compliant.
+
 ### Choosing repos
 
-Each agent can be on or off per repo under **Which repos** on the Agents page, including Fungi's nightly fixes. You also choose whether repos you start watching later get all three. Turning an agent on for a repo leaves its open PRs alone until they change.
+Each agent can be on or off per repo under **Which repos** on the Agents page, including Fungi's nightly fixes. You also choose whether repos you start watching later get all of them. Turning an agent on for a repo leaves its open PRs alone until they change.
 
 ## Commands
 
@@ -308,6 +320,7 @@ src/
   review.ts           adversarial PR review: agent, read-only tools, queue, GitHub status + comment
   agents.ts, keys.ts  key watcher and fungi: rule-based checks on every PR
   review-tools.ts     those read-only tools as an MCP server, when reviews run through Claude Code
+  lenses.ts           the AI review "lenses": Crimson (red-team) and Accessibility, as data on the reviewer's pipeline
   serve.ts, report.ts dashboard server + HTML
   mcp.ts              MCP tools
 agents/               Claude Code subagent definition

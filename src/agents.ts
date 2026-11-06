@@ -12,35 +12,45 @@ import { emailConfigured, loadAlertSettings, resendSender, type Sender } from ".
 import { scanPatch, type KeyHit } from "./keys.ts";
 import { checkPackages, severityRank, type PackageVuln } from "./osv.ts";
 import { agentOnFor, loadRepoChoices } from "./repos.ts";
-import { fetchPrObjects, type GithubPort, type OpenPr } from "./review.ts";
+import { aiBudgetLeft, dropAiRun, fetchPrObjects, neutralise, prepareDiff, recordAiRun, type GithubPort, type OpenPr, type ReviewEngine, type ReviewFinding, type ReviewResult } from "./review.ts";
+import { AI_LENSES, aiLens, type AiLens } from "./lenses.ts";
 import { parseLockText } from "./scan.ts";
 
 const execFileP = promisify(execFile);
 const git = async (repo: string, args: string[]) => (await execFileP("git", args, { cwd: repo, encoding: "utf8", timeout: 180_000, maxBuffer: 1 << 28 })).stdout;
+// AI agents, like the reviewer, skip forks and dependency bots: untrusted or low-value, and each one spends the plan.
+const DEPENDENCY_BOT = /^(dependabot|renovate|github-actions)(\[bot\])?$/i;
 
-export type AgentName = "keys" | "fungi";
-export const AGENT_CONTEXT: Record<AgentName, string> = { keys: "Mycelium keys", fungi: "Mycelium fungi" };
+export type AgentName = "keys" | "fungi" | "crimson" | "a11y";
+export const RULE_AGENTS: AgentName[] = ["keys", "fungi"];
+const AI_AGENT_IDS = AI_LENSES.map((l) => l.id) as AgentName[];
+export const ALL_AGENTS: AgentName[] = [...RULE_AGENTS, ...AI_AGENT_IDS];
+export const AGENT_CONTEXT: Record<AgentName, string> = { keys: "Mycelium keys", fungi: "Mycelium fungi", ...Object.fromEntries(AI_LENSES.map((l) => [l.id, l.context])) } as Record<AgentName, string>;
 
 export interface AgentSettings {
   keys: boolean;
   fungi: boolean;
   fungiAutoFix: boolean; // after the nightly check, open fix PRs for high and critical production findings
+  crimson: boolean; // red-team AI lens: is this change trying to do something harmful on purpose
+  a11y: boolean; // accessibility AI lens, advisory only
   seen: Record<AgentName, string[]>; // repos that have answered since each agent was turned on. PRs open at that first answer wait until they change
 }
-export const DEFAULT_AGENTS: AgentSettings = { keys: false, fungi: false, fungiAutoFix: false, seen: { keys: [], fungi: [] } };
+export const DEFAULT_AGENTS: AgentSettings = { keys: false, fungi: false, fungiAutoFix: false, crimson: false, a11y: false, seen: { keys: [], fungi: [], crimson: [], a11y: [] } };
 
 export const loadAgentSettings = (db: DatabaseSync): AgentSettings => {
   const row = db.prepare("SELECT value FROM settings WHERE key = 'agents'").get() as { value: string } | undefined;
-  return row ? { ...DEFAULT_AGENTS, ...JSON.parse(row.value) } : DEFAULT_AGENTS;
+  const base = row ? { ...DEFAULT_AGENTS, ...JSON.parse(row.value) } : DEFAULT_AGENTS;
+  return { ...base, seen: { ...DEFAULT_AGENTS.seen, ...base.seen } }; // an older record has no seen list for a newer agent
 };
 const writeSettings = (db: DatabaseSync, s: AgentSettings) =>
   db.prepare("INSERT INTO settings (key, value) VALUES ('agents', ?) ON CONFLICT DO UPDATE SET value = excluded.value").run(JSON.stringify(s));
 
 export function saveAgentSettings(db: DatabaseSync, input: Partial<AgentSettings>): AgentSettings {
   const prev = loadAgentSettings(db);
-  const keys = !!(input.keys ?? prev.keys), fungi = !!(input.fungi ?? prev.fungi);
-  const seen = { keys: keys && prev.keys ? prev.seen.keys : [], fungi: fungi && prev.fungi ? prev.seen.fungi : [] };
-  const settings: AgentSettings = { keys, fungi, fungiAutoFix: !!(input.fungiAutoFix ?? prev.fungiAutoFix), seen };
+  const on = Object.fromEntries(ALL_AGENTS.map((a) => [a, !!(input[a] ?? prev[a])])) as Record<AgentName, boolean>;
+  // Turning an agent off and on again re-baselines it: its open PRs wait until they change, so it doesn't flag a backlog at once.
+  const seen = Object.fromEntries(ALL_AGENTS.map((a) => [a, on[a] && prev[a] ? prev.seen[a] : []])) as Record<AgentName, string[]>;
+  const settings: AgentSettings = { ...on, fungiAutoFix: !!(input.fungiAutoFix ?? prev.fungiAutoFix), seen };
   writeSettings(db, settings);
   return settings;
 }
@@ -153,12 +163,56 @@ export function fungiComment(r: FungiResult): string {
 
 // ---------------------------------------------------------------- the poll
 
-export interface AgentDeps { github: GithubPort; repoPath(slug: string): string | null; baseUrl: string | null; send?: Sender; log?: (s: string) => void; check?: typeof checkPackages }
+const RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
+const COMMENT_CHARS = 60_000; // GitHub refuses comments over 65,536
+
+/** The PR comment for one AI lens, worst finding first, trimmed to fit. Everything from the model is neutralised. */
+export function lensComment(lens: AiLens, repo: string, sha: string, result: ReviewResult): string {
+  const ordered = [...result.findings].sort((a, b) => RANK[a.severity] - RANK[b.severity]);
+  const sections = ordered.map((f) => `### ${f.severity.toUpperCase()}: ${neutralise(f.title).replace(/\s+/g, " ")}${f.file ? ` \u00b7 \`${neutralise(f.file).replace(/[\`\]\[]/g, "")}${f.line > 0 ? `:${f.line}` : ""}\`` : ""}\n\n${neutralise(f.detail)}${f.suggestion ? `\n\n**Fix:** ${neutralise(f.suggestion)}` : ""}`);
+  let body = "", dropped = 0;
+  for (const sec of sections) { if (body.length + sec.length > COMMENT_CHARS) dropped++; else body += (body ? "\n\n" : "") + sec; }
+  if (dropped) body += `\n\n_${dropped} more on the Mycelium dashboard._`;
+  const head = lens.advisory
+    ? `## ${lens.emoji} Mycelium ${lens.id}: ${lens.foundLabel(result.findings.length)} (advisory, never blocks a merge)`
+    : `## ${lens.emoji} Mycelium ${lens.id}: ${result.findings.some(lens.blocks) ? "sent back" : "notes"}`;
+  return `<!-- mycelium-${lens.id} -->\n${head}\n\n${neutralise(result.summary).slice(0, 2000)}\n\n${body}\n\n<sub>Reviewed \`${sha.slice(0, 7)}\`. An AI review can miss things, and Mycelium never merges on its own.</sub>`;
+}
+
+// A review that stopped early says so in its summary and brings back no findings. These are the phrasings the model
+// uses when a safety classifier or a limit cut it off; matching them lets an unfinished review fail closed, not pass.
+const INCOMPLETE_REVIEW = /safety classifier|did ?n.t (finish|complete)|could ?n.t (finish|complete)|was stopped|not (a )?clean result|no findings (are|were) recorded|assessment .{0,40}withheld|a human should review/i;
+
+interface LensOutcome { bad: boolean; description: string; details: ReviewFinding[]; body: string | null; note: string | null }
+
+/** Runs one AI lens on a PR's diff. Uses the same fetch, diff prep, and engine as the reviewer. */
+async function runAiLens(engine: ReviewEngine, lens: AiLens, repoPath: string, p: OpenPr, previousComment: boolean): Promise<LensOutcome> {
+  await fetchPrObjects(repoPath, p.number, p.baseRef);
+  const raw = await git(repoPath, ["-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames", `${p.baseSha}...${p.sha}`]);
+  const { diff, omitted, tooLarge } = prepareDiff(raw);
+  if (tooLarge) return { bad: false, description: "Too large to review automatically", details: [], body: null, note: "The diff was too large to review automatically." };
+  const { result } = await engine({ repo: p.repo, number: p.number, title: p.title, body: p.body, author: p.author, baseRef: p.baseRef, diff, omitted }, repoPath, p.sha, lens.system);
+  // A review that didn't finish is never a pass. A safety classifier can stop a red-team pass on the very code that
+  // most needs it, and the model then returns no findings with a summary admitting it stopped. Fail closed: a blocking
+  // lens sends it back for a person; an advisory one just says so.
+  if (!result.findings.length && INCOMPLETE_REVIEW.test(result.summary)) {
+    const body = `<!-- mycelium-${lens.id} -->\n## ${lens.emoji} Mycelium ${lens.id}: couldn't finish this review\n\n${neutralise(result.summary).slice(0, 1000)}\n\n<sub>An unfinished review isn't a pass. A person should look at this PR before merging.</sub>`;
+    return { bad: !lens.advisory, description: lens.advisory ? "Couldn't finish — needs a human" : "Couldn't finish the review — needs a human", details: [], body, note: "The review didn't finish." };
+  }
+  const blocking = lens.advisory ? [] : result.findings.filter(lens.blocks);
+  const bad = blocking.length > 0;
+  const description = bad ? lens.foundLabel(blocking.length) : result.findings.length && lens.advisory ? lens.foundLabel(result.findings.length) : lens.passLabel;
+  const body = result.findings.length ? lensComment(lens, p.repo, p.sha, result)
+    : previousComment ? `<!-- mycelium-${lens.id} -->\n## ${lens.emoji} Mycelium ${lens.id}: nothing to flag in the latest commit` : null;
+  return { bad, description, details: result.findings, body, note: null };
+}
+
+export interface AgentDeps { github: GithubPort; repoPath(slug: string): string | null; baseUrl: string | null; send?: Sender; log?: (s: string) => void; check?: typeof checkPackages; engine?: ReviewEngine }
 
 export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentDeps): Promise<{ checked: number; failed: number }> {
   db.exec(SCHEMA);
   const settings = loadAgentSettings(db);
-  const enabled = (["keys", "fungi"] as AgentName[]).filter((a) => settings[a]);
+  const enabled = [...RULE_AGENTS.filter((a) => settings[a]), ...(deps.engine ? AI_AGENT_IDS.filter((a) => settings[a]) : [])];
   if (!enabled.length) return { checked: 0, failed: 0 };
   const choices = loadRepoChoices(db);
   const onFor = (agent: AgentName) => repos.filter((r) => agentOnFor(choices, r, agent));
@@ -193,7 +247,7 @@ export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentD
           details = hits;
           description = bad ? `${hits.length} possible key${hits.length === 1 ? "" : "s"} committed` : "No keys found";
           body = bad ? keysComment(p.repo, hits) : previous ? "<!-- mycelium-keys -->\n## 🔑 Mycelium keys: no keys in the latest commit\n\nIf an earlier commit in this PR had a real key, it's still in the history, and it still needs replacing." : null;
-        } else {
+        } else if (agent === "fungi") {
           const r = await checkDependencies(repo, p, deps.check);
           const blocking = r.added.filter(FUNGI_BLOCKS);
           bad = blocking.length > 0 || r.unreadable.length > 0;
@@ -202,6 +256,21 @@ export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentD
           note = gaps.length ? `Couldn't check ${gaps.join(", ")}` : null;
           description = blocking.length ? `Adds ${blocking.length} vulnerable package version${blocking.length === 1 ? "" : "s"}` : r.unreadable.length ? `Couldn't read ${r.unreadable.length} lockfile${r.unreadable.length === 1 ? "" : "s"}` : r.uncheckable.length ? `Couldn't check ${r.uncheckable.length} dependency file${r.uncheckable.length === 1 ? "" : "s"}` : r.added.length ? "Only lower-severity advisories added" : "No new vulnerable packages";
           body = r.added.length || gaps.length ? fungiComment(r) : previous ? "<!-- mycelium-fungi -->\n## 🍄 Mycelium fungi: no new vulnerable packages in the latest commit" : null;
+        } else {
+          // An AI lens (Crimson, a11y). Skip forks and dependency bots once, and stop at the shared daily limit.
+          if (p.fork || DEPENDENCY_BOT.test(p.author ?? "")) {
+            put.run(p.repo, p.number, p.sha, agent, p.title, p.url, "skipped", "[]", "From a fork or a dependency bot, so the AI agents skip it.", null, now);
+            continue;
+          }
+          if (aiBudgetLeft(db) <= 0) continue; // out of budget: leave it unrecorded so it runs after the limit resets
+          const runId = recordAiRun(db);
+          try {
+            const out = await runAiLens(deps.engine!, aiLens(agent)!, repo, p, !!previous);
+            ({ bad, description, details, body, note } = out);
+          } catch (e) {
+            dropAiRun(db, runId); // the run never produced a result, so it shouldn't count against the budget
+            throw e;
+          }
         }
         // The check first: if the comment can't be posted, the PR must still show the result.
         // A repo this account can read but not write to can't take a check. That won't change on a retry, so record the result here and move on.
@@ -249,7 +318,7 @@ export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentD
     const on = new Set(onFor(a));
     return [...new Set([...latest.seen[a], ...listing.answered])].filter((r) => on.has(r));
   };
-  writeSettings(db, { ...latest, seen: { keys: nextSeen("keys"), fungi: nextSeen("fungi") } });
+  writeSettings(db, { ...latest, seen: Object.fromEntries(ALL_AGENTS.map((a) => [a, nextSeen(a)])) as Record<AgentName, string[]> });
   if (firstError) throw firstError;
   return { checked, failed };
 }
@@ -258,8 +327,8 @@ async function emailFailure(db: DatabaseSync, agent: AgentName, p: OpenPr, descr
   const to = loadAlertSettings(db).recipients;
   if (!to.length || !emailConfigured()) return;
   const h = (s: unknown) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
-  const what = agent === "keys" ? "Possible API key committed" : "New vulnerable package";
-  const advice = agent === "keys" ? "If it's real, replace the key first. It's already on GitHub." : "Upgrade it on the PR's branch.";
+  const what = agent === "keys" ? "Possible API key committed" : agent === "fungi" ? "New vulnerable package" : agent === "crimson" ? "Suspicious change flagged by Crimson" : "Issue found";
+  const advice = agent === "keys" ? "If it's real, replace the key first. It's already on GitHub." : agent === "fungi" ? "Upgrade it on the PR's branch." : "Read the PR comment and decide before merging.";
   try {
     await (deps.send ?? resendSender)({
       to,
@@ -281,7 +350,7 @@ export function agentsView(db: DatabaseSync) {
   const rows = all.filter((r) => agentOnFor(choices, r.repo, r.agent)); // turned off for a repo means off this list too
   return {
     settings: loadAgentSettings(db),
-    totals: { keys: totals("keys"), fungi: totals("fungi") },
+    totals: { keys: totals("keys"), fungi: totals("fungi"), crimson: totals("crimson"), a11y: totals("a11y") },
     problems: rows.filter((r) => r.state === "failed").slice(0, 30).map((r) => ({ agent: r.agent, repo: r.repo, number: r.number, sha: r.sha, title: r.title, url: r.url, at: r.checked_at, details: JSON.parse(r.details), note: r.note })),
     gaps: rows.filter((r) => r.state === "passed" && r.note).slice(0, 10).map((r) => ({ repo: r.repo, number: r.number, title: r.title, url: r.url, note: r.note })),
   };

@@ -201,7 +201,9 @@ export function serve(db: DatabaseSync, port: number) {
     if (agentPoll.running || !cfg.repos) return;
     agentPoll.running = true;
     try {
-      await pollAgents(db, watchedList(), { github: githubPort, repoPath: reviewRepoPath, baseUrl, log: (s) => console.error(s) });
+      const kind = await reviewEngine();
+      const engine = kind === "api" ? apiEngine(new Anthropic() as unknown as ReviewClient) : kind === "claude-code" ? claudeCodeEngine : undefined;
+      await pollAgents(db, watchedList(), { github: githubPort, repoPath: reviewRepoPath, baseUrl, log: (s) => console.error(s), engine });
       agentPoll.lastError = null;
     } catch (e) {
       console.error("PR agents:", e);

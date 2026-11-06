@@ -140,5 +140,5 @@ test("agents can be chosen per repo, and later repos follow their own setting", 
   assert.throws(() => saveRepoChoices(db, { changes: [{ slug: "x/y", agent: "keys", on: true }] }, ["o/a"]), /isn't being watched/);
   assert.throws(() => saveRepoChoices(db, { changes: [{ slug: "o/a", agent: "nope", on: true }] }, ["o/a"]), /no agent/);
   assert.throws(() => saveRepoChoices(db, { changes: [{ slug: "o/a", agent: "keys", on: "yes" }] }, ["o/a"]), /on or off/);
-  assert.deepEqual(repoChoicesView(db, ["o/a"]).repos, [{ slug: "o/a", review: false, keys: true, fungi: true }]);
+  assert.deepEqual(repoChoicesView(db, ["o/a"]).repos, [{ slug: "o/a", review: false, keys: true, fungi: true, crimson: true, a11y: true }]);
 });

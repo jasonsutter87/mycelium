@@ -8,7 +8,8 @@ import { agentsView, checkDependencies, checkKeys, fungiComment, keysComment, po
 import { openDb } from "../src/db.ts";
 import { saveRepoChoices } from "../src/repos.ts";
 import { describeHits, redactKeys, scanLine, scanPatch } from "../src/keys.ts";
-import type { GithubPort, OpenPr } from "../src/review.ts";
+import type { GithubPort, OpenPr, ReviewEngine } from "../src/review.ts";
+import { loadAgentSettings } from "../src/agents.ts";
 
 // Assembled at run time, so this file doesn't trip the very check it tests.
 const GH = "ghp" + "_" + "Ab1".repeat(12);
@@ -354,4 +355,78 @@ test("an agent switched on during a pass still leaves open PRs alone", async () 
     assert.equal(ran, 0, "the PR was already open, so fungi waits for it to change");
     assert.equal((db.prepare("SELECT state FROM agent_checks WHERE agent = 'fungi'").get() as any).state, "skipped");
   } finally { r.cleanup(); }
+});
+
+
+test("settings: Crimson and a11y save, re-baseline when toggled, and old records gain their seen lists", () => {
+  const db = openDb(":memory:");
+  const s1 = saveAgentSettings(db, { crimson: true, a11y: true });
+  assert.equal(s1.crimson, true);
+  assert.equal(s1.a11y, true);
+  assert.deepEqual(s1.seen.crimson, []);
+  // Pretend a poll recorded that o/r has been seen by crimson.
+  db.prepare("UPDATE settings SET value = ? WHERE key = 'agents'").run(JSON.stringify({ ...s1, seen: { ...s1.seen, crimson: ["o/r"] } }));
+  // Turning it off and on again clears that, so its open PRs wait instead of flagging a backlog.
+  saveAgentSettings(db, { crimson: false });
+  const s2 = saveAgentSettings(db, { crimson: true });
+  assert.deepEqual(s2.seen.crimson, []);
+  // A record written before a11y existed still loads with an a11y seen list.
+  db.prepare("UPDATE settings SET value = ? WHERE key = 'agents'").run(JSON.stringify({ keys: true, fungi: false, fungiAutoFix: false, seen: { keys: [], fungi: [] } }));
+  assert.deepEqual(loadAgentSettings(db).seen.a11y, []);
+});
+
+test("Crimson blocks on a high finding; a11y is advisory; both count against the shared budget", async () => {
+  const r = repo();
+  try {
+    const db = openDb(":memory:");
+    const engine: ReviewEngine = async (_input, _repo, _sha, system) => {
+      const crimson = /red-team/.test(system ?? "");
+      return { result: { summary: crimson ? "a backdoor" : "a missing label",
+        findings: [{ severity: "high", category: crimson ? "security" : "a11y", file: "a.ts", line: 1, title: crimson ? "backdoor" : "no label", detail: "d", suggestion: "s" }] }, costUsd: null };
+    };
+    saveAgentSettings(db, { crimson: true, a11y: true });
+    const first = r.commit({ "a.ts": "export const a = 2;\n" });
+    const open = [pr(r, first, { author: "alice" })];
+    const gh = fake(open);
+    const deps: AgentDeps = { github: gh.github, repoPath: () => r.dir, baseUrl: null, engine };
+    withOrigin(r, first);
+    await pollAgents(db, ["o/r"], deps); // PRs already open are baselined, not reviewed
+    assert.equal(gh.statuses.length, 0);
+
+    const next = r.commit({ "a.ts": "export const a = 3;\n" });
+    execFileSync("git", ["update-ref", "refs/pull/1/head", next], { cwd: r.dir, stdio: "ignore" });
+    open[0] = pr(r, next, { baseSha: first, author: "alice" });
+    await pollAgents(db, ["o/r"], deps);
+    const last = (c: string) => gh.statuses.filter((s) => s.context === c).at(-1);
+    assert.equal(last("Mycelium crimson")!.state, "failure", "a high red-team finding blocks");
+    assert.equal(last("Mycelium a11y")!.state, "success", "a11y is advisory and never blocks");
+    assert.equal((db.prepare("SELECT count(*) AS n FROM review_runs").get() as { n: number }).n, 2, "each lens run counts against the daily budget");
+    assert.ok(gh.comments.some((c) => /Mycelium crimson/.test(c.body)) && gh.comments.some((c) => /advisory/.test(c.body)));
+  } finally {
+    r.cleanup();
+  }
+});
+
+test("AI lenses need an engine, and skip forks and dependency bots", async () => {
+  const r = repo();
+  try {
+    const db = openDb(":memory:");
+    let called = 0;
+    const engine: ReviewEngine = async () => { called++; return { result: { summary: "", findings: [] }, costUsd: null }; };
+    saveAgentSettings(db, { crimson: true });
+    const first = r.commit({ "a.ts": "export const a = 2;\n" });
+    withOrigin(r, first);
+    // No engine: the lens is disabled, so nothing is even listed.
+    assert.deepEqual(await pollAgents(db, ["o/r"], { github: fake([pr(r, first)]).github, repoPath: () => r.dir, baseUrl: null }), { checked: 0, failed: 0 });
+    // With an engine: baseline the already-open PR, then a dependency-bot PR is skipped without calling the engine.
+    await pollAgents(db, ["o/r"], { github: fake([pr(r, first)]).github, repoPath: () => r.dir, baseUrl: null, engine });
+    const next = r.commit({ "a.ts": "export const a = 3;\n" });
+    execFileSync("git", ["update-ref", "refs/pull/1/head", next], { cwd: r.dir, stdio: "ignore" });
+    const gh = fake([pr(r, next, { baseSha: first, author: "dependabot[bot]" })]);
+    await pollAgents(db, ["o/r"], { github: gh.github, repoPath: () => r.dir, baseUrl: null, engine });
+    assert.equal(called, 0, "the engine never ran for a dependency-bot PR");
+    assert.equal(gh.statuses.length, 0, "a skipped PR posts no check");
+  } finally {
+    r.cleanup();
+  }
 });
