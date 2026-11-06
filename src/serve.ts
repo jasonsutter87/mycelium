@@ -197,21 +197,37 @@ export function serve(db: DatabaseSync, port: number) {
     return path && existsSync(join(path, ".git")) ? path : null;
   };
   const agentPoll: { running: boolean; lastError: string | null } = { running: false, lastError: null };
-  let agentsPausedUntil = 0; // after a plan limit or outage, the AI agents shouldn't hammer the engine every two minutes
   const pollAgentsNow = async () => {
-    if (agentPoll.running || !cfg.repos || Date.now() < agentsPausedUntil) return;
+    if (agentPoll.running || !cfg.repos) return;
     agentPoll.running = true;
     try {
-      const kind = await reviewEngine();
-      const engine = kind === "api" ? apiEngine(new Anthropic() as unknown as ReviewClient) : kind === "claude-code" ? claudeCodeEngine : undefined;
-      await pollAgents(db, watchedList(), { github: githubPort, repoPath: reviewRepoPath, baseUrl, log: (s) => console.error(s), engine });
+      await pollAgents(db, watchedList(), { github: githubPort, repoPath: reviewRepoPath, baseUrl, log: (s) => console.error(s), only: "rules" });
       agentPoll.lastError = null;
     } catch (e) {
       console.error("PR agents:", e);
       agentPoll.lastError = cleanError(e);
-      if (e instanceof EngineTrouble) agentsPausedUntil = Date.now() + 15 * 60_000;
     } finally {
       agentPoll.running = false;
+    }
+  };
+  // The AI lenses (Crimson, a11y) poll on their own flag: a slow review must never hold up the key watcher or Fungi.
+  const lensPoll: { running: boolean; lastError: string | null } = { running: false, lastError: null };
+  let lensesPausedUntil = 0;
+  const pollLensesNow = async () => {
+    if (lensPoll.running || !cfg.repos || Date.now() < lensesPausedUntil) return;
+    lensPoll.running = true;
+    try {
+      const kind = await reviewEngine();
+      const engine = kind === "api" ? apiEngine(new Anthropic() as unknown as ReviewClient) : kind === "claude-code" ? claudeCodeEngine : undefined;
+      if (!engine) return;
+      await pollAgents(db, watchedList(), { github: githubPort, repoPath: reviewRepoPath, baseUrl, log: (s) => console.error(s), engine, only: "ai" });
+      lensPoll.lastError = null;
+    } catch (e) {
+      console.error("AI review agents:", e);
+      lensPoll.lastError = cleanError(e);
+      if (e instanceof EngineTrouble) lensesPausedUntil = Date.now() + 15 * 60_000;
+    } finally {
+      lensPoll.running = false;
     }
   };
   let reviewsPausedUntil = 0; // after a plan limit or an outage, there's no point asking again every two minutes
@@ -389,11 +405,13 @@ export function serve(db: DatabaseSync, port: number) {
       if (p === "/api/agents") {
         saveAgentSettings(db, body);
         void pollAgentsNow();
+        void pollLensesNow();
         return send(res, 200, await reviewView());
       }
       if (p === "/api/agents/repos") {
         saveRepoChoices(db, body, watchedList());
         void pollAgentsNow();
+        void pollLensesNow();
         void pollReviewsNow(true);
         return send(res, 200, await reviewView());
       }
@@ -483,12 +501,13 @@ export function serve(db: DatabaseSync, port: number) {
   });
 
   resetInterrupted(db);
-  setInterval(() => { void pollAgentsNow(); void pollReviewsNow(); }, 2 * 60_000).unref();
+  setInterval(() => { void pollAgentsNow(); void pollLensesNow(); void pollReviewsNow(); }, 2 * 60_000).unref();
 
   server.listen(port, cfg.host, () => {
     setImmediate(() => overview(db)); // warm the slow part, so the first page load is quick
     console.log(`🍄 Mycelium at ${baseUrl}/  ${auth ? "(sign-in on)" : "(this computer only)"}  (Ctrl-C to stop)`);
     void pollAgentsNow();
+    void pollLensesNow();
     void pollReviewsNow();
     if (process.platform === "darwin" && localUrl && !process.env.MYCELIUM_NO_OPEN) execFile("open", [baseUrl + "/"]);
   });

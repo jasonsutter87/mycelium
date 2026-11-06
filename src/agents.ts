@@ -227,12 +227,18 @@ async function runAiLens(engine: ReviewEngine, lens: AiLens, repoPath: string, p
 }
 
 
-export interface AgentDeps { github: GithubPort; repoPath(slug: string): string | null; baseUrl: string | null; send?: Sender; log?: (s: string) => void; check?: typeof checkPackages; engine?: ReviewEngine }
+export interface AgentDeps { github: GithubPort; repoPath(slug: string): string | null; baseUrl: string | null; send?: Sender; log?: (s: string) => void; check?: typeof checkPackages; engine?: ReviewEngine;
+  /** Which agents this pass runs. The AI lenses are slow and spend the plan, so a server runs them on their own poll
+   * (own busy flag), apart from the free rule-based agents, so one can't hold the other up. Omitted runs both. */
+  only?: "rules" | "ai"; }
 
 export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentDeps): Promise<{ checked: number; failed: number }> {
   ensureAgentSchema(db);
   const settings = loadAgentSettings(db);
-  const enabled = [...RULE_AGENTS.filter((a) => settings[a]), ...(deps.engine ? AI_AGENT_IDS.filter((a) => settings[a]) : [])];
+  const enabled = [
+    ...(deps.only === "ai" ? [] : RULE_AGENTS.filter((a) => settings[a])),
+    ...(deps.only === "rules" || !deps.engine ? [] : AI_AGENT_IDS.filter((a) => settings[a])),
+  ];
   if (!enabled.length) return { checked: 0, failed: 0 };
   const choices = loadRepoChoices(db);
   const onFor = (agent: AgentName) => repos.filter((r) => agentOnFor(choices, r, agent));
