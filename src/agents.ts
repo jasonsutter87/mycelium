@@ -179,6 +179,10 @@ export function lensComment(lens: AiLens, repo: string, sha: string, result: Rev
   return `<!-- mycelium-${lens.id} -->\n${head}\n\n${neutralise(result.summary).slice(0, 2000)}\n\n${body}\n\n<sub>Reviewed \`${sha.slice(0, 7)}\`. An AI review can miss things, and Mycelium never merges on its own.</sub>`;
 }
 
+// A review that stopped early says so in its summary and brings back no findings. These are the phrasings the model
+// uses when a safety classifier or a limit cut it off; matching them lets an unfinished review fail closed, not pass.
+const INCOMPLETE_REVIEW = /safety classifier|did ?n.t (finish|complete)|could ?n.t (finish|complete)|was stopped|not (a )?clean result|no findings (are|were) recorded|assessment .{0,40}withheld|a human should review/i;
+
 interface LensOutcome { bad: boolean; description: string; details: ReviewFinding[]; body: string | null; note: string | null }
 
 /** Runs one AI lens on a PR's diff. Uses the same fetch, diff prep, and engine as the reviewer. */
@@ -188,6 +192,13 @@ async function runAiLens(engine: ReviewEngine, lens: AiLens, repoPath: string, p
   const { diff, omitted, tooLarge } = prepareDiff(raw);
   if (tooLarge) return { bad: false, description: "Too large to review automatically", details: [], body: null, note: "The diff was too large to review automatically." };
   const { result } = await engine({ repo: p.repo, number: p.number, title: p.title, body: p.body, author: p.author, baseRef: p.baseRef, diff, omitted }, repoPath, p.sha, lens.system);
+  // A review that didn't finish is never a pass. A safety classifier can stop a red-team pass on the very code that
+  // most needs it, and the model then returns no findings with a summary admitting it stopped. Fail closed: a blocking
+  // lens sends it back for a person; an advisory one just says so.
+  if (!result.findings.length && INCOMPLETE_REVIEW.test(result.summary)) {
+    const body = `<!-- mycelium-${lens.id} -->\n## ${lens.emoji} Mycelium ${lens.id}: couldn't finish this review\n\n${neutralise(result.summary).slice(0, 1000)}\n\n<sub>An unfinished review isn't a pass. A person should look at this PR before merging.</sub>`;
+    return { bad: !lens.advisory, description: lens.advisory ? "Couldn't finish — needs a human" : "Couldn't finish the review — needs a human", details: [], body, note: "The review didn't finish." };
+  }
   const blocking = lens.advisory ? [] : result.findings.filter(lens.blocks);
   const bad = blocking.length > 0;
   const description = bad ? lens.foundLabel(blocking.length) : result.findings.length && lens.advisory ? lens.foundLabel(result.findings.length) : lens.passLabel;
