@@ -7,6 +7,7 @@ import { join } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { openDb } from "../src/db.ts";
 import { withoutServiceKeys } from "../src/net.ts";
+import { saveRepoChoices } from "../src/repos.ts";
 import {
   apiEngine, isSensitivePath, fetchPrObjects, statusDescription, withheldFindings, buildComment, buildPrompt, claudeCodeArgs, EngineTrouble, parseClaudeCodeOutput, ReviewFailed, neutralise, openPrsQuery, pollReviews, prepareDiff, recordOpenPrs, redactSecrets, requeueReview, resetInterrupted, reviewOne, runReviewAgent, runTool,
   saveReviewSettings, reviewsView, verdictOf, type GithubPort, type OpenPr, type ReviewClient, type ReviewFinding, type ReviewInput,
@@ -588,4 +589,32 @@ test("Review again on a review that hasn't posted yet can't get stuck", async ()
     await pollReviews(db, ["o/r"], { github, engine: async () => { throw new Error("no"); }, repoPath: () => r.clone, baseUrl: null });
     assert.equal(stateOf(db).state, "queued");
   } finally { r.cleanup(); }
+});
+
+// ---------------------------------------------------------------- choosing repos
+
+test("the reviewer skips a repo it's off for, and PRs there wait again when it's turned back on", async () => {
+  const db = openDb(":memory:");
+  live(db);
+  const asked: string[][] = [];
+  const list: OpenPr[] = [pr({ sha: "s1" }), pr({ repo: "o/other", number: 2, sha: "o1" })];
+  const github = { ...fakeGithub([]).github, listOpenPrs: async (repos: string[]) => { asked.push(repos); return { prs: list.filter((p) => repos.includes(p.repo)), answered: repos, partial: [] }; } };
+  const deps = { github, engine: async () => ({ result: { summary: "s", findings: [] }, costUsd: null }), repoPath: () => null, baseUrl: null };
+  const all = ["o/r", "o/other"];
+  saveRepoChoices(db, { changes: [{ slug: "o/other", agent: "review", on: false }] }, all);
+  await pollReviews(db, all, deps);
+  assert.deepEqual(asked.at(-1), ["o/r"]);
+  assert.equal(stateOf(db, "o1"), undefined, "nothing recorded for it");
+  assert.equal(stateOf(db, "s1").state, "queued");
+
+  saveRepoChoices(db, { changes: [{ slug: "o/r", agent: "review", on: false }] }, all);
+  await pollReviews(db, all, deps);
+  assert.match(stateOf(db, "s1").note, /off for this repo/);
+  const calls = asked.length;
+  await pollReviews(db, all, deps);
+  assert.equal(asked.length, calls, "with none on, GitHub isn't asked at all");
+
+  saveRepoChoices(db, { changes: [{ slug: "o/other", agent: "review", on: true }] }, all);
+  await pollReviews(db, all, deps);
+  assert.match(stateOf(db, "o1").note, /Already open/);
 });

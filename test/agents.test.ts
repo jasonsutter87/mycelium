@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { agentsView, checkDependencies, checkKeys, fungiComment, keysComment, pollAgents, saveAgentSettings, type AgentDeps } from "../src/agents.ts";
 import { openDb } from "../src/db.ts";
+import { saveRepoChoices } from "../src/repos.ts";
 import { describeHits, redactKeys, scanLine, scanPatch } from "../src/keys.ts";
 import type { GithubPort, OpenPr } from "../src/review.ts";
 
@@ -282,5 +283,29 @@ test("an advisory with no usable severity fails, and a fixed or closed PR leaves
     await pollAgents(db, ["o/r"], { github: gh.github, repoPath: () => r.dir, baseUrl: null, check: unknown });
     assert.equal(agentsView(db).problems.length, 0, "the PR closed");
     assert.equal(agentsView(db).totals.fungi.failed, 1, "but it still counts as flagged");
+  } finally { r.cleanup(); }
+});
+
+test("each agent only runs on its chosen repos, and a repo turned off leaves the flagged list", async () => {
+  const r = repo();
+  try {
+    const db = openDb(":memory:");
+    saveAgentSettings(db, { keys: true, fungi: true });
+    await pollAgents(db, ["o/r"], { github: fake([]).github, repoPath: () => r.dir, baseUrl: null });
+    const sha = r.commit({ "a.ts": `export const k = "${GH}";\n` });
+    withOrigin(r, sha);
+    saveRepoChoices(db, { changes: [{ slug: "o/r", agent: "fungi", on: false }] }, ["o/r"]);
+    const gh = fake([pr(r, sha)]);
+    const deps: AgentDeps = { github: gh.github, repoPath: () => r.dir, baseUrl: null, check: async () => { throw new Error("fungi shouldn't run"); } };
+    assert.deepEqual(await pollAgents(db, ["o/r"], deps), { checked: 1, failed: 1 });
+    assert.deepEqual(gh.statuses.map((s) => s.context), ["Mycelium keys"]);
+    assert.equal(agentsView(db).problems.length, 1);
+    saveRepoChoices(db, { changes: [{ slug: "o/r", agent: "keys", on: false }] }, ["o/r"]);
+    assert.equal(agentsView(db).problems.length, 0);
+    const before = gh.statuses.length;
+    let asked = 0;
+    await pollAgents(db, ["o/r"], { ...deps, github: { ...gh.github, listOpenPrs: async () => { asked++; return { prs: [], answered: [], partial: [] }; } } });
+    assert.equal(asked, 0, "with every agent off for every repo, GitHub isn't asked");
+    assert.equal(gh.statuses.length, before);
   } finally { r.cleanup(); }
 });

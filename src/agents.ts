@@ -11,6 +11,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { emailConfigured, loadAlertSettings, resendSender, type Sender } from "./alerts.ts";
 import { scanPatch, type KeyHit } from "./keys.ts";
 import { checkPackages, severityRank, type PackageVuln } from "./osv.ts";
+import { agentOnFor, loadRepoChoices } from "./repos.ts";
 import { fetchPrObjects, type GithubPort, type OpenPr } from "./review.ts";
 import { parseLockText } from "./scan.ts";
 
@@ -159,8 +160,11 @@ export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentD
   const settings = loadAgentSettings(db);
   const enabled = (["keys", "fungi"] as AgentName[]).filter((a) => settings[a]);
   if (!enabled.length) return { checked: 0, failed: 0 };
-  const listing = await deps.github.listOpenPrs(repos);
-  if (repos.length && !listing.answered.length) throw new Error("GitHub didn't answer for any watched repo. Check that `gh auth status` works on this server.");
+  const choices = loadRepoChoices(db);
+  const onFor = (agent: AgentName) => repos.filter((r) => agentOnFor(choices, r, agent));
+  const wanted = repos.filter((r) => enabled.some((a) => agentOnFor(choices, r, a)));
+  const listing = wanted.length ? await deps.github.listOpenPrs(wanted) : { prs: [], answered: [], partial: [] };
+  if (wanted.length && !listing.answered.length) throw new Error("GitHub didn't answer for any watched repo. Check that `gh auth status` works on this server.");
   const open = listing.prs.filter((p) => !p.draft);
   const seen = db.prepare("SELECT 1 FROM agent_checks WHERE repo = ? AND number = ? AND sha = ? AND agent = ?");
   const put = db.prepare("INSERT OR REPLACE INTO agent_checks (repo, number, sha, agent, title, url, state, details, note, comment_id, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
@@ -168,7 +172,9 @@ export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentD
   let checked = 0, failed = 0, firstError: unknown = null;
   for (const agent of enabled) {
     const seenRepos = new Set(settings.seen[agent]);
+    const onHere = new Set(onFor(agent));
     for (const p of open) {
+      if (!onHere.has(p.repo)) continue;
       if (seen.get(p.repo, p.number, p.sha, agent)) continue;
       const now = new Date().toISOString();
       if (!seenRepos.has(p.repo)) {
@@ -227,7 +233,13 @@ export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentD
     if (complete.includes(r.repo) && !openNow.has(`${r.repo}#${r.number}`)) db.prepare("UPDATE agent_checks SET state = 'closed' WHERE state = 'failed' AND repo = ? AND number = ?").run(r.repo, r.number);
   }
   const latest = loadAgentSettings(db);
-  writeSettings(db, { ...latest, seen: { keys: latest.keys ? [...new Set([...latest.seen.keys, ...listing.answered])] : [], fungi: latest.fungi ? [...new Set([...latest.seen.fungi, ...listing.answered])] : [] } });
+  // A repo that's off drops out, so its open PRs wait again when it's turned back on.
+  const nextSeen = (a: AgentName) => {
+    if (!latest[a]) return [];
+    const on = new Set(onFor(a));
+    return [...new Set([...latest.seen[a], ...listing.answered])].filter((r) => on.has(r));
+  };
+  writeSettings(db, { ...latest, seen: { keys: nextSeen("keys"), fungi: nextSeen("fungi") } });
   if (firstError) throw firstError;
   return { checked, failed };
 }
@@ -254,7 +266,9 @@ export function agentsView(db: DatabaseSync) {
   db.exec(SCHEMA);
   const totals = (agent: string) => db.prepare("SELECT count(*) AS checked, COALESCE(sum(state IN ('failed', 'closed')), 0) AS failed FROM agent_checks WHERE agent = ? AND state != 'skipped'").get(agent) as { checked: number; failed: number };
   // Each PR's latest commit per agent: a failure that a later commit fixed is over.
-  const rows = db.prepare(`SELECT * FROM agent_checks a WHERE state IN ('passed', 'failed') AND checked_at = (SELECT max(checked_at) FROM agent_checks b WHERE b.repo = a.repo AND b.number = a.number AND b.agent = a.agent AND b.state != 'skipped') ORDER BY checked_at DESC LIMIT 200`).all() as any[];
+  const choices = loadRepoChoices(db);
+  const all = db.prepare(`SELECT * FROM agent_checks a WHERE state IN ('passed', 'failed') AND checked_at = (SELECT max(checked_at) FROM agent_checks b WHERE b.repo = a.repo AND b.number = a.number AND b.agent = a.agent AND b.state != 'skipped') ORDER BY checked_at DESC LIMIT 200`).all() as any[];
+  const rows = all.filter((r) => agentOnFor(choices, r.repo, r.agent)); // turned off for a repo means off this list too
   return {
     settings: loadAgentSettings(db),
     totals: { keys: totals("keys"), fungi: totals("fungi") },
