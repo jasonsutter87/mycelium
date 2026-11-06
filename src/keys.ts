@@ -28,10 +28,11 @@ export const KEY_PATTERNS: { kind: string; re: RegExp }[] = [
 
 /** Blanks every known key format. For text about to leave this machine. */
 export const redactKeys = (text: string): string =>
-  KEY_PATTERNS.reduce((t, { kind, re }) => {
-    const all = new RegExp(kind === "private key" ? /-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z]+ )*PRIVATE KEY-----|$)/.source : re.source, "g");
-    return t.replace(all, "[REDACTED]");
-  }, text);
+  KEY_PATTERNS.reduce((t, { re }) => t.replace(new RegExp(re.source, "g"), "[REDACTED]"),
+    // A whole key block, only when it really ends nearby. A lone BEGIN line must never swallow what follows it: that would let
+    // one comment hide the rest of a diff from the reviewer. Then package manager auth lines, which have no recognisable format.
+    text.replace(/-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----[\s\S]{0,12000}?-----END (?:[A-Z]+ )*PRIVATE KEY-----/g, "[REDACTED]")
+      .replace(/^(\s*[-+ ]?\s*\S*(?:_authToken|_auth|_password)\s*=\s*).+$/gm, "$1[REDACTED]"));
 
 // Documentation values and placeholders. `mycelium:allow-key` on the line is the way out for a test fixture.
 const PLACEHOLDER = /EXAMPLE|x{6,}|X{6,}|0{8,}|your[-_]?(?:api[-_]?)?key|placeholder|<[a-z_-]+>/i;
@@ -56,25 +57,44 @@ export function scanPatch(patch: string): KeyHit[] {
   const hits: KeyHit[] = [];
   const seen = new Set<string>();
   let commit: string | null = null, file = "", line = 0;
+  let oldLeft = 0, newLeft = 0; // lines still to come in this hunk. Inside one, anything is content, even a line that looks like a header
+  const secretName = (path: string) => {
+    if (SECRET_FILE.test(path) && !SAFE_FILE.test(path)) add({ kind: "file that holds secrets", file: path, line: 0, commit });
+  };
   const add = (hit: KeyHit) => {
     const key = `${hit.kind}|${hit.file}|${hit.line}`;
     if (!seen.has(key)) { seen.add(key); hits.push(hit); }
   };
   for (const raw of patch.split("\n")) {
+    if (oldLeft > 0 || newLeft > 0) {
+      if (raw.startsWith("+")) {
+        const kind = file ? scanLine(raw.slice(1)) : null;
+        if (kind) add({ kind, file, line, commit });
+        line++;
+        newLeft--;
+      } else if (raw.startsWith("-")) oldLeft--;
+      else if (!raw.startsWith("\\")) { oldLeft--; newLeft--; line++; } // a context line, for patches made with context
+      continue;
+    }
     if (raw.startsWith("commit:")) { commit = raw.slice(7).trim(); continue; }
-    if (raw.startsWith("diff --git ")) { file = ""; continue; }
+    if (raw.startsWith("diff --git ")) {
+      file = "";
+      // Binary files, empty files and pure renames never get a +++ line: this header is all there is.
+      const same = /^diff --git a\/(.+) b\/\1$/.exec(raw);
+      if (same) secretName(same[1]);
+      continue;
+    }
+    if (raw.startsWith("rename to ") || raw.startsWith("copy to ")) { secretName(raw.replace(/^(rename|copy) to /, "")); continue; }
     if (raw.startsWith("+++ ")) {
-      file = raw === "+++ /dev/null" ? "" : raw.slice(4).replace(/^"?b\//, "").replace(/"$/, "");
-      if (file && SECRET_FILE.test(file) && !SAFE_FILE.test(file)) add({ kind: "file that holds secrets", file, line: 0, commit });
+      file = raw === "+++ /dev/null" ? "" : raw.slice(4).replace(/\t$/, "").replace(/^"?b\//, "").replace(/"$/, "");
       continue;
     }
     if (raw.startsWith("--- ")) continue;
-    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
-    if (hunk) { line = Number(hunk[1]); continue; }
-    if (raw.startsWith("+")) {
-      const kind = file ? scanLine(raw.slice(1)) : null;
-      if (kind) add({ kind, file, line, commit });
-      line++;
+    const hunk = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(raw);
+    if (hunk) {
+      oldLeft = hunk[1] === undefined ? 1 : Number(hunk[1]);
+      newLeft = hunk[3] === undefined ? 1 : Number(hunk[3]);
+      line = Number(hunk[2]);
     }
   }
   return hits;

@@ -29,8 +29,8 @@ function repo() {
 test("known key formats are caught, placeholders and marked test values aren't", () => {
   assert.equal(scanLine(`token = "${GH}"`), "GitHub token");
   assert.equal(scanLine(`aws=${AWS}`), "AWS access key");
-  assert.equal(scanLine("-----BEGIN RSA PRIVATE KEY-----"), "private key");
-  assert.equal(scanLine("AKIAIOSFODNN7EXAMPLE"), null);
+  assert.equal(scanLine(["-----BEGIN", "RSA PRIVATE", "KEY-----"].join(" ")), "private key");
+  assert.equal(scanLine("AKIAIOSFODNN7EXAMPLE"), null); // mycelium:allow-key
   assert.equal(scanLine(`t = "${GH}" // mycelium:allow-key`), null);
   assert.equal(scanLine("const version = '1.2.3';"), null);
   assert.ok(!redactKeys(`a ${GH} b ${AWS}`).includes("Ab1Ab1"));
@@ -73,15 +73,15 @@ test("fungi only asks about what the PR adds, and flags a package.json with no l
     });
     assert.deepEqual(asked.sort(), ["npm:fresh@3.0.0", "npm:shared@2.1.0"]);
     assert.equal(out.added[0].lockfile, "package-lock.json");
-    assert.deepEqual(out.manifestOnly, []);
+    assert.deepEqual(out.uncheckable, []);
     assert.match(fungiComment(out), /fresh/);
     const lone = r.commit({ "package.json": '{"name":"x"}' });
-    assert.deepEqual((await checkDependencies(r.dir, { baseSha: sha, sha: lone }, async () => [])).manifestOnly, ["package.json"]);
+    assert.deepEqual((await checkDependencies(r.dir, { baseSha: sha, sha: lone }, async () => [])).uncheckable, ["package.json"]);
   } finally { r.cleanup(); }
 });
 
 test("advisory text can't ping people or inject markup", () => {
-  const c = fungiComment({ manifestOnly: [], added: [{ ecosystem: "npm", name: "p", version: "1", vulnId: "GHSA-1", severity: "HIGH", summary: "hi @octocat <img src=x> ![a](b)", fixed: null, lockfile: "l" }] });
+  const c = fungiComment({ uncheckable: [], unreadable: [], added: [{ ecosystem: "npm", name: "p", version: "1", vulnId: "GHSA-1", severity: "HIGH", summary: "hi @octocat <img src=x> ![a](b)", fixed: null, lockfile: "l" }] });
   assert.ok(!c.includes("@octocat") && !c.includes("<img") && !c.includes("!["));
 });
 
@@ -162,5 +162,56 @@ test("a failed advisory lookup records nothing and retries, and off means off", 
     assert.deepEqual(await pollAgents(db, ["o/r"], deps), { checked: 1, failed: 1 });
     assert.equal(open.statuses.at(-1).context, "Mycelium fungi");
     assert.equal(open.statuses.at(-1).state, "failure", "a malicious package fails whatever its severity says");
+  } finally { r.cleanup(); }
+});
+
+// ---------------------------------------------------------------- what the second real review found
+
+test("binary, renamed and spaced secret files are flagged, and a line that looks like a header can't stop the scan", () => {
+  assert.equal(scanPatch("diff --git a/app.p12 b/app.p12\nnew file mode 100644\nBinary files /dev/null and b/app.p12 differ\n")[0].kind, "file that holds secrets");
+  assert.equal(scanPatch("diff --git a/notes.txt b/.env\nsimilarity index 100%\nrename from notes.txt\nrename to .env\n")[0].file, ".env");
+  assert.equal(scanPatch("diff --git a/.env b/.env\nnew file mode 100644\n")[0].kind, "file that holds secrets");
+  assert.equal(scanPatch("diff --git a/my dir/.env b/my dir/.env\n--- /dev/null\n+++ b/my dir/.env\t\n@@ -0,0 +1 @@\n+A=1\n")[0].file, "my dir/.env");
+  const tricky = `diff --git a/x.ts b/x.ts\n--- a/x.ts\n+++ b/x.ts\n@@ -0,0 +1,2 @@\n+++ /dev/null\n+const k = "${GH}";\n`;
+  assert.deepEqual(scanPatch(tricky), [{ kind: "GitHub token", file: "x.ts", line: 2, commit: null }]);
+});
+
+test("fungi compares with where the branch left off, and a broken lockfile doesn't pass", async () => {
+  const r = repo();
+  try {
+    const g = (...a: string[]) => execFileSync("git", a, { cwd: r.dir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    g("checkout", "-q", "-b", "pr");
+    const sha = r.commit({ "package-lock.json": lock({ old: "1.0.0", shared: "2.0.0", mine: "1.0.0" }) });
+    g("checkout", "-q", "main");
+    const moved = r.commit({ "package-lock.json": lock({ old: "1.0.1", shared: "2.0.0" }) });
+    const asked: string[] = [];
+    await checkDependencies(r.dir, { baseSha: moved, sha }, async (list) => { asked.push(...list.map((p) => p.name)); return []; });
+    assert.deepEqual(asked, ["mine"], "old@1.0.0 only looks new because main moved on");
+
+    g("checkout", "-q", "pr");
+    const broken = r.commit({ "package-lock.json": "<<<<<<< HEAD\n{}\n=======\n{}\n>>>>>>> x\n" });
+    const out = await checkDependencies(r.dir, { baseSha: moved, sha: broken }, async () => []);
+    assert.deepEqual(out.unreadable, ["package-lock.json"]);
+    const gem = r.commit({ "Gemfile.lock": "GEM\n" });
+    assert.deepEqual((await checkDependencies(r.dir, { baseSha: broken, sha: gem }, async () => [])).uncheckable, ["Gemfile.lock"]);
+  } finally { r.cleanup(); }
+});
+
+test("the check is set first and comments are capped, so a failed comment can't hide a result", async () => {
+  const hits = Array.from({ length: 5000 }, (_, i) => ({ kind: "GitHub token", file: `fixtures/some/long/path/file-${i}.txt`, line: 1, commit: "a".repeat(40) }));
+  assert.ok(keysComment("o/r", hits).length < 65_536);
+  assert.match(keysComment("o/r", hits), /And 4900 more/);
+  const r = repo();
+  try {
+    const db = openDb(":memory:");
+    saveAgentSettings(db, { keys: true });
+    const gh = fake([]);
+    await pollAgents(db, ["o/r"], { github: gh.github, repoPath: () => r.dir, baseUrl: null });
+    const sha = r.commit({ "a.ts": `export const k = "${GH}";\n` });
+    withOrigin(r, sha);
+    const open = fake([pr(r, sha)]);
+    const github: GithubPort = { ...open.github, comment: async () => { throw new Error("HTTP 422"); } };
+    assert.deepEqual(await pollAgents(db, ["o/r"], { github, repoPath: () => r.dir, baseUrl: null }), { checked: 1, failed: 1 });
+    assert.equal(open.statuses.at(-1).state, "failure");
   } finally { r.cleanup(); }
 });

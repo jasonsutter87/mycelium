@@ -80,9 +80,12 @@ async function keysCmd() {
   const { describeHits, preCommitHook, scanPatch } = await import("./keys.ts");
   const run = (...a: string[]) => execFileSync("git", a, { encoding: "utf8", maxBuffer: 1 << 28 });
   if (flags.has("--install-hook")) {
-    const { existsSync, chmodSync } = await import("node:fs");
-    const hook = join(run("rev-parse", "--absolute-git-dir").trim(), "hooks", "pre-commit");
+    const { existsSync, chmodSync, mkdirSync } = await import("node:fs");
+    const { dirname } = await import("node:path");
+    // --git-path follows core.hooksPath and worktrees, so this is the file git will really run.
+    const hook = resolve(run("rev-parse", "--git-path", "hooks/pre-commit").trim());
     if (existsSync(hook)) return fail(`${hook} already exists, so it was left alone. Add this line to it: mycelium keys --staged`);
+    mkdirSync(dirname(hook), { recursive: true });
     writeFileSync(hook, preCommitHook(join(import.meta.dirname, "..", "bin", "mycelium")));
     chmodSync(hook, 0o755);
     return console.log(`Installed ${hook}`);

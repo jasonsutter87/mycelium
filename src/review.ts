@@ -99,9 +99,10 @@ export function saveReviewSettings(db: DatabaseSync, input: Partial<ReviewSettin
 
 // ---------------------------------------------------------------- keeping secrets out
 
-const SENSITIVE_PATH = /(^|\/)(\.env(\.[^/]*)?|\.envrc|[^/]*\.env|\.npmrc|\.pypirc|\.netrc|\.git-credentials|id_(rsa|dsa|ecdsa|ed25519)|credentials(\.[^/]*)?|secrets?\.(json|ya?ml|toml))$|\.(pem|key|p12|pfx|jks|keystore|tfvars|tfstate)$/i;
+const SENSITIVE_PATH = /(^|\/)(\.env(\.[^/]*)?|\.envrc|[^/]*\.env|\.pypirc|\.netrc|\.git-credentials|id_(rsa|dsa|ecdsa|ed25519)|credentials(\.(json|ya?ml|toml|ini|txt|csv))?|secrets?\.(json|ya?ml|toml))$|\.(pem|key|p12|pfx|jks|keystore|tfvars|tfstate)$/i;
+const SAFE_EXAMPLE = /\.(example|sample|template|dist|defaults?)$/i;
 const LOCKFILE = /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lock|Cargo\.lock|poetry\.lock|uv\.lock|Gemfile\.lock|composer\.lock|go\.sum|packages\.lock\.json|gradle\.lockfile)$/;
-export const isSensitivePath = (path: string) => SENSITIVE_PATH.test(path);
+export const isSensitivePath = (path: string) => SENSITIVE_PATH.test(path) && !SAFE_EXAMPLE.test(path);
 export const redactSecrets = redactKeys;
 
 /** What's sent as the diff: no sensitive files, big lockfiles reduced to a name, known token shapes blanked out. */
@@ -115,7 +116,8 @@ export function prepareDiff(raw: string): { diff: string; omitted: string[]; too
     if (LOCKFILE.test(path) && section.length > LOCKFILE_DIFF_CHARS) return omitted.push(`${path} (large lockfile)`), false;
     return true;
   });
-  const diff = redactSecrets(kept.join(""));
+  // One file at a time, so nothing in one file can affect what's sent for another.
+  const diff = kept.map(redactSecrets).join("");
   return { diff, omitted, tooLarge: diff.length > MAX_DIFF_CHARS };
 }
 
@@ -241,7 +243,9 @@ export async function detectEngine(env = process.env): Promise<EngineKind | null
   }
 }
 
-const TOO_BIG = /prompt is too long|too many tokens|exceeds? .*(context|token)/i;
+/** Stops the whole queue: nothing about the PR would change the answer. Any other 4xx counts against that one PR. */
+const accountError = (status: number, message: string) =>
+  [401, 403, 429].includes(status) || status >= 500 || (status >= 400 && /credit|balance|billing|model/i.test(message));
 const CLAUDE_TOOLS = ["read_file", "search", "list_files"].map((t) => `mcp__review__${t}`);
 
 /** The whole command line. Claude Code's own tools are off: all it can use is the read-only server, for this one commit. */
@@ -270,8 +274,7 @@ export function parseClaudeCodeOutput(stdout: string): ReviewResult {
     throw new ReviewFailed("The review didn't come back in the expected format.");
   }
   const said = String(out?.result ?? "");
-  // Any API error is about the login, the plan, or the settings, unless the PR itself was too big to send.
-  if (((out?.api_error_status ?? 0) >= 400 && !TOO_BIG.test(said)) || /usage limit|limit reached|hit your limit|not logged in|please run \/login|invalid api key/i.test(out?.is_error ? said : "")) {
+  if (accountError(out?.api_error_status ?? 0, said) || /usage limit|limit reached|hit your limit|not logged in|please run \/login|invalid api key/i.test(out?.is_error ? said : "")) {
     throw new EngineTrouble(out?.api_error_status === 429 || /limit/i.test(said) ? "Your Claude plan's usage limit was reached. Reviews continue when it resets." : out?.api_error_status === 401 || out?.api_error_status === 403 || /log/i.test(said) ? "Claude Code on this server isn't logged in. Run claude there to log in." : `Anthropic returned an error (${out?.api_error_status ?? "no status"}).`);
   }
   if (out?.is_error || out?.subtype !== "success") throw new ReviewFailed("The review didn't finish.");
@@ -293,10 +296,13 @@ export const claudeCodeEngine: ReviewEngine = async (input, repo, sha) => {
   try {
     const stdout = await new Promise<string>((resolve, reject) => {
       const child = execFile("claude", claudeCodeArgs(repo, sha, toolsScript), { cwd, env: claudeCodeEnv(), encoding: "utf8", timeout: CLAUDE_CODE_TIMEOUT_MS, maxBuffer: 1 << 26 }, (err, out, stderr) => {
+        // Nothing is printed until the end, so a timeout looks empty too. That's about this PR, not the login.
+        if (err && (err as any).killed) reject(new Error(`The review didn't finish within ${CLAUDE_CODE_TIMEOUT_MS / 60_000} minutes.`));
         // A failed run still prints its JSON, and that says why. No JSON at all is the CLI itself failing.
-        if (err && !String(out).trim()) reject(new EngineTrouble(`Claude Code couldn't run: ${String(stderr || err.message).trim().split("\n")[0].slice(0, 200)}`));
+        else if (err && !String(out).trim()) reject(new EngineTrouble(`Claude Code couldn't run: ${String(stderr || err.message).trim().split("\n")[0].slice(0, 200)}`));
         else resolve(out);
       });
+      child.stdin!.on("error", () => {}); // it exiting early is reported by the callback, and must not take the server down
       child.stdin!.end(buildPrompt(input));
     });
     return { result: parseClaudeCodeOutput(stdout), costUsd: null }; // the JSON's cost is notional here: nothing is billed per review
@@ -401,11 +407,11 @@ export function buildComment(repo: string, sha: string, result: ReviewResult, om
     else body += (body ? "\n\n" : "") + section;
   }
   if (dropped) body += `\n\n_${dropped} lower-severity note${dropped === 1 ? "" : "s"} left out because this comment got too long. All of them are on the Mycelium dashboard._`;
-  const notSeen = omitted.length ? `**Not reviewed:** ${neutralise(omitted.join(", "))}\n\n` : "";
+  const notSeen = omitted.length ? `**Not reviewed:** ${neutralise(omitted.slice(0, 40).join(", "))}${omitted.length > 40 ? `, and ${omitted.length - 40} more` : ""}\n\n` : "";
   const head = verdict === "passed"
     ? `## ✅ Mycelium review: ready for a person to merge${ordered.length ? ` (${ordered.length} minor note${ordered.length === 1 ? "" : "s"})` : ""}`
     : `## ❌ Mycelium review: sent back with notes`;
-  return `${MARKER}\n${head}\n\n${neutralise(result.summary)}\n\n${body}${body ? "\n\n" : ""}${notSeen}<sub>Reviewed \`${sha.slice(0, 7)}\`. An AI review can miss things, and Mycelium never merges on its own.</sub>`;
+  return `${MARKER}\n${head}\n\n${neutralise(result.summary).slice(0, 2000)}\n\n${body}${body ? "\n\n" : ""}${notSeen}<sub>Reviewed \`${sha.slice(0, 7)}\`. An AI review can miss things, and Mycelium never merges on its own.</sub>`;
 }
 
 export const statusDescription = (verdict: "passed" | "sent_back", findings: ReviewFinding[], omitted: string[] = []) => {
@@ -431,6 +437,7 @@ export interface GithubPort {
 const gh = async (args: string[], stdin?: string): Promise<string> => {
   return await new Promise((resolve, reject) => {
     const child = execFile("gh", args, { encoding: "utf8", timeout: 60_000, maxBuffer: 1 << 26 }, (err, stdout, stderr) => (err ? reject(Object.assign(err, { stdout, stderr })) : resolve(stdout)));
+    child.stdin!.on("error", () => {}); // it exiting early is reported by the callback, and must not take the server down
     if (stdin !== undefined) child.stdin!.end(stdin);
   });
 };
@@ -521,8 +528,11 @@ export function recordOpenPrs(db: DatabaseSync, listing: PrListing, now = new Da
     else if (added && baseline) baselined++;
   }
   const complete = new Set(listing.answered.filter((r) => !listing.partial.includes(r)));
+  const listedPrs = new Set(listing.prs.map((p) => `${p.repo}#${p.number}`));
   for (const r of db.prepare("SELECT repo, number, sha FROM reviews WHERE state = 'queued'").all() as { repo: string; number: number; sha: string }[]) {
-    if (complete.has(r.repo) && !heads.has(`${r.repo}#${r.number}@${r.sha}`)) {
+    // Seen with a newer commit counts even from a partial list. Absence only means closed when the list was complete.
+    const gone = !heads.has(`${r.repo}#${r.number}@${r.sha}`) && (complete.has(r.repo) || listedPrs.has(`${r.repo}#${r.number}`));
+    if (gone) {
       db.prepare("UPDATE reviews SET state = 'skipped', note = 'Replaced by a newer commit, or the PR closed.' WHERE repo = ? AND number = ? AND sha = ?").run(r.repo, r.number, r.sha);
     }
   }
@@ -562,7 +572,7 @@ const noteFor = (e: unknown) => {
 
 /** Trouble with the API or the key says nothing about this PR: it keeps its place and the poll stops until the next one. */
 const apiTrouble = (e: unknown) =>
-  e instanceof EngineTrouble || e instanceof Anthropic.AuthenticationError || e instanceof Anthropic.PermissionDeniedError || e instanceof Anthropic.RateLimitError || e instanceof Anthropic.APIConnectionError || (e instanceof Anthropic.APIError && (e.status ?? 0) >= 400 && !TOO_BIG.test(e.message));
+  e instanceof EngineTrouble || e instanceof Anthropic.AuthenticationError || e instanceof Anthropic.PermissionDeniedError || e instanceof Anthropic.RateLimitError || e instanceof Anthropic.APIConnectionError || (e instanceof Anthropic.APIError && accountError(e.status ?? 0, e.message));
 
 /** Reviews one queued commit. It ends as a verdict or an error on GitHub, or stays pending while the API itself is down. */
 export async function reviewOne(db: DatabaseSync, row: Row, deps: ReviewDeps): Promise<void> {
@@ -571,6 +581,7 @@ export async function reviewOne(db: DatabaseSync, row: Row, deps: ReviewDeps): P
   const target = deps.baseUrl?.startsWith("https://") ? deps.baseUrl : null;
   const attempts = row.attempts + 1;
   setRow(db, row, { state: "running", attempts });
+  let runId: number | null = null;
   try {
     await deps.github.setStatus(row.repo, row.sha, "pending", "Reviewing", target);
     await fetchPrObjects(repo, row.number, row.base_ref);
@@ -581,7 +592,7 @@ export async function reviewOne(db: DatabaseSync, row: Row, deps: ReviewDeps): P
       await deps.github.setStatus(row.repo, row.sha, "error", "Too large to review automatically", target);
       return;
     }
-    db.prepare("INSERT INTO review_runs (at) VALUES (?)").run(new Date().toISOString());
+    runId = Number(db.prepare("INSERT INTO review_runs (at) VALUES (?)").run(new Date().toISOString()).lastInsertRowid);
     const { result, costUsd } = await deps.engine({ repo: row.repo, number: row.number, title: row.title, body: row.body, author: row.author, baseRef: row.base_ref, diff, omitted }, repo, row.sha);
     const full = withheldFindings(result, omitted);
     // Saved before anything goes to GitHub, so trouble posting it never means paying for the same review again.
@@ -594,7 +605,8 @@ export async function reviewOne(db: DatabaseSync, row: Row, deps: ReviewDeps): P
     if (finished) return; // the verdict is saved: the next poll retries posting it
     if (apiTrouble(e)) {
       setRow(db, row, { state: "queued", attempts: row.attempts, note });
-      throw new Error(note, { cause: e });
+      if (runId !== null) db.prepare("DELETE FROM review_runs WHERE rowid = ?").run(runId); // an outage or a plan limit isn't a review
+      throw new EngineTrouble(note, { cause: e });
     }
     const giveUp = attempts >= MAX_ATTEMPTS || e instanceof ReviewFailed;
     setRow(db, row, giveUp ? { state: "error", note, reviewed_at: new Date().toISOString() } : { state: "queued", note });
@@ -602,14 +614,17 @@ export async function reviewOne(db: DatabaseSync, row: Row, deps: ReviewDeps): P
   }
 }
 
-/** A changed file the reviewer wasn't allowed to read is a reason for a person to look, not a clean pass. Big lockfiles are only noted: Fungi covers those. */
+/**
+ * A changed file the reviewer wasn't allowed to read goes on the PR for a person to look at. It doesn't fail the check, because nothing
+ * on a PR could ever clear it and a required check would stay red for good. Real keys in those files are the key watcher's job.
+ */
 export function withheldFindings(result: ReviewResult, omitted: string[]): ReviewResult {
   const secret = omitted.filter((o) => o.endsWith("(may hold secrets)")).map((o) => o.replace(/ \(may hold secrets\)$/, ""));
   if (!secret.length) return result;
   return { ...result, findings: [...result.findings, ...secret.map((file): ReviewFinding => ({
-    severity: "high", category: "not-reviewed", file: file === "a file with an unusual name" ? "" : file, line: 0,
+    severity: "medium", category: "not-reviewed", file: file === "a file with an unusual name" ? "" : file, line: 0,
     title: `Changed file wasn't reviewed: ${file}`,
-    detail: "This file may hold secrets, so it wasn't sent to the reviewer. A change here, such as a package registry setting, can matter a lot, and nothing has checked it.",
+    detail: "This file may hold secrets, so it wasn't sent to the reviewer, and nothing has checked this change.",
     suggestion: "Have a person read this file's change. If it holds real secrets, take it out of the PR and replace them.",
   }))] };
 }
@@ -650,7 +665,19 @@ async function emailSentBack(db: DatabaseSync, row: Row, findings: ReviewFinding
 /** One pass of the poller: post anything finished but not yet on GitHub, find new PR heads, then work through the queue up to the daily limit. */
 export async function pollReviews(db: DatabaseSync, repos: string[], deps: ReviewDeps, now = Date.now): Promise<{ reviewed: number; queued: number }> {
   if (!loadReviewSettings(db).enabled) return { reviewed: 0, queued: 0 };
-  for (const row of db.prepare("SELECT * FROM reviews WHERE published = 0").all() as unknown as Row[]) await publishReview(db, row, deps);
+  // One that can't be posted never holds up the rest. After a day it's given up on: the result stays on the dashboard.
+  for (const row of db.prepare("SELECT * FROM reviews WHERE published = 0").all() as unknown as Row[]) {
+    try {
+      await publishReview(db, row, deps);
+    } catch (e) {
+      deps.log?.(`couldn't post the review of ${row.repo}#${row.number}: ${noteFor(e)}`);
+      if (now() - Date.parse(row.reviewed_at ?? new Date(now()).toISOString()) > 86_400_000) setRow(db, row, { published: 1, note: `Couldn't post this to GitHub: ${noteFor(e)}` });
+    }
+  }
+  const watched = new Set(repos);
+  for (const r of db.prepare("SELECT repo, number, sha FROM reviews WHERE state = 'queued'").all() as { repo: string; number: number; sha: string }[]) {
+    if (!watched.has(r.repo)) setRow(db, r, { state: "skipped", note: "This repo is no longer being watched." });
+  }
   const refresh = async () => {
     const listing = await deps.github.listOpenPrs(repos);
     if (repos.length && !listing.answered.length) throw new Error("GitHub didn't answer for any watched repo. Check that `gh auth status` works on this server.");

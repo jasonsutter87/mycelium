@@ -60,55 +60,81 @@ export async function checkKeys(repo: string, p: Pick<OpenPr, "baseSha" | "sha">
 }
 
 export function keysComment(repo: string, hits: KeyHit[]): string {
-  const rows = hits.map((h) => {
+  const rows = hits.slice(0, 100).map((h) => {
     const safe = h.file.replace(/[`[\]<>]/g, "");
     const place = `${safe}${h.line ? `:${h.line}` : ""}`;
     const link = h.commit ? `https://github.com/${repo}/blob/${h.commit}/${safe.split("/").map(encodeURIComponent).join("/")}${h.line ? `#L${h.line}` : ""}` : "";
     return `- **${h.kind}** in ${link ? `[\`${place}\`](${link})` : `\`${place}\``}`;
   });
-  return `<!-- mycelium-keys -->\n## 🔑 Mycelium keys: possible key committed\n\n${rows.join("\n")}\n\n**If it's real, replace it first.** It has already been pushed to GitHub, so treat it as leaked, and deleting it in a new commit doesn't remove it from the branch's history.\n\n<sub>The value isn't shown here on purpose. For a test value, add \`mycelium:allow-key\` to that line.</sub>`;
+  return `<!-- mycelium-keys -->\n## 🔑 Mycelium keys: possible key committed\n\n${rows.join("\n")}${hits.length > 100 ? `\n\n_And ${hits.length - 100} more._` : ""}\n\n**If it's real, replace it first.** It has already been pushed to GitHub, so treat it as leaked, and deleting it in a new commit doesn't remove it from the branch's history.\n\n<sub>The value isn't shown here on purpose. For a test value, add \`mycelium:allow-key\` to that line.</sub>`;
 }
 
 // ---------------------------------------------------------------- fungi
 
-export interface FungiResult { added: (PackageVuln & { lockfile: string })[]; manifestOnly: string[] }
+export interface FungiResult {
+  added: (PackageVuln & { lockfile: string })[];
+  uncheckable: string[]; // dependency files that changed but can't be checked: no lockfile, or one this can't read
+  unreadable: string[]; // lockfiles that wouldn't parse, like ones with merge conflict markers
+}
 export const FUNGI_BLOCKS = (v: PackageVuln) => v.vulnId.startsWith("MAL-") || severityRank(v.severity) >= severityRank("HIGH");
 
 const LOCK_NAME = /^(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock|packages\.lock\.json|poetry\.lock|uv\.lock|Pipfile\.lock|go\.mod)$/;
 
+const UNSUPPORTED_LOCK = /^(bun\.lockb?|Gemfile\.lock|composer\.lock|go\.sum|gradle\.lockfile)$/;
+
+/** Empty when the file isn't in that commit. Null when it's there but can't be parsed. A failure in git itself throws, and the poll retries. */
 const parseAt = async (repo: string, sha: string, path: string) => {
   try {
-    return parseLockText(basename(path), await git(repo, ["show", `${sha}:${path}`]));
+    await git(repo, ["cat-file", "-e", `${sha}:${path}`]);
   } catch {
-    return []; // not in that commit: every package counts as new
+    return [];
+  }
+  const text = await git(repo, ["show", `${sha}:${path}`]);
+  if (/^(<<<<<<<|>>>>>>>) /m.test(text)) return null;
+  try {
+    return parseLockText(basename(path), text);
+  } catch {
+    return null;
   }
 };
 
 /** Only what this PR brings in. A package that was already on the base branch stays with Findings and the normal fix flow. */
 export async function checkDependencies(repo: string, p: Pick<OpenPr, "baseSha" | "sha">, check: typeof checkPackages = checkPackages): Promise<FungiResult> {
-  const changed = (await git(repo, ["diff", "--name-only", "--no-renames", `${p.baseSha}...${p.sha}`])).split("\n").filter(Boolean);
+  // Compared with where the branch left off: a package that only changed on the base branch since then isn't this PR's doing.
+  const forkPoint = (await git(repo, ["merge-base", p.baseSha, p.sha])).trim();
+  const changed = (await git(repo, ["-c", "core.quotePath=false", "diff", "--name-only", "--no-renames", `${forkPoint}...${p.sha}`])).split("\n").filter(Boolean);
   const locks = changed.filter((f) => LOCK_NAME.test(basename(f)));
   const dirOf = (f: string) => f.slice(0, Math.max(0, f.lastIndexOf("/")));
-  const manifestOnly = changed.filter((f) => basename(f) === "package.json" && !locks.some((l) => dirOf(l) === dirOf(f)));
+  const uncheckable = changed.filter((f) => UNSUPPORTED_LOCK.test(basename(f)) || (basename(f) === "package.json" && !locks.some((l) => dirOf(l) === dirOf(f)) && !changed.some((o) => UNSUPPORTED_LOCK.test(basename(o)) && dirOf(o) === dirOf(f))));
+  const unreadable: string[] = [];
   const fresh = new Map<string, { ecosystem: string; name: string; version: string; lockfile: string }>();
   for (const lock of locks) {
     const key = (x: { name: string; version: string }) => `${x.name}@${x.version}`;
-    const before = new Set((await parseAt(repo, p.baseSha, lock)).map(key));
-    for (const pkg of await parseAt(repo, p.sha, lock)) {
+    const older = await parseAt(repo, forkPoint, lock), newer = await parseAt(repo, p.sha, lock);
+    if (!older || !newer) { unreadable.push(lock); continue; }
+    const before = new Set(older.map(key));
+    for (const pkg of newer) {
       if (!before.has(key(pkg)) && !fresh.has(`${pkg.ecosystem}|${key(pkg)}`)) fresh.set(`${pkg.ecosystem}|${key(pkg)}`, { ...pkg, lockfile: lock });
     }
   }
   const list = [...fresh.values()];
   const added = (await check(list)).map((v) => ({ ...v, lockfile: list.find((x) => x.name === v.name && x.version === v.version && x.ecosystem === v.ecosystem)!.lockfile }));
-  return { added: added.sort((a, b) => severityRank(b.severity) - severityRank(a.severity)), manifestOnly };
+  return { added: added.sort((a, b) => severityRank(b.severity) - severityRank(a.severity)), uncheckable, unreadable };
 }
 
+const MAX_ROWS = 100; // a table this long has made its point, and GitHub refuses comments over 65,536 characters
 const plain = (s: string) => s.replace(/:\/\//g, " ").replace(/[<>[\]`@!#]/g, " ").replace(/\s+/g, " ").trim(); // advisory text comes from outside
 
 export function fungiComment(r: FungiResult): string {
   const row = (v: FungiResult["added"][number]) => `| ${v.vulnId.startsWith("MAL-") ? "MALICIOUS" : v.severity} | \`${plain(v.name)}\` ${plain(v.version)} | ${v.fixed ? plain(v.fixed) : "no fix yet"} | [${plain(v.vulnId)}](https://osv.dev/vulnerability/${encodeURIComponent(v.vulnId)}) ${plain(v.summary).slice(0, 120)} |`;
   const blocking = r.added.filter(FUNGI_BLOCKS);
-  return `<!-- mycelium-fungi -->\n## 🍄 Mycelium fungi: ${blocking.length ? `this PR adds ${blocking.length} vulnerable package version${blocking.length === 1 ? "" : "s"}` : "this PR adds lower-severity advisories"}\n\n| Severity | Package | Fixed in | Advisory |\n|---|---|---|---|\n${r.added.map(row).join("\n")}\n\n<sub>Only what this PR adds. Upgrade these on this branch and push. The check runs again on the new commit.</sub>`;
+  const shown = r.added.slice(0, MAX_ROWS);
+  const title = blocking.length ? `this PR adds ${blocking.length} vulnerable package version${blocking.length === 1 ? "" : "s"}` : r.unreadable.length ? "couldn't read a lockfile" : r.added.length ? "this PR adds lower-severity advisories" : "couldn't check everything";
+  const table = shown.length ? `| Severity | Package | Fixed in | Advisory |\n|---|---|---|---|\n${shown.map(row).join("\n")}${r.added.length > MAX_ROWS ? `\n\n_And ${r.added.length - MAX_ROWS} more._` : ""}\n\n` : "";
+  const list = (l: string[]) => l.slice(0, 40).map((f) => `\`${plain(f)}\``).join(", ") + (l.length > 40 ? `, and ${l.length - 40} more` : "");
+  const unread = r.unreadable.length ? `**Couldn't read:** ${list(r.unreadable)}. It may have merge conflict markers in it.\n\n` : "";
+  const notChecked = r.uncheckable.length ? `**Not checked:** ${list(r.uncheckable)}. Either there's no lockfile showing exact versions, or it's a kind Fungi can't read yet.\n\n` : "";
+  return `<!-- mycelium-fungi -->\n## 🍄 Mycelium fungi: ${title}\n\n${table}${unread}${notChecked}<sub>Only what this PR adds. Upgrade these on this branch and push. The check runs again on the new commit.</sub>`;
 }
 
 // ---------------------------------------------------------------- the poll
@@ -151,14 +177,23 @@ export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentD
         } else {
           const r = await checkDependencies(repo, p, deps.check);
           const blocking = r.added.filter(FUNGI_BLOCKS);
-          bad = blocking.length > 0;
+          bad = blocking.length > 0 || r.unreadable.length > 0;
           details = r.added;
-          note = r.manifestOnly.length ? `${r.manifestOnly.join(", ")} changed without a lockfile, so the exact versions couldn't be checked.` : null;
-          description = bad ? `Adds ${blocking.length} vulnerable package version${blocking.length === 1 ? "" : "s"}` : r.added.length ? "Only lower-severity advisories added" : "No new vulnerable packages";
-          body = r.added.length ? fungiComment(r) : previous ? "<!-- mycelium-fungi -->\n## 🍄 Mycelium fungi: no new vulnerable packages in the latest commit" : null;
+          const gaps = [...r.unreadable, ...r.uncheckable];
+          note = gaps.length ? `Couldn't check ${gaps.join(", ")}` : null;
+          description = blocking.length ? `Adds ${blocking.length} vulnerable package version${blocking.length === 1 ? "" : "s"}` : r.unreadable.length ? `Couldn't read ${r.unreadable.length} lockfile${r.unreadable.length === 1 ? "" : "s"}` : r.uncheckable.length ? `Couldn't check ${r.uncheckable.length} dependency file${r.uncheckable.length === 1 ? "" : "s"}` : r.added.length ? "Only lower-severity advisories added" : "No new vulnerable packages";
+          body = r.added.length || gaps.length ? fungiComment(r) : previous ? "<!-- mycelium-fungi -->\n## 🍄 Mycelium fungi: no new vulnerable packages in the latest commit" : null;
         }
-        const commentId = body ? await deps.github.comment(p.repo, p.number, previous?.comment_id ?? null, body) : previous?.comment_id ?? null;
+        // The check first: if the comment can't be posted, the PR must still show the result.
         await deps.github.setStatus(p.repo, p.sha, bad ? "failure" : "success", description, target, AGENT_CONTEXT[agent]);
+        let commentId = previous?.comment_id ?? null;
+        if (body) {
+          try {
+            commentId = await deps.github.comment(p.repo, p.number, commentId, body);
+          } catch (e) {
+            deps.log?.(`couldn't comment on ${p.repo}#${p.number}: ${String((e as Error)?.message).split("\n")[0]}`);
+          }
+        }
         put.run(p.repo, p.number, p.sha, agent, p.title, p.url, bad ? "failed" : "passed", JSON.stringify(details), note, commentId, now);
         checked++;
         if (bad) {
@@ -207,5 +242,6 @@ export function agentsView(db: DatabaseSync) {
     settings: loadAgentSettings(db),
     totals: { keys: totals("keys"), fungi: totals("fungi") },
     problems: rows.filter((r) => r.state === "failed").slice(0, 30).map((r) => ({ agent: r.agent, repo: r.repo, number: r.number, sha: r.sha, title: r.title, url: r.url, at: r.checked_at, details: JSON.parse(r.details), note: r.note })),
+    gaps: rows.filter((r) => r.state === "passed" && r.note).slice(0, 10).map((r) => ({ repo: r.repo, number: r.number, title: r.title, url: r.url, note: r.note })),
   };
 }

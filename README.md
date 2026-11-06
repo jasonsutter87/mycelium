@@ -228,7 +228,7 @@ mycelium review owner/name 123
   everything in a PR is treated as data. The verdict is computed from its findings, and a review that doesn't finish is never a pass.
 - **Spending has a limit.** A daily cap (50 reviews by default) holds the rest in the queue, and the page shows the estimated cost.
   PRs from forks and dependency bots, and PRs already open when you turn this on or start watching a repo, are skipped until you ask or they change.
-- **A file it can't read counts against the PR.** Files that may hold secrets aren't sent, so changing one sends the PR back for a person to check. Big lockfiles aren't sent either: the comment says so, and Fungi covers their vulnerabilities.
+- **It says what it didn't read.** Files that may hold secrets and big lockfiles aren't sent, and the check and comment list them for a person to look at.
 
 ### Key watcher and Fungi
 
@@ -238,7 +238,7 @@ dependency bots and forks. They only read git objects and never run a PR's code.
 - **Key watcher** (`Mycelium keys`) looks for known API key formats and secret files in every commit of a PR, so a key added and then deleted is still caught.
   It never shows the value. A key found here is already on GitHub, so replace it. To stop one before it's committed: `mycelium keys --install-hook`.
 - **Fungi** (`Mycelium fungi`) checks packages a PR's lockfile changes add against OSV, and fails on high, critical or malicious. Vulnerabilities that were already there
-  stay with Findings. With nightly fixes on, each `mycelium sync` also opens fix PRs for high and critical production findings, leaving out major upgrades.
+  stay with Findings. It reads npm, pnpm, yarn, Cargo, NuGet, Python and Go lockfiles. For others, or a `package.json` with no lockfile, the check says what it couldn't check. A lockfile that won't parse fails the check. With nightly fixes on, each `mycelium sync` also opens fix PRs for high and critical production findings, leaving out major upgrades.
 
 ## Commands
 

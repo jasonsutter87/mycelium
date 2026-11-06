@@ -26,7 +26,7 @@ import { companyName, saveCompanyName } from "./db.ts";
 import { cloneDirs, readRepoList } from "./sync.ts";
 import Anthropic from "@anthropic-ai/sdk";
 import { agentsView, pollAgents, saveAgentSettings } from "./agents.ts";
-import { apiEngine, claudeCodeEngine, detectEngine, githubPort, loadReviewSettings, pollReviews, requeueReview, resetInterrupted, reviewsView, saveReviewSettings, type EngineKind, type ReviewClient } from "./review.ts";
+import { apiEngine, claudeCodeEngine, detectEngine, EngineTrouble, githubPort, loadReviewSettings, pollReviews, requeueReview, resetInterrupted, reviewsView, saveReviewSettings, type EngineKind, type ReviewClient } from "./review.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PUBLIC = join(HERE, "..", "public");
@@ -210,8 +210,9 @@ export function serve(db: DatabaseSync, port: number) {
       agentPoll.running = false;
     }
   };
-  const pollReviewsNow = async () => {
-    if (reviewPoll.running || !cfg.repos || !loadReviewSettings(db).enabled) return;
+  let reviewsPausedUntil = 0; // after a plan limit or an outage, there's no point asking again every two minutes
+  const pollReviewsNow = async (manual = false) => {
+    if (reviewPoll.running || !cfg.repos || !loadReviewSettings(db).enabled || (!manual && Date.now() < reviewsPausedUntil)) return;
     reviewPoll.running = true;
     try {
       const kind = await reviewEngine();
@@ -221,6 +222,7 @@ export function serve(db: DatabaseSync, port: number) {
     } catch (e) {
       console.error("reviewing PRs:", e);
       reviewPoll.lastError = cleanError(e);
+      if (e instanceof EngineTrouble) reviewsPausedUntil = Date.now() + 15 * 60_000;
     } finally {
       reviewPoll.running = false;
       reviewPoll.lastPollAt = new Date().toISOString();
@@ -377,8 +379,7 @@ export function serve(db: DatabaseSync, port: number) {
       }
       if (p === "/api/reviews") {
         saveReviewSettings(db, body);
-        void pollAgentsNow();
-    void pollReviewsNow();
+        void pollReviewsNow(true);
         return send(res, 200, await reviewView());
       }
       if (p === "/api/agents") {
@@ -389,7 +390,7 @@ export function serve(db: DatabaseSync, port: number) {
       if (p === "/api/reviews/again") {
         if (!validSlug(body.repo) || !Number.isInteger(body.number)) return send(res, 400, { error: "Which PR?" });
         requeueReview(db, body.repo, body.number);
-        void pollReviewsNow();
+        void pollReviewsNow(true);
         return send(res, 200, await reviewView());
       }
       if (["/api/check", "/api/fix", "/api/pull"].includes(p) && typeof body.project !== "string") return send(res, 400, { error: "which project? (missing project name)" });
@@ -474,9 +475,10 @@ export function serve(db: DatabaseSync, port: number) {
   setInterval(() => { void pollAgentsNow(); void pollReviewsNow(); }, 2 * 60_000).unref();
 
   server.listen(port, cfg.host, () => {
-    void pollReviewsNow();
     setImmediate(() => overview(db)); // warm the slow part, so the first page load is quick
     console.log(`🍄 Mycelium at ${baseUrl}/  ${auth ? "(sign-in on)" : "(this computer only)"}  (Ctrl-C to stop)`);
+    void pollAgentsNow();
+    void pollReviewsNow();
     if (process.platform === "darwin" && localUrl && !process.env.MYCELIUM_NO_OPEN) execFile("open", [baseUrl + "/"]);
   });
 }
