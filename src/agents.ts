@@ -204,7 +204,14 @@ export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentD
           body = r.added.length || gaps.length ? fungiComment(r) : previous ? "<!-- mycelium-fungi -->\n## 🍄 Mycelium fungi: no new vulnerable packages in the latest commit" : null;
         }
         // The check first: if the comment can't be posted, the PR must still show the result.
-        await deps.github.setStatus(p.repo, p.sha, bad ? "failure" : "success", description, target, AGENT_CONTEXT[agent]);
+        // A repo this account can read but not write to can't take a check. That won't change on a retry, so record the result here and move on.
+        try {
+          await deps.github.setStatus(p.repo, p.sha, bad ? "failure" : "success", description, target, AGENT_CONTEXT[agent]);
+        } catch (e) {
+          if (!/HTTP (403|404)/.test(`${(e as any)?.stderr ?? ""} ${(e as Error)?.message ?? ""}`)) throw e;
+          body = null;
+          note = "This GitHub account can't post to this repo, so the result only shows here.";
+        }
         let commentId = previous?.comment_id ?? null;
         if (body) {
           try {
@@ -236,6 +243,9 @@ export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentD
   // A repo that's off drops out, so its open PRs wait again when it's turned back on.
   const nextSeen = (a: AgentName) => {
     if (!latest[a]) return [];
+    // Only an agent this pass actually ran for. One switched on while this pass was running hasn't left anything alone yet:
+    // marking its repos as seen would make every PR already open look new on its next pass.
+    if (!enabled.includes(a)) return latest.seen[a];
     const on = new Set(onFor(a));
     return [...new Set([...latest.seen[a], ...listing.answered])].filter((r) => on.has(r));
   };
