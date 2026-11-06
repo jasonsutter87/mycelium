@@ -247,9 +247,7 @@ Two AI agents on the same page. They ride the reviewer's pipeline (read-only too
 separate lens on the same diff. They need a Claude login or `ANTHROPIC_API_KEY`, skip forks and dependency bots, and share the reviewer's daily limit.
 Adding another AI agent later is one entry in `src/lenses.ts` plus a per-repo toggle — no new pipeline.
 
-- **Crimson** (`Mycelium crimson`) is a red-team pass: it assumes the author may be hostile and looks for backdoors, exfiltration, logic bombs, obfuscation,
-  dynamic code loading, secret access and install-time code. It follows calls across files, resolving names built from strings or config. It fails the check on
-  high or critical. Note: like the reviewer, it sees one PR at a time, so a payload split across several already-merged PRs can still get past it.
+- **Crimson** (`Mycelium crimson`) is a security pass. It assumes the author is well-meaning but may not see what their code enables, and asks whether the change makes the product more exploitable than before — a loosened auth or validation check, a new injection surface, mishandled secrets, dynamic/eval or install-time code. Intent aside: a naive change that weakens the product is the common case. It follows calls across files, resolving names built from strings or config, and fails the check on high or critical. Note: like the reviewer, it sees one PR at a time, so a payload split across several already-merged PRs can still get past it.
 - **Accessibility** (`Mycelium a11y`) checks the diff against WCAG for what's visible in the source: missing labels and alt text, misused ARIA, non-semantic
   markup, low-contrast tokens. It's advisory — it posts its notes but never fails a check, because source alone can't prove the rendered page is compliant.
 

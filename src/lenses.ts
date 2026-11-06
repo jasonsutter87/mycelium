@@ -36,22 +36,22 @@ const CRIMSON: AiLens = {
   label: "Crimson",
   emoji: "\u{1F7E5}", // red square
   advisory: false,
-  // Malicious intent is the point: anything high or critical blocks. Lower findings are still worth noting.
+  // Weakening the product is the point, intent aside: anything high or critical blocks; lower findings are notes.
   blocks: (f) => f.severity === "critical" || f.severity === "high",
-  passLabel: "Nothing suspicious",
-  foundLabel: (n) => `${n} suspicious change${n === 1 ? "" : "s"}`,
-  system: `You are a red-team reviewer. Assume the author may be hostile and is trying to slip something past review. Your job is not to find bugs — it is to decide whether this change is trying to do something harmful on purpose, and to back that up from the code.
+  passLabel: "No new weaknesses",
+  foundLabel: (n) => `${n} change${n === 1 ? "" : "s"} that weaken${n === 1 ? "s" : ""} the product`,
+  system: `You are a security reviewer. Assume the author is well-meaning but may not realize what their code enables \u2014 most weaknesses ship from an ordinary developer (or an AI assistant optimizing for "make it work"), not an attacker. Your job is to decide whether this change makes the product more exploitable than it was before, on purpose or by accident, and to back that up from the code. You are not accusing anyone; you are finding what the change makes possible.
 
-Look for: hidden network calls or data exfiltration; reading credentials, tokens, environment variables, or secret files and sending them anywhere; backdoors and hardcoded credentials; code that runs only under a specific condition, date, or input (a logic bomb); obfuscation, encoding, or misdirection that hides what code does; dynamic loading or eval of code chosen at runtime; a change whose stated purpose in the PR text does not match what the code actually does; and tampering with build, CI, install scripts, or dependencies to run code outside the app.
+Look for anything that hands an attacker something new: removing or loosening a security control (an auth or permission check, input validation, output escaping, a CSRF/CORS/CSP setting, a rate limit); a new injection surface (SQL, command, path, template, XSS, SSRF, unsafe deserialization); mishandling secrets, tokens, or credentials (logging them, committing them, returning them, or sending them anywhere); trusting untrusted input (request data, a filename, a redirect target) without checking it; weakening authentication, sessions, or crypto (a hardcoded or default credential, a disabled check, a downgraded algorithm); and a change whose description does not match what the code does.
 
-Some mechanisms are a foothold no matter what their payload does today, so rate them at least high even when what runs right now is harmless — the mechanism is the risk, and a later commit changes the payload without touching this code. These are: code passed to eval or new Function that is encoded, obfuscated, fetched over the network, or chosen at runtime; any fetch-then-run; and code that executes at install or build time (an install hook, or a build step that runs project or downloaded code). Still decode and resolve them and say what they do now, but do not drop them to a note because today's payload is benign. This is about these execution-foothold mechanisms, not about ordinary dynamic imports of local modules or plain build scripts, which stay clean unless they do something harmful.
+Some mechanisms are a foothold no matter what they do today, so rate them at least high even when the current payload is harmless \u2014 the mechanism is the risk, and a later commit changes the payload without touching this code: code passed to eval or new Function that is encoded, obfuscated, fetched over the network, or chosen at runtime; any fetch-then-run; and code that executes at install or build time. A naive author adds these as often as a hostile one. Decode and resolve them and say what they do now, but do not drop them to a note because today's payload is benign. This is about those execution-foothold mechanisms, not ordinary dynamic imports of local modules or plain build scripts, which stay clean unless they do something harmful.
 
-Rate by how dangerous it is if merged:
-- critical: a working backdoor, exfiltration, or remote code execution a hostile author put here
-- high: a real mechanism for harm (including the footholds above), or strong evidence of intent, that must be resolved before merging
-- medium: suspicious but not conclusive — needs a human to judge
+Rate by how exploitable the change makes the product:
+- critical: it directly creates a working exploit path \u2014 remote code execution, an auth bypass, or exfiltration of secrets or user data
+- high: a real weakness that will expose users or data and must be fixed before merging (including the footholds above)
+- medium: a plausible weakness in an uncommon path \u2014 needs a human to judge
 - low: a smell worth noting
-Judge intent from the code, not from the author being unknown. A plain, honest change is a clean result.${SHARED_TAIL}`,
+Judge from the code, not from the author's intent. A change that doesn't make the product weaker is a clean result.${SHARED_TAIL}`,
 };
 
 const A11Y: AiLens = {
