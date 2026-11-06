@@ -21,7 +21,7 @@ import { saveProject, scanProject, scanRoots, setIgnored } from "./scan.ts";
 import { enrich } from "./depsdev.ts";
 import { pullProject, syncPrs } from "./prs.ts";
 import { alertsView, loadAlertSettings, runAlerts, saveAlertSettings, sendTestEmail } from "./alerts.ts";
-import { applyRepoChange, cleanError, fetchRepos, listGithubRepos, loadAutoWatch, loadHiddenAccounts, loadRepoIssues, parseRepoInput, saveAutoWatch, saveHiddenAccounts, updateRepoIssues, validSlug, type GithubRepo } from "./repos.ts";
+import { agentOnFor, applyRepoChange, cleanError, loadRepoChoices, repoChoicesView, saveRepoChoices, fetchRepos, listGithubRepos, loadAutoWatch, loadHiddenAccounts, loadRepoIssues, parseRepoInput, saveAutoWatch, saveHiddenAccounts, updateRepoIssues, validSlug, type GithubRepo } from "./repos.ts";
 import { companyName, saveCompanyName } from "./db.ts";
 import { cloneDirs, readRepoList } from "./sync.ts";
 import Anthropic from "@anthropic-ai/sdk";
@@ -228,7 +228,7 @@ export function serve(db: DatabaseSync, port: number) {
       reviewPoll.lastPollAt = new Date().toISOString();
     }
   };
-  const reviewView = async () => ({ ...reviewsView(db, { managed: !!cfg.repos, engine: await reviewEngine(), lastError: reviewPoll.lastError ?? agentPoll.lastError, lastPollAt: reviewPoll.lastPollAt }), agents: agentsView(db) });
+  const reviewView = async () => ({ ...reviewsView(db, { managed: !!cfg.repos, engine: await reviewEngine(), lastError: reviewPoll.lastError ?? agentPoll.lastError, lastPollAt: reviewPoll.lastPollAt }), agents: agentsView(db), repoChoices: repoChoicesView(db, watchedList()) });
 
   const page = (file: string, res: ServerResponse) => {
     const html = readFileSync(join(PUBLIC, file), "utf8").replace("__TOKEN__", token!);
@@ -387,8 +387,15 @@ export function serve(db: DatabaseSync, port: number) {
         void pollAgentsNow();
         return send(res, 200, await reviewView());
       }
+      if (p === "/api/agents/repos") {
+        saveRepoChoices(db, body, watchedList());
+        void pollAgentsNow();
+        void pollReviewsNow(true);
+        return send(res, 200, await reviewView());
+      }
       if (p === "/api/reviews/again") {
         if (!validSlug(body.repo) || !Number.isInteger(body.number)) return send(res, 400, { error: "Which PR?" });
+        if (!agentOnFor(loadRepoChoices(db), body.repo, "review")) return send(res, 400, { error: `The reviewer is off for ${body.repo}. Tick it under Which repos first.` });
         requeueReview(db, body.repo, body.number);
         void pollReviewsNow(true);
         return send(res, 200, await reviewView());

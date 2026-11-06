@@ -51,6 +51,8 @@ const state = {
   reviewFilter: "all",
   reviewMsg: null,
   reviewOpen: new Set(), // which reviews are expanded: the page re-renders while work is running
+  repoScopeOpen: false,
+  repoScopeQ: "",
 };
 
 function banner(msg, isErr) {
@@ -675,7 +677,7 @@ function renderReviews() {
   $("canvas").innerHTML = `<div class="profile">
     <header class="phead">
       <div class="pavatar" aria-hidden="true">✓</div>
-      <div class="pwho"><h2>Agents</h2><p class="muted">Three agents watch every pull request on your watched repos, each with its own check on GitHub. None of them ever merges.</p></div>
+      <div class="pwho"><h2>Agents</h2><p class="muted">Three agents watch pull requests on the repos you choose, each with its own check on GitHub. None of them ever merges.</p></div>
     </header>
     ${d.managed ? "" : `<div class="warn-box"><b>Reviews run on a server install.</b> They use the repo list and clones from the Repos page, which this install doesn't have.</div>`}
     ${d.managed && !d.configured ? `<div class="warn-box"><b>Reviews need Claude.</b> Log in to Claude Code on this server, or add <span class="mono">ANTHROPIC_API_KEY</span> to Mycelium's environment and restart it.</div>` : ""}
@@ -715,6 +717,7 @@ function renderReviews() {
       <p class="small muted">PRs already open when you turn this on or start watching a repo aren't reviewed until they change. PRs from forks and dependency bots like Dependabot are skipped, but you can still review one by hand. PR code goes to Anthropic (${esc(d.model)}${d.engine === "claude-code" ? ", through Claude Code on this server" : ""}), without files that may hold secrets. To block merging on a failed review, make the <span class="mono">Mycelium review</span> check required in GitHub's branch rules.</p>
       <div class="actions"><button class="btn primary" id="rSave">Save</button>${state.reviewMsg ? `<span class="small ${state.reviewMsg.err ? "warn-text" : "ok-text"}" role="status">${esc(state.reviewMsg.text)}</span>` : ""}</div>
     </section>
+    ${d.managed ? repoScopeHtml(d) : ""}
     <div class="filters rfilters"><div class="chips" role="group" aria-label="Filter reviews">${chips.map(([id, label, c]) => `<button data-rfilter="${id}" class="${state.reviewFilter === id ? "on" : ""}">${label}<i>${c}</i></button>`).join("")}</div></div>
     ${shown.length ? `<ul class="plain rlist">${shown.map(row).join("")}</ul>` : `<div class="empty">${d.reviews.length ? "No reviews match this filter." : on ? "No PRs yet. New ones show up here within a couple of minutes." : "Turn reviews on, and new PRs show up here."}</div>`}
   </div>`;
@@ -725,6 +728,7 @@ function renderReviews() {
       renderReviews();
     };
   });
+  wireRepoScope(d);
   $("rSave").onclick = async () => {
     try {
       state.tabs.reviews = await api("/api/reviews", { enabled: $("rOn").checked, dailyLimit: Number($("rLimit").value), emailSentBack: $("rEmail").checked });
@@ -741,10 +745,56 @@ function renderReviews() {
   }));
 }
 
+// ---- which agents run on which repo
+
+const SCOPE_AGENTS = [["review", "Reviewer"], ["keys", "Key watcher"], ["fungi", "Fungi"]];
+
+function repoScopeRows(d) {
+  const q = state.repoScopeQ.trim().toLowerCase();
+  return d.repoChoices.repos.filter((r) => !q || r.slug.toLowerCase().includes(q));
+}
+
+function repoScopeBody(d) {
+  const rows = repoScopeRows(d);
+  return rows.map((r) => `<tr><td class="wrap">${esc(r.slug)}</td>${SCOPE_AGENTS.map(([a, label]) => `<td class="tick"><input type="checkbox" data-sslug="${esc(r.slug)}" data-sagent="${a}" aria-label="${label} on ${esc(r.slug)}" ${r[a] ? "checked" : ""}></td>`).join("")}</tr>`).join("")
+    || `<tr><td colspan="4" class="empty">${d.repoChoices.repos.length ? "No repos match." : "No repos are being watched yet."}</td></tr>`;
+}
+
+function repoScopeHtml(d) {
+  const counts = SCOPE_AGENTS.map(([a, label]) => `${label} ${d.repoChoices.repos.filter((r) => r[a]).length}`).join(", ");
+  return `<section class="pcard rcard">
+    <details id="rsBox" ${state.repoScopeOpen ? "open" : ""}><summary><b>Which repos</b> <span class="muted">${esc(counts)} of ${d.repoChoices.repos.length}</span></summary>
+      <div class="rsTools">
+        <input class="field" id="rsQ" type="search" placeholder="Search repos" aria-label="Search repos" value="${esc(state.repoScopeQ)}">
+        <label class="row"><input type="checkbox" id="rsNew" ${d.repoChoices.newRepos ? "checked" : ""}> <span>Repos you start watching later get all three</span></label>
+      </div>
+      <p class="small muted">All and None change the repos shown, so you can search first. When you turn an agent on for a repo, PRs already open there wait until they change.</p>
+      <div class="tablewrap rsTable"><table><thead><tr><th>Repo</th>${SCOPE_AGENTS.map(([a, label]) => `<th><span class="rsHead">${label}<span><button class="linkish small" data-sall="${a}" data-son="1">All</button> · <button class="linkish small" data-sall="${a}" data-son="0">None</button></span></span></th>`).join("")}</tr></thead>
+        <tbody id="rsBody">${repoScopeBody(d)}</tbody></table></div>
+    </details></section>`;
+}
+
+function wireRepoScope(d) {
+  if (!$("rsBox")) return;
+  const save = async (payload) => {
+    try { state.tabs.reviews = await api("/api/agents/repos", payload); }
+    catch (e) { state.reviewMsg = { text: e.message, err: true }; }
+    renderReviews();
+  };
+  $("rsBox").ontoggle = () => { state.repoScopeOpen = $("rsBox").open; };
+  $("rsQ").oninput = (e) => { state.repoScopeQ = e.target.value; $("rsBody").innerHTML = repoScopeBody(d); };
+  $("rsNew").onchange = (e) => save({ newRepos: e.target.checked });
+  $("rsBody").onchange = (e) => { if (e.target.dataset.sslug) save({ changes: [{ slug: e.target.dataset.sslug, agent: e.target.dataset.sagent, on: e.target.checked }] }); };
+  document.querySelectorAll("[data-sall]").forEach((b) => (b.onclick = () => {
+    const on = b.dataset.son === "1";
+    save({ changes: repoScopeRows(d).map((r) => ({ slug: r.slug, agent: b.dataset.sall, on })) });
+  }));
+}
+
 // Reviews take minutes and finish on their own, so this page keeps itself current, unless someone's mid-edit in its settings.
 setInterval(async () => {
   if (state.view !== "reviews" || !state.tabs.reviews || document.hidden) return;
-  if (["rLimit", "rOn", "rEmail", "gKeys", "gFungi", "gFix"].includes(document.activeElement?.id)) return;
+  if (["rLimit", "rOn", "rEmail", "gKeys", "gFungi", "gFix", "rsQ", "rsNew"].includes(document.activeElement?.id) || document.activeElement?.dataset?.sslug) return;
   try {
     const next = await api("/api/reviews");
     if (state.view === "reviews") { state.tabs.reviews = next; renderReviews(); }

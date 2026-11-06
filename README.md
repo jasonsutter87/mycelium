@@ -240,6 +240,10 @@ dependency bots and forks. They only read git objects and never run a PR's code.
 - **Fungi** (`Mycelium fungi`) checks packages a PR's lockfile changes add against OSV, and fails on high, critical or malicious. Vulnerabilities that were already there
   stay with Findings. It reads npm, pnpm, yarn, Cargo, NuGet, Python, Go and Gradle dependency files. For others, or a `package.json` with no lockfile, the check says what it couldn't check. A lockfile that won't parse fails the check, and so does an advisory with no usable severity. With nightly fixes on, each `mycelium sync` also opens fix PRs for high and critical production findings, leaving out major upgrades.
 
+### Choosing repos
+
+Each agent can be on or off per repo under **Which repos** on the Agents page, including Fungi's nightly fixes. You also choose whether repos you start watching later get all three. Turning an agent on for a repo leaves its open PRs alone until they change.
+
 ## Commands
 
 | Command | What it does |

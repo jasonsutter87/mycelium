@@ -165,3 +165,41 @@ export function saveHiddenAccounts(db: DatabaseSync, accounts: unknown): string[
   setSetting(db, "repo_auto", { ...auto, owners: auto.owners.filter((o) => !list.includes(o)) });
   return list as string[];
 }
+
+// ---------------------------------------------------------------- which agents run on which repo
+
+export type RepoAgent = "review" | "keys" | "fungi";
+export const REPO_AGENTS: RepoAgent[] = ["review", "keys", "fungi"];
+
+/** Only what someone changed is stored. Anything else follows `newRepos`, so repos watched later get a deliberate answer too. */
+export interface RepoChoices { newRepos: boolean; repos: Record<string, Partial<Record<RepoAgent, boolean>>> }
+
+export const loadRepoChoices = (db: DatabaseSync): RepoChoices => ({ newRepos: true, repos: {}, ...getSetting<Partial<RepoChoices>>(db, "agent_repos", {}) });
+export const agentOnFor = (c: RepoChoices, slug: string, agent: RepoAgent) => c.repos[slug]?.[agent] ?? c.newRepos;
+
+/**
+ * Applies ticks from the Agents page. Changing `newRepos` first writes down what every watched repo has now,
+ * so answering "what about later ones?" never flips the repos already on the list.
+ */
+export function saveRepoChoices(db: DatabaseSync, input: { changes?: unknown; newRepos?: unknown }, watched: string[]): RepoChoices {
+  const c = loadRepoChoices(db);
+  const known = new Set(watched);
+  const changes = Array.isArray(input.changes) ? input.changes : [];
+  for (const ch of changes) {
+    if (!known.has(ch?.slug)) throw new Error("That repo isn't being watched.");
+    if (!REPO_AGENTS.includes(ch?.agent)) throw new Error("There's no agent with that name.");
+    if (typeof ch?.on !== "boolean") throw new Error("Each change has to say on or off.");
+  }
+  if (typeof input.newRepos === "boolean" && input.newRepos !== c.newRepos) {
+    for (const slug of watched) c.repos[slug] = Object.fromEntries(REPO_AGENTS.map((a) => [a, agentOnFor(c, slug, a)]));
+    c.newRepos = input.newRepos;
+  }
+  for (const { slug, agent, on } of changes) c.repos[slug] = { ...c.repos[slug], [agent]: on };
+  setSetting(db, "agent_repos", c);
+  return c;
+}
+
+export function repoChoicesView(db: DatabaseSync, watched: string[]) {
+  const c = loadRepoChoices(db);
+  return { newRepos: c.newRepos, repos: watched.map((slug) => ({ slug, review: agentOnFor(c, slug, "review"), keys: agentOnFor(c, slug, "keys"), fungi: agentOnFor(c, slug, "fungi") })) };
+}

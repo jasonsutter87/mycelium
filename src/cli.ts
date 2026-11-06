@@ -69,9 +69,19 @@ async function sync(dir?: string) {
   // Fungi's nightly job: open fix PRs for what's fixable. Never merges, and a fix already in an open PR isn't repeated.
   const { loadAgentSettings } = await import("./agents.ts");
   if (loadAgentSettings(db).fungiAutoFix) {
-    flags.add("--apply"); flags.add("--no-refresh"); flags.add("--respect-closed");
-    if (!flagValue("--min")) values.set("--min", "high");
-    await fixAll().catch((e) => console.log(c.yellow(`fungi: couldn't open fix PRs: ${(e as Error).message}`)));
+    // Only the repos ticked for Fungi on the Agents page.
+    const { agentOnFor, loadRepoChoices } = await import("./repos.ts");
+    const { cloneDirs, readRepoList } = await import("./sync.ts");
+    const choices = loadRepoChoices(db);
+    const folders = cloneDirs(readRepoList(list));
+    const onPaths = new Set([...folders].filter(([slug]) => agentOnFor(choices, slug, "fungi")).map(([, folder]) => join(target, folder)));
+    const names = (db.prepare("SELECT name, path FROM projects").all() as { name: string; path: string }[]).filter((p) => onPaths.has(p.path)).map((p) => p.name);
+    if (names.length) {
+      flags.add("--apply"); flags.add("--no-refresh"); flags.add("--respect-closed");
+      values.set("--project", names.join(","));
+      if (!flagValue("--min")) values.set("--min", "high");
+      await fixAll().catch((e) => console.log(c.yellow(`fungi: couldn't open fix PRs: ${(e as Error).message}`)));
+    }
   }
 }
 

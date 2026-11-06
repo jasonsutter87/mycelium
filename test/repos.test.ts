@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import { companyName, openDb, saveCompanyName } from "../src/db.ts";
-import { applyAutoWatch, fetchRepos, loadAutoWatch, loadHiddenAccounts, loadRepoIssues, newRepos, parseRepoInput, planRepoChange, saveAutoWatch, saveHiddenAccounts, updateRepoIssues, validSlug, writeRepoList, type GithubRepo } from "../src/repos.ts";
+import { applyAutoWatch, fetchRepos, loadAutoWatch, loadHiddenAccounts, loadRepoIssues, newRepos, parseRepoInput, planRepoChange, saveAutoWatch, saveHiddenAccounts, updateRepoIssues, validSlug, writeRepoList, type GithubRepo, agentOnFor, loadRepoChoices, saveRepoChoices, repoChoicesView } from "../src/repos.ts";
 import { readRepoList } from "../src/sync.ts";
 
 const repo = (slug: string, over: Partial<GithubRepo> = {}): GithubRepo => ({ slug, owner: slug.split("/")[0], private: false, archived: false, fork: false, description: "", pushedAt: null, ...over });
@@ -122,4 +122,23 @@ test("hiding an account stops auto-watching it, and bad names are refused", () =
   assert.deepEqual(loadAutoWatch(db).seen, ["old/a", "keep/b"], "what's been seen is kept, so unhiding doesn't pull in old repos");
   assert.throws(() => saveHiddenAccounts(db, ["../etc"]), /account name/);
   assert.deepEqual(saveHiddenAccounts(db, []), []);
+});
+
+test("agents can be chosen per repo, and later repos follow their own setting", () => {
+  const db = openDb(":memory:");
+  assert.equal(agentOnFor(loadRepoChoices(db), "o/a", "review"), true, "on everywhere until narrowed");
+  saveRepoChoices(db, { changes: [{ slug: "o/a", agent: "review", on: false }] }, ["o/a", "o/b"]);
+  let c = loadRepoChoices(db);
+  assert.equal(agentOnFor(c, "o/a", "review"), false);
+  assert.equal(agentOnFor(c, "o/a", "keys"), true);
+  assert.equal(agentOnFor(c, "o/b", "review"), true);
+  saveRepoChoices(db, { newRepos: false }, ["o/a", "o/b"]);
+  c = loadRepoChoices(db);
+  assert.equal(agentOnFor(c, "o/b", "review"), true, "repos already listed don't flip");
+  assert.equal(agentOnFor(c, "o/a", "review"), false);
+  assert.equal(agentOnFor(c, "o/later", "review"), false, "later ones follow the new answer");
+  assert.throws(() => saveRepoChoices(db, { changes: [{ slug: "x/y", agent: "keys", on: true }] }, ["o/a"]), /isn't being watched/);
+  assert.throws(() => saveRepoChoices(db, { changes: [{ slug: "o/a", agent: "nope", on: true }] }, ["o/a"]), /no agent/);
+  assert.throws(() => saveRepoChoices(db, { changes: [{ slug: "o/a", agent: "keys", on: "yes" }] }, ["o/a"]), /on or off/);
+  assert.deepEqual(repoChoicesView(db, ["o/a"]).repos, [{ slug: "o/a", review: false, keys: true, fungi: true }]);
 });

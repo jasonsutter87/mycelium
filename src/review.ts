@@ -19,6 +19,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
 import { resendSender, loadAlertSettings, emailConfigured, type Sender } from "./alerts.ts";
 import { redactKeys } from "./keys.ts";
+import { agentOnFor, loadRepoChoices } from "./repos.ts";
 
 const execFileP = promisify(execFile);
 
@@ -672,8 +673,14 @@ async function emailSentBack(db: DatabaseSync, row: Row, findings: ReviewFinding
 }
 
 /** One pass of the poller: post anything finished but not yet on GitHub, find new PR heads, then work through the queue up to the daily limit. */
-export async function pollReviews(db: DatabaseSync, repos: string[], deps: ReviewDeps, now = Date.now): Promise<{ reviewed: number; queued: number }> {
+export async function pollReviews(db: DatabaseSync, allRepos: string[], deps: ReviewDeps, now = Date.now): Promise<{ reviewed: number; queued: number }> {
   if (!loadReviewSettings(db).enabled) return { reviewed: 0, queued: 0 };
+  const choices = loadRepoChoices(db);
+  const repos = allRepos.filter((r) => agentOnFor(choices, r, "review"));
+  // Forgetting a repo that's turned off means its open PRs wait again when it's turned back on, instead of all being reviewed at once.
+  const before = loadReviewSettings(db);
+  const stillOn = before.seenRepos.filter((r) => repos.includes(r));
+  if (stillOn.length !== before.seenRepos.length) setJson(db, "reviews", { ...before, seenRepos: stillOn });
   // One that can't be posted never holds up the rest. After a day it's given up on: the result stays on the dashboard.
   for (const row of db.prepare("SELECT * FROM reviews WHERE published = 0").all() as unknown as Row[]) {
     try {
@@ -685,9 +692,10 @@ export async function pollReviews(db: DatabaseSync, repos: string[], deps: Revie
   }
   const watched = new Set(repos);
   for (const r of db.prepare("SELECT repo, number, sha FROM reviews WHERE state = 'queued'").all() as { repo: string; number: number; sha: string }[]) {
-    if (!watched.has(r.repo)) setRow(db, r, { state: "skipped", note: "This repo is no longer being watched." });
+    if (!watched.has(r.repo)) setRow(db, r, { state: "skipped", note: allRepos.includes(r.repo) ? "The reviewer is off for this repo." : "This repo is no longer being watched." });
   }
   const refresh = async () => {
+    if (!repos.length) return 0;
     const listing = await deps.github.listOpenPrs(repos);
     if (repos.length && !listing.answered.length) throw new Error("GitHub didn't answer for any watched repo. Check that `gh auth status` works on this server.");
     const missing = repos.length - listing.answered.length;
