@@ -12,7 +12,7 @@ import { emailConfigured, loadAlertSettings, resendSender, type Sender } from ".
 import { scanPatch, type KeyHit } from "./keys.ts";
 import { checkPackages, severityRank, type PackageVuln } from "./osv.ts";
 import { agentOnFor, loadRepoChoices } from "./repos.ts";
-import { aiBudgetLeft, dropAiRun, fetchPrObjects, neutralise, prepareDiff, recordAiRun, type GithubPort, type OpenPr, type ReviewEngine, type ReviewFinding, type ReviewResult } from "./review.ts";
+import { aiBudgetLeft, dropAiRun, EngineTrouble, fetchPrObjects, neutralise, prepareDiff, recordAiRun, ReviewFailed, type GithubPort, type OpenPr, type ReviewEngine, type ReviewFinding, type ReviewResult } from "./review.ts";
 import { AI_LENSES, aiLens, type AiLens } from "./lenses.ts";
 import { parseLockText } from "./scan.ts";
 
@@ -58,11 +58,24 @@ export function saveAgentSettings(db: DatabaseSync, input: Partial<AgentSettings
 const SCHEMA = `CREATE TABLE IF NOT EXISTS agent_checks (
   repo TEXT NOT NULL, number INTEGER NOT NULL, sha TEXT NOT NULL, agent TEXT NOT NULL,
   title TEXT NOT NULL, url TEXT NOT NULL,
-  state TEXT NOT NULL,       -- passed | failed | skipped
+  state TEXT NOT NULL,       -- passed | failed | skipped | closed | retry
   details TEXT NOT NULL DEFAULT '[]',
   note TEXT, comment_id INTEGER, checked_at TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0, -- AI lenses only: failed tries on this sha, so a broken PR can't retry forever
+  published INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (repo, number, sha, agent)
 )`;
+
+const MAX_AI_ATTEMPTS = 3;
+const TERMINAL_STATES = new Set(["passed", "failed", "skipped", "closed"]); // a "retry" row is not terminal: it runs again
+
+/** Adds columns an older database is missing, so a deploy doesn't need a manual migration. */
+function ensureAgentSchema(db: DatabaseSync) {
+  db.exec(SCHEMA);
+  const cols = new Set((db.prepare("PRAGMA table_info(agent_checks)").all() as { name: string }[]).map((c) => c.name));
+  if (!cols.has("attempts")) db.exec("ALTER TABLE agent_checks ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0");
+  if (!cols.has("published")) db.exec("ALTER TABLE agent_checks ADD COLUMN published INTEGER NOT NULL DEFAULT 1");
+}
 
 // ---------------------------------------------------------------- key watcher
 
@@ -167,7 +180,7 @@ const RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 }
 const COMMENT_CHARS = 60_000; // GitHub refuses comments over 65,536
 
 /** The PR comment for one AI lens, worst finding first, trimmed to fit. Everything from the model is neutralised. */
-export function lensComment(lens: AiLens, repo: string, sha: string, result: ReviewResult): string {
+export function lensComment(lens: AiLens, repo: string, sha: string, result: ReviewResult, withheld = ""): string {
   const ordered = [...result.findings].sort((a, b) => RANK[a.severity] - RANK[b.severity]);
   const sections = ordered.map((f) => `### ${f.severity.toUpperCase()}: ${neutralise(f.title).replace(/\s+/g, " ")}${f.file ? ` \u00b7 \`${neutralise(f.file).replace(/[\`\]\[]/g, "")}${f.line > 0 ? `:${f.line}` : ""}\`` : ""}\n\n${neutralise(f.detail)}${f.suggestion ? `\n\n**Fix:** ${neutralise(f.suggestion)}` : ""}`);
   let body = "", dropped = 0;
@@ -176,41 +189,51 @@ export function lensComment(lens: AiLens, repo: string, sha: string, result: Rev
   const head = lens.advisory
     ? `## ${lens.emoji} Mycelium ${lens.id}: ${lens.foundLabel(result.findings.length)} (advisory, never blocks a merge)`
     : `## ${lens.emoji} Mycelium ${lens.id}: ${result.findings.some(lens.blocks) ? "sent back" : "notes"}`;
-  return `<!-- mycelium-${lens.id} -->\n${head}\n\n${neutralise(result.summary).slice(0, 2000)}\n\n${body}\n\n<sub>Reviewed \`${sha.slice(0, 7)}\`. An AI review can miss things, and Mycelium never merges on its own.</sub>`;
+  return `<!-- mycelium-${lens.id} -->\n${head}\n\n${neutralise(result.summary).slice(0, 2000)}\n\n${body}${withheld}\n\n<sub>Reviewed \`${sha.slice(0, 7)}\`. An AI review can miss things, and Mycelium never merges on its own.</sub>`;
 }
 
 // A review that stopped early says so in its summary and brings back no findings. These are the phrasings the model
 // uses when a safety classifier or a limit cut it off; matching them lets an unfinished review fail closed, not pass.
-const INCOMPLETE_REVIEW = /safety classifier|did ?n.t (finish|complete)|could ?n.t (finish|complete)|was stopped|not (a )?clean result|no findings (are|were) recorded|assessment .{0,40}withheld|a human should review/i;
+// Matches the model saying THIS REVIEW stopped early — not the PR's own content. "a worker was stopped by SIGTERM"
+// describes the code and must not match; "this review was stopped by a safety classifier" must.
+export const INCOMPLETE_REVIEW = /\b(this|the) (review|assessment|analysis)\b[^.]{0,90}(stopped|halted|cut off|interrupted|incomplete|did ?n.t (finish|complete)|could ?n.t (finish|complete)|not complete)|safety classifier (stopped|halted|interrupted|cut|ended|prevented)|stopped by (a |the )?safety|no findings (were|are) recorded|assessment of [^.]{0,40} withheld/i;
 
 interface LensOutcome { bad: boolean; description: string; details: ReviewFinding[]; body: string | null; note: string | null }
 
 /** Runs one AI lens on a PR's diff. Uses the same fetch, diff prep, and engine as the reviewer. */
 async function runAiLens(engine: ReviewEngine, lens: AiLens, repoPath: string, p: OpenPr, previousComment: boolean): Promise<LensOutcome> {
+  const head = (extra: string) => `<!-- mycelium-${lens.id} -->\n## ${lens.emoji} Mycelium ${lens.id}: ${extra}`;
+  const foot = "\n\n<sub>An AI review can miss things, and Mycelium never merges on its own.</sub>";
   await fetchPrObjects(repoPath, p.number, p.baseRef);
   const raw = await git(repoPath, ["-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames", `${p.baseSha}...${p.sha}`]);
   const { diff, omitted, tooLarge } = prepareDiff(raw);
-  if (tooLarge) return { bad: false, description: "Too large to review automatically", details: [], body: null, note: "The diff was too large to review automatically." };
+  if (tooLarge) {
+    const body = head(`diff too large to review automatically${lens.advisory ? ", so it wasn't checked" : " — a person should check this PR"}`) + foot;
+    return { bad: !lens.advisory, description: lens.advisory ? "Too large to review — not checked" : "Too large to review — needs a human", details: [], body, note: "Diff too large to review automatically." };
+  }
   const { result } = await engine({ repo: p.repo, number: p.number, title: p.title, body: p.body, author: p.author, baseRef: p.baseRef, diff, omitted }, repoPath, p.sha, lens.system);
-  // A review that didn't finish is never a pass. A safety classifier can stop a red-team pass on the very code that
-  // most needs it, and the model then returns no findings with a summary admitting it stopped. Fail closed: a blocking
-  // lens sends it back for a person; an advisory one just says so.
-  if (!result.findings.length && INCOMPLETE_REVIEW.test(result.summary)) {
-    const body = `<!-- mycelium-${lens.id} -->\n## ${lens.emoji} Mycelium ${lens.id}: couldn't finish this review\n\n${neutralise(result.summary).slice(0, 1000)}\n\n<sub>An unfinished review isn't a pass. A person should look at this PR before merging.</sub>`;
+  if (INCOMPLETE_REVIEW.test(result.summary)) {
+    const body = head("couldn't finish this review") + `\n\n${neutralise(result.summary).slice(0, 1000)}\n\n<sub>An unfinished review isn't a pass. A person should look at this PR before merging.</sub>`;
     return { bad: !lens.advisory, description: lens.advisory ? "Couldn't finish — needs a human" : "Couldn't finish the review — needs a human", details: [], body, note: "The review didn't finish." };
   }
   const blocking = lens.advisory ? [] : result.findings.filter(lens.blocks);
   const bad = blocking.length > 0;
-  const description = bad ? lens.foundLabel(blocking.length) : result.findings.length && lens.advisory ? lens.foundLabel(result.findings.length) : lens.passLabel;
-  const body = result.findings.length ? lensComment(lens, p.repo, p.sha, result)
-    : previousComment ? `<!-- mycelium-${lens.id} -->\n## ${lens.emoji} Mycelium ${lens.id}: nothing to flag in the latest commit` : null;
-  return { bad, description, details: result.findings, body, note: null };
+  const description = bad ? lens.foundLabel(blocking.length)
+    : result.findings.length ? (lens.advisory ? lens.foundLabel(result.findings.length) : `${result.findings.length} note${result.findings.length === 1 ? "" : "s"} for a person to check`)
+    : lens.passLabel;
+  const notRead = omitted.length ? `Not read: ${omitted.join(", ")}` : null;
+  const withheld = notRead ? `\n\n**Not reviewed:** ${neutralise(omitted.join(", "))} — a person should read ${omitted.length === 1 ? "it" : "these"}.` : "";
+  const body = result.findings.length ? lensComment(lens, p.repo, p.sha, result, withheld)
+    : withheld ? head(description) + withheld + foot
+    : previousComment ? head("nothing to flag in the latest commit") : null;
+  return { bad, description, details: result.findings, body, note: notRead };
 }
+
 
 export interface AgentDeps { github: GithubPort; repoPath(slug: string): string | null; baseUrl: string | null; send?: Sender; log?: (s: string) => void; check?: typeof checkPackages; engine?: ReviewEngine }
 
 export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentDeps): Promise<{ checked: number; failed: number }> {
-  db.exec(SCHEMA);
+  ensureAgentSchema(db);
   const settings = loadAgentSettings(db);
   const enabled = [...RULE_AGENTS.filter((a) => settings[a]), ...(deps.engine ? AI_AGENT_IDS.filter((a) => settings[a]) : [])];
   if (!enabled.length) return { checked: 0, failed: 0 };
@@ -220,19 +243,20 @@ export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentD
   const listing = wanted.length ? await deps.github.listOpenPrs(wanted) : { prs: [], answered: [], partial: [] };
   if (wanted.length && !listing.answered.length) throw new Error("GitHub didn't answer for any watched repo. Check that `gh auth status` works on this server.");
   const open = listing.prs.filter((p) => !p.draft);
-  const seen = db.prepare("SELECT 1 FROM agent_checks WHERE repo = ? AND number = ? AND sha = ? AND agent = ?");
-  const put = db.prepare("INSERT OR REPLACE INTO agent_checks (repo, number, sha, agent, title, url, state, details, note, comment_id, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+  const priorRow = db.prepare("SELECT state, attempts FROM agent_checks WHERE repo = ? AND number = ? AND sha = ? AND agent = ?");
+  const put = db.prepare("INSERT OR REPLACE INTO agent_checks (repo, number, sha, agent, title, url, state, details, note, comment_id, checked_at, attempts, published) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
   const target = deps.baseUrl?.startsWith("https://") ? deps.baseUrl : null;
-  let checked = 0, failed = 0, firstError: unknown = null;
+  let checked = 0, failed = 0, firstError: unknown = null, engineDown = false;
   for (const agent of enabled) {
     const seenRepos = new Set(settings.seen[agent]);
     const onHere = new Set(onFor(agent));
     for (const p of open) {
       if (!onHere.has(p.repo)) continue;
-      if (seen.get(p.repo, p.number, p.sha, agent)) continue;
+      const prior = priorRow.get(p.repo, p.number, p.sha, agent) as { state: string; attempts: number } | undefined;
+      if (prior && TERMINAL_STATES.has(prior.state)) continue; // already answered for this commit
       const now = new Date().toISOString();
       if (!seenRepos.has(p.repo)) {
-        put.run(p.repo, p.number, p.sha, agent, p.title, p.url, "skipped", "[]", "Already open when this started on the repo.", null, now);
+        put.run(p.repo, p.number, p.sha, agent, p.title, p.url, "skipped", "[]", "Already open when this started on the repo.", null, now, 0, 1);
         continue;
       }
       const repo = deps.repoPath(p.repo);
@@ -257,20 +281,53 @@ export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentD
           description = blocking.length ? `Adds ${blocking.length} vulnerable package version${blocking.length === 1 ? "" : "s"}` : r.unreadable.length ? `Couldn't read ${r.unreadable.length} lockfile${r.unreadable.length === 1 ? "" : "s"}` : r.uncheckable.length ? `Couldn't check ${r.uncheckable.length} dependency file${r.uncheckable.length === 1 ? "" : "s"}` : r.added.length ? "Only lower-severity advisories added" : "No new vulnerable packages";
           body = r.added.length || gaps.length ? fungiComment(r) : previous ? "<!-- mycelium-fungi -->\n## 🍄 Mycelium fungi: no new vulnerable packages in the latest commit" : null;
         } else {
-          // An AI lens (Crimson, a11y). Skip forks and dependency bots once, and stop at the shared daily limit.
+          // An AI lens (Crimson, a11y). It spends the plan, so: skip forks and bots, stop at the daily limit,
+          // cap retries per commit, pause on engine trouble, and never let a stopped or failed run read as a pass.
+          if (engineDown) continue; // the engine is in trouble this pass; try again next poll
           if (p.fork || DEPENDENCY_BOT.test(p.author ?? "")) {
-            put.run(p.repo, p.number, p.sha, agent, p.title, p.url, "skipped", "[]", "From a fork or a dependency bot, so the AI agents skip it.", null, now);
+            put.run(p.repo, p.number, p.sha, agent, p.title, p.url, "skipped", "[]", "From a fork or a dependency bot, so the AI agents skip it.", null, now, 0, 1);
             continue;
           }
-          if (aiBudgetLeft(db) <= 0) continue; // out of budget: leave it unrecorded so it runs after the limit resets
-          const runId = recordAiRun(db);
-          try {
-            const out = await runAiLens(deps.engine!, aiLens(agent)!, repo, p, !!previous);
-            ({ bad, description, details, body, note } = out);
-          } catch (e) {
-            dropAiRun(db, runId); // the run never produced a result, so it shouldn't count against the budget
-            throw e;
+          const lens = aiLens(agent)!;
+          if (aiBudgetLeft(db) <= 0) {
+            // Don't silently drop the check: show it's waiting, so a required check still blocks the merge.
+            await deps.github.setStatus(p.repo, p.sha, "pending", "Waiting for the daily AI limit to reset", target, AGENT_CONTEXT[agent]).catch(() => {});
+            continue;
           }
+          const attempt = (prior?.attempts ?? 0) + 1;
+          const runId = recordAiRun(db);
+          let out: LensOutcome;
+          try {
+            out = await runAiLens(deps.engine!, lens, repo, p, !!previous);
+          } catch (e) {
+            const line = String((e as any)?.stderr || (e as Error)?.message).split("\n")[0].slice(0, 200);
+            if (e instanceof EngineTrouble) { dropAiRun(db, runId); engineDown = true; firstError ??= e; continue; } // account/outage: refund, pause
+            if (!(e instanceof ReviewFailed) && attempt < MAX_AI_ATTEMPTS) {
+              // A transient failure: remember the attempt so this commit can't retry forever, then try again next poll.
+              put.run(p.repo, p.number, p.sha, agent, p.title, p.url, "retry", "[]", `Attempt ${attempt} failed: ${line}`, previous?.comment_id ?? null, now, attempt, 1);
+              deps.log?.(`${agent} on ${p.repo}#${p.number}: ${line}`);
+              continue;
+            }
+            // Out of attempts, or a review that can't complete: fail closed for a blocking lens.
+            out = { bad: !lens.advisory, description: lens.advisory ? "Couldn't review — needs a human" : "Couldn't review — a person should check it", details: [],
+              body: `<!-- mycelium-${lens.id} -->\n## ${lens.emoji} Mycelium ${lens.id}: couldn't review this PR\n\n${line}\n\n<sub>An unfinished review isn't a pass. A person should look before merging.</sub>`, note: `Couldn't review: ${line}` };
+          }
+          let commentId = previous?.comment_id ?? null, postBody = out.body, noteOut = out.note;
+          try {
+            await deps.github.setStatus(p.repo, p.sha, out.bad ? "failure" : "success", out.description, target, AGENT_CONTEXT[agent]);
+          } catch (e) {
+            const line = String((e as any)?.stderr || (e as Error)?.message).split("\n")[0].slice(0, 200);
+            if (!/HTTP (403|404)/.test(`${(e as any)?.stderr ?? ""} ${(e as Error)?.message ?? ""}`)) {
+              if (attempt < MAX_AI_ATTEMPTS) { put.run(p.repo, p.number, p.sha, agent, p.title, p.url, "retry", "[]", `Attempt ${attempt} couldn't post: ${line}`, previous?.comment_id ?? null, now, attempt, 1); firstError ??= e; continue; }
+              throw e; // give up after the cap; the outer catch logs it
+            }
+            postBody = null; noteOut = "This GitHub account can't post to this repo, so the result only shows here.";
+          }
+          if (postBody) { try { commentId = await deps.github.comment(p.repo, p.number, commentId, postBody); } catch (e) { deps.log?.(`couldn't comment on ${p.repo}#${p.number}: ${String((e as Error)?.message).split("\n")[0]}`); } }
+          put.run(p.repo, p.number, p.sha, agent, p.title, p.url, out.bad ? "failed" : "passed", JSON.stringify(out.details), noteOut, commentId, now, attempt, 1);
+          checked++;
+          if (out.bad) { failed++; await emailFailure(db, agent, p, out.description, deps); }
+          continue;
         }
         // The check first: if the comment can't be posted, the PR must still show the result.
         // A repo this account can read but not write to can't take a check. That won't change on a retry, so record the result here and move on.
@@ -289,7 +346,7 @@ export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentD
             deps.log?.(`couldn't comment on ${p.repo}#${p.number}: ${String((e as Error)?.message).split("\n")[0]}`);
           }
         }
-        put.run(p.repo, p.number, p.sha, agent, p.title, p.url, bad ? "failed" : "passed", JSON.stringify(details), note, commentId, now);
+        put.run(p.repo, p.number, p.sha, agent, p.title, p.url, bad ? "failed" : "passed", JSON.stringify(details), note, commentId, now, 0, 1);
         checked++;
         if (bad) {
           failed++;
@@ -342,7 +399,7 @@ async function emailFailure(db: DatabaseSync, agent: AgentName, p: OpenPr, descr
 }
 
 export function agentsView(db: DatabaseSync) {
-  db.exec(SCHEMA);
+  ensureAgentSchema(db);
   const totals = (agent: string) => db.prepare("SELECT count(*) AS checked, COALESCE(sum(state IN ('failed', 'closed')), 0) AS failed FROM agent_checks WHERE agent = ? AND state != 'skipped'").get(agent) as { checked: number; failed: number };
   // Each PR's latest commit per agent: a failure that a later commit fixed is over.
   const choices = loadRepoChoices(db);
