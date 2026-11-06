@@ -6,7 +6,7 @@ import { homedir } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
 import { DB_PATH, openDb } from "./db.ts";
 import { mergeRoots, scanRoots } from "./scan.ts";
-import { applyFixes, errLine, planFixes, type ApplyResult, type FixPlan } from "./fix.ts";
+import { applyFixes, errLine, leftoverDetail, planFixes, waitingSummary, type ApplyResult, type FixPlan } from "./fix.ts";
 import { audit, CATEGORY_LABEL } from "./audit.ts";
 import { enrich } from "./depsdev.ts";
 import { severityRank } from "./osv.ts";
@@ -484,12 +484,12 @@ async function fixAll() {
   const projects = (db.prepare("SELECT name FROM projects ORDER BY name").all() as { name: string }[])
     .map((p) => p.name).filter((n) => !only || only.includes(n));
 
-  type Row = { project: string; status: "fixed" | "pr" | "nothing" | "manual-only" | "failed" | "verify-failed" | "planned";
-    autoFixable: number; fixed: string[]; prs: string[]; failed: string[]; manual: number; skippedNotes: string[]; branch: string | null; error?: string };
+  type Row = { project: string; status: "fixed" | "pr" | "nothing" | "manual-only" | "waiting" | "failed" | "verify-failed" | "planned";
+    autoFixable: number; fixed: string[]; prs: string[]; failed: string[]; manual: number; waiting: string[]; skippedNotes: string[]; branch: string | null; error?: string };
   const rows: Row[] = [];
   // One stable progress line per project ("[i/N] name · status · PR urls") so a skill/agent can stream it.
   const progress = (i: number, r: Row | undefined, name: string) => {
-    const detail = !r ? "" : r.prs.length ? r.prs.join(" ") + (r.error ? ` · ${r.error}` : "") : r.status === "manual-only" ? `${r.manual} need a human` :
+    const detail = !r ? "" : r.prs.length ? r.prs.join(" ") + (r.error ? ` · ${r.error}` : "") : r.status === "manual-only" || r.status === "waiting" ? leftoverDetail(r.manual, r.waiting.length) :
       r.status === "planned" ? `${r.autoFixable} auto` : r.status === "verify-failed" ? `build/test broke, branch ${r.branch} kept` :
       r.status === "fixed" ? `committed on ${r.branch}${r.error ? ` · ${r.error}` : ", no PR"}` : r.status === "failed" ? (r.error ?? r.failed.join("; ")).slice(0, 160) : "";
     console.log(`[${i}/${projects.length}] ${name} · ${r?.status ?? "failed"}${detail ? " · " + detail : ""}`);
@@ -499,7 +499,7 @@ async function fixAll() {
     try {
       plan = planFixes(db, name, { minSeverity: flagValue("--min")?.toUpperCase(), includeDev: flags.has("--dev") });
     } catch (e) {
-      rows.push({ project: name, status: "failed", autoFixable: 0, fixed: [], prs: [], failed: [], manual: 0, skippedNotes: [], branch: null, error: (e as Error).message });
+      rows.push({ project: name, status: "failed", autoFixable: 0, fixed: [], prs: [], failed: [], manual: 0, waiting: [], skippedNotes: [], branch: null, error: (e as Error).message });
       continue;
     }
     // A fix PR someone closed unmerged was a decision: the nightly job doesn't ask again until a newer fix exists.
@@ -510,7 +510,7 @@ async function fixAll() {
     }
     const auto = plan.fixes.filter((f) => f.strategy !== "manual" && (allowMajor || !f.breaking));
     const manual = plan.fixes.length - auto.length;
-    const row: Row = { project: name, status: "nothing", autoFixable: auto.length, fixed: [], prs: [], failed: [], manual, skippedNotes: [], branch: null };
+    const row: Row = { project: name, status: "nothing", autoFixable: auto.length, fixed: [], prs: [], failed: [], manual, waiting: [], skippedNotes: [], branch: null };
     rows.push(row);
     if (!plan.fixes.length) continue;
     if (!auto.length) { row.status = "manual-only"; continue; }
@@ -531,9 +531,9 @@ async function fixAll() {
       const verifyFailed = r.verifyFailedRepos.length > 0;
       // Applied but the package manager kept the old version: that's a failure to report, not "nothing".
       if (!r.fixed.length && r.stillVulnerable.length) row.failed.push(...r.stillVulnerable.map((s) => `${s}: still locked at the vulnerable version after the upgrade`));
-      const human = r.skipped.filter((s) => s.human);
-      row.manual += human.length;
-      row.status = row.prs.length ? "pr" : verifyFailed && r.committed ? "verify-failed" : r.fixed.length ? "fixed" : row.failed.length ? "failed" : human.length ? "manual-only" : "nothing";
+      // Tried again every night on purpose: it takes seconds, and it's how a new upstream release gets noticed.
+      row.waiting = r.skipped.filter((s) => s.human).map((s) => `${s.fix.name} ${s.fix.from}`);
+      row.status = row.prs.length ? "pr" : verifyFailed && r.committed ? "verify-failed" : r.fixed.length ? "fixed" : row.failed.length ? "failed" : row.manual ? "manual-only" : row.waiting.length ? "waiting" : "nothing";
       const notes: string[] = [];
       if (verifyFailed) notes.push(`build/test broke in ${r.verifyFailedRepos.map((p) => relative(plan.projectPath, p) || basename(p)).join(", ")}: branch kept, no PR`);
       if (r.noPr.length) notes.push(`no PR: ${r.noPr.join("; ")}`);
@@ -555,13 +555,15 @@ async function fixAll() {
   }
   const acted = rows.filter((r) => r.status !== "nothing");
   console.log(c.bold(`\n${apply ? "Fix-all summary" : "Fix-all plan (dry run; add --apply)"}`));
-  const icon: Record<Row["status"], string> = { pr: "⇪", fixed: "✓", "verify-failed": "✗", failed: "✗", "manual-only": "·", planned: "→", nothing: "✓" };
+  const icon: Record<Row["status"], string> = { pr: "⇪", fixed: "✓", "verify-failed": "✗", failed: "✗", "manual-only": "·", waiting: "·", planned: "→", nothing: "✓" };
   for (const r of acted) {
-    const detail = r.status === "pr" ? r.prs.join(" ") + (r.error ? ` · ${r.error}` : "") : r.status === "manual-only" ? `${r.manual} need a human` : r.status === "planned" ? `${r.autoFixable} auto` :
+    const detail = r.status === "pr" ? r.prs.join(" ") + (r.error ? ` · ${r.error}` : "") : r.status === "manual-only" || r.status === "waiting" ? leftoverDetail(r.manual, r.waiting.length) : r.status === "planned" ? `${r.autoFixable} auto` :
       r.status === "verify-failed" ? `build/test broke: branch ${r.branch} kept, no PR` : r.status === "fixed" ? `committed on ${r.branch} (${r.error ?? "no PR"})` :
       r.error ?? r.failed.join("; ") ?? "";
     console.log(`${icon[r.status]} ${r.project.padEnd(28)} ${r.status.padEnd(14)} ${c.dim(detail.slice(0, 200))}`);
   }
+  const blocked = waitingSummary(rows);
+  if (blocked.length) console.log(c.dim(`\nWaiting on an upstream release, retried each run:\n${blocked.map((b) => `  ${b}`).join("\n")}`));
   const clean = rows.length - acted.length;
   console.log(c.dim(`\n${clean} project(s) had nothing to fix.`));
   const dir = join(homedir(), ".mycelium");
