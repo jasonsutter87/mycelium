@@ -305,10 +305,9 @@ function repoJobHtml() {
   const j = state.repoJob;
   if (!j || j.state !== "running") return "";
   const fetching = j.step === "fetching";
-  const pct = fetching ? Math.round((j.finished / j.total) * 100) : 100;
   return `<div class="jobbox" role="status" aria-live="polite">
     <div><span class="spin"></span><b>${JOB_STEP[j.step]}</b> <span class="muted">${fetching ? `${j.finished} of ${j.total}` : ""}${fetching && j.current.length ? ` · ${esc(j.current.join(", "))}` : ""}</span></div>
-    <div class="bar"><i style="width:${pct}%"></i></div>
+    <progress class="bar" max="${j.total}" value="${fetching ? j.finished : j.total}" aria-label="Import progress"></progress>
     <div class="small muted">This keeps going if you leave this page.</div></div>`;
 }
 
@@ -515,23 +514,46 @@ function renderProfile() {
   const d = state.tabs.profile;
   if (!d) return ($("canvas").innerHTML = `<div class="empty"><span class="spin"></span>Loading your profile</div>`);
   const gh = d.github;
-  $("canvas").innerHTML = `<div class="page narrow">
-    <h2>Profile</h2>
-    <h3>Company</h3>
-    <div class="actions tight"><input class="field grow" id="pCompany" maxlength="80" placeholder="Your company name" aria-label="Company name" value="${esc(state.profileDraft ?? d.company)}"><button class="btn" id="pSave">Save</button>${state.profileMsg ? `<span class="small ${state.profileMsg.err ? "warn-text" : "ok-text"}" role="status">${esc(state.profileMsg.text)}</span>` : ""}</div>
-    <p class="small muted">Shown at the top of this page and in the subject of alert emails.</p>
-    <h3>Your account</h3>
-    ${d.signIn ? `<p>Signed in as <b>${esc(d.user)}</b> · <a href="/auth/logout">Sign out</a></p>
-      <p class="small muted">Can sign in here: ${d.allowedEmails.map(esc).join(", ")}. This list is set when Mycelium is installed.</p>`
-      : `<p>No sign-in: this install can only be reached from this computer.</p>`}
-    <h3>GitHub connection</h3>
-    ${gh.login ? `<p><span class="pill clean"><span class="dot"></span>Connected</span> as <b>${esc(gh.login)}</b>${gh.name ? ` <span class="muted">(${esc(gh.name)})</span>` : ""}</p>
-      <p class="small muted">Mycelium reads repos and opens fix pull requests as this account, so PRs show its name.</p>
-      ${gh.accounts.length ? `<ul class="plain small">${gh.accounts.slice(0, 8).map((a) => `<li>${esc(a.owner)} <span class="muted">· ${a.repos} repo${a.repos === 1 ? "" : "s"}</span></li>`).join("")}${gh.accounts.length > 8 ? `<li class="muted">and ${gh.accounts.length - 8} more</li>` : ""}</ul>` : ""}`
-      : `<div class="warn-box"><b>GitHub isn't connected.</b> On the machine running Mycelium, run <span class="mono">gh auth login</span>, then reload this page.</div>`}
-    <h3>This install</h3>
-    <p>${d.install.managed ? `${d.install.watched} repo${d.install.watched === 1 ? "" : "s"} watched` : "Scanning folders on this computer"} · ${d.install.projects} project${d.install.projects === 1 ? "" : "s"}</p>
-    <div class="actions tight">${d.install.managed ? `<button class="btn small" data-go="repos">Manage repos</button>` : ""}<button class="btn small" data-go="alerts">${d.alerts.enabled ? `Alerts on: ${d.alerts.recipients.length} recipient${d.alerts.recipients.length === 1 ? "" : "s"}` : "Alerts off: set them up"}</button></div>
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  const title = d.company || "Your company";
+  const initial = (d.company || d.user || "M").trim()[0].toUpperCase();
+  const tile = (go, value, label, cls = "") => `<button class="ptile" data-go="${go}"><b class="${cls}">${esc(value)}</b><span>${esc(label)}</span></button>`;
+  const SHOWN = 6;
+  $("canvas").innerHTML = `<div class="profile">
+    <header class="phead">
+      <div class="pavatar" aria-hidden="true">${esc(initial)}</div>
+      <div class="pwho"><h2 class="${d.company ? "" : "muted"}">${esc(title)}</h2><p class="muted">${d.signIn ? esc(d.user) : "This computer only"}</p></div>
+    </header>
+    <div class="ptiles">
+      ${d.install.managed ? tile("repos", d.install.watched, d.install.watched === 1 ? "repo watched" : "repos watched") : tile("repos", "Folders", "scanned on this computer")}
+      ${tile("projects", d.install.projects, d.install.projects === 1 ? "project" : "projects")}
+      ${tile("alerts", d.alerts.enabled ? "On" : "Off", d.alerts.enabled ? `alerts to ${plural(d.alerts.recipients.length, "recipient")}` : "email alerts", d.alerts.enabled ? "ok-text" : "")}
+    </div>
+    <div class="pgrid">
+      <div class="pcol">
+      <section class="pcard">
+        <h3>Company</h3>
+        <div class="pform"><input class="field" id="pCompany" maxlength="80" placeholder="Your company name" aria-label="Company name" value="${esc(state.profileDraft ?? d.company)}"><button class="btn" id="pSave">Save</button></div>
+        ${state.profileMsg ? `<p class="small ${state.profileMsg.err ? "warn-text" : "ok-text"}" role="status">${esc(state.profileMsg.text)}</p>` : `<p class="small muted">Shown in the top bar and in the subject of alert emails.</p>`}
+      </section>
+      <section class="pcard">
+        <h3>Your account</h3>
+        ${d.signIn ? `<p class="pline"><span>Signed in as <b>${esc(d.user)}</b></span><a class="btn small" href="/auth/logout">Sign out</a></p>
+          <p class="small muted">Can sign in here</p>
+          <ul class="pchips">${d.allowedEmails.map((e) => `<li>${esc(e)}</li>`).join("")}</ul>
+          <p class="small muted">This list is set when Mycelium is installed.</p>`
+          : `<p>No sign-in is needed, because this install can only be reached from this computer.</p>`}
+      </section>
+      </div>
+      <section class="pcard">
+        <h3>GitHub connection</h3>
+        ${gh.login ? `<div class="pidentity"><span class="pill clean"><span class="dot"></span>Connected</span><span><b>${esc(gh.login)}</b>${gh.name ? ` <span class="muted">${esc(gh.name)}</span>` : ""}</span></div>
+          <p class="small muted">Mycelium reads repos and opens fix pull requests as this account, so PRs show its name.</p>
+          ${gh.accounts.length ? `<ul class="prows">${gh.accounts.slice(0, SHOWN).map((a) => `<li><span>${esc(a.owner)}</span><span class="muted">${plural(a.repos, "repo")}</span></li>`).join("")}</ul>
+            ${gh.accounts.length > SHOWN ? `<p class="small muted">and ${gh.accounts.length - SHOWN} more</p>` : ""}` : ""}`
+          : `<div class="warn-box"><b>GitHub isn't connected.</b> On the machine running Mycelium, run <span class="mono">gh auth login</span>, then reload this page.</div>`}
+      </section>
+    </div>
   </div>`;
   $("pCompany").oninput = (e) => { state.profileDraft = e.target.value; };
   $("pSave").onclick = async () => {
