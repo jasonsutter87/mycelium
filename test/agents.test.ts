@@ -381,7 +381,7 @@ test("Crimson blocks on a high finding; a11y is advisory; both count against the
   try {
     const db = openDb(":memory:");
     const engine: ReviewEngine = async (_input, _repo, _sha, system) => {
-      const crimson = /red-team/.test(system ?? "");
+      const crimson = !/accessibility|WCAG/i.test(system ?? ""); // a11y prompt names WCAG; anything else here is Crimson
       return { result: { summary: crimson ? "a backdoor" : "a missing label",
         findings: [{ severity: "high", category: crimson ? "security" : "a11y", file: "a.ts", line: 1, title: crimson ? "backdoor" : "no label", detail: "d", suggestion: "s" }] }, costUsd: null };
     };
@@ -399,7 +399,7 @@ test("Crimson blocks on a high finding; a11y is advisory; both count against the
     open[0] = pr(r, next, { baseSha: first, author: "alice" });
     await pollAgents(db, ["o/r"], deps);
     const last = (c: string) => gh.statuses.filter((s) => s.context === c).at(-1);
-    assert.equal(last("Mycelium crimson")!.state, "failure", "a high red-team finding blocks");
+    assert.equal(last("Mycelium crimson")!.state, "failure", "a high security finding blocks");
     assert.equal(last("Mycelium a11y")!.state, "success", "a11y is advisory and never blocks");
     assert.equal((db.prepare("SELECT count(*) AS n FROM review_runs").get() as { n: number }).n, 2, "each lens run counts against the daily budget");
     assert.ok(gh.comments.some((c) => /Mycelium crimson/.test(c.body)) && gh.comments.some((c) => /advisory/.test(c.body)));
