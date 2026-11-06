@@ -56,7 +56,12 @@ const SCHEMA = `CREATE TABLE IF NOT EXISTS agent_checks (
 // ---------------------------------------------------------------- key watcher
 
 export async function checkKeys(repo: string, p: Pick<OpenPr, "baseSha" | "sha">): Promise<KeyHit[]> {
-  return scanPatch(await git(repo, ["-c", "core.quotePath=false", "log", "-p", "--format=commit:%H", "--no-ext-diff", "--no-textconv", "--no-color", "-U0", `${p.baseSha}..${p.sha}`]));
+  const flags = ["--text", "--no-ext-diff", "--no-textconv", "--no-color", "-U0"];
+  // Commit by commit catches a key added then deleted. The whole-PR diff catches one that came in through a merge, which git log leaves out.
+  const history = scanPatch(await git(repo, ["-c", "core.quotePath=false", "log", "-p", "--format=commit:%H", ...flags, `${p.baseSha}..${p.sha}`]));
+  const final = scanPatch(await git(repo, ["-c", "core.quotePath=false", "diff", ...flags, `${p.baseSha}...${p.sha}`])).map((h) => ({ ...h, commit: p.sha }));
+  const known = new Set(history.map((h) => `${h.kind}|${h.file}`));
+  return [...history, ...final.filter((h) => !known.has(`${h.kind}|${h.file}`))];
 }
 
 export function keysComment(repo: string, hits: KeyHit[]): string {
@@ -76,11 +81,15 @@ export interface FungiResult {
   uncheckable: string[]; // dependency files that changed but can't be checked: no lockfile, or one this can't read
   unreadable: string[]; // lockfiles that wouldn't parse, like ones with merge conflict markers
 }
-export const FUNGI_BLOCKS = (v: PackageVuln) => v.vulnId.startsWith("MAL-") || severityRank(v.severity) >= severityRank("HIGH");
+// UNKNOWN blocks too: an advisory with no usable score hasn't been shown to be minor.
+export const FUNGI_BLOCKS = (v: PackageVuln) => v.vulnId.startsWith("MAL-") || v.severity === "UNKNOWN" || severityRank(v.severity) >= severityRank("HIGH");
 
-const LOCK_NAME = /^(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock|packages\.lock\.json|poetry\.lock|uv\.lock|Pipfile\.lock|go\.mod)$/;
+// What parseLockText can read, so exact versions can be compared.
+const LOCK_NAME = /^(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock|packages\.lock\.json|poetry\.lock|uv\.lock|Pipfile\.lock|go\.mod|requirements.*\.txt|.*\.(?:cs|fs|vb)proj|build\.gradle(?:\.kts)?)$/;
+// These only give ranges: fine if a lockfile beside or above them changed too, a gap if not.
+const NEEDS_LOCK = /^(package\.json|Cargo\.toml|pyproject\.toml|Pipfile)$/;
 
-const UNSUPPORTED_LOCK = /^(bun\.lockb?|Gemfile\.lock|composer\.lock|go\.sum|gradle\.lockfile)$/;
+const UNSUPPORTED = /^(bun\.lockb?|Gemfile(\.lock)?|composer\.(lock|json)|gradle\.lockfile|pom\.xml|Directory\.Packages\.props)$/;
 
 /** Empty when the file isn't in that commit. Null when it's there but can't be parsed. A failure in git itself throws, and the poll retries. */
 const parseAt = async (repo: string, sha: string, path: string) => {
@@ -105,7 +114,11 @@ export async function checkDependencies(repo: string, p: Pick<OpenPr, "baseSha" 
   const changed = (await git(repo, ["-c", "core.quotePath=false", "diff", "--name-only", "--no-renames", `${forkPoint}...${p.sha}`])).split("\n").filter(Boolean);
   const locks = changed.filter((f) => LOCK_NAME.test(basename(f)));
   const dirOf = (f: string) => f.slice(0, Math.max(0, f.lastIndexOf("/")));
-  const uncheckable = changed.filter((f) => UNSUPPORTED_LOCK.test(basename(f)) || (basename(f) === "package.json" && !locks.some((l) => dirOf(l) === dirOf(f)) && !changed.some((o) => UNSUPPORTED_LOCK.test(basename(o)) && dirOf(o) === dirOf(f))));
+  const covers = (lock: string, f: string) => dirOf(lock) === "" || dirOf(f) === dirOf(lock) || dirOf(f).startsWith(`${dirOf(lock)}/`);
+  const unsupported = changed.filter((f) => UNSUPPORTED.test(basename(f)));
+  const uncheckable = [...unsupported, ...changed.filter((f) => NEEDS_LOCK.test(basename(f)) && !locks.some((l) => covers(l, f)) && !unsupported.some((l) => covers(l, f)))];
+  // go.sum only ever changes with its go.mod, which is read. On its own it's a gap.
+  for (const f of changed) if (basename(f) === "go.sum" && !locks.some((l) => basename(l) === "go.mod" && dirOf(l) === dirOf(f))) uncheckable.push(f);
   const unreadable: string[] = [];
   const fresh = new Map<string, { ecosystem: string; name: string; version: string; lockfile: string }>();
   for (const lock of locks) {
@@ -207,6 +220,12 @@ export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentD
       }
     }
   }
+  // A flagged PR that has since closed isn't a to-do any more. Only a complete answer can say it closed.
+  const complete = listing.answered.filter((r) => !listing.partial.includes(r));
+  const openNow = new Set(listing.prs.map((p) => `${p.repo}#${p.number}`));
+  for (const r of db.prepare("SELECT DISTINCT repo, number FROM agent_checks WHERE state = 'failed'").all() as { repo: string; number: number }[]) {
+    if (complete.includes(r.repo) && !openNow.has(`${r.repo}#${r.number}`)) db.prepare("UPDATE agent_checks SET state = 'closed' WHERE state = 'failed' AND repo = ? AND number = ?").run(r.repo, r.number);
+  }
   const latest = loadAgentSettings(db);
   writeSettings(db, { ...latest, seen: { keys: latest.keys ? [...new Set([...latest.seen.keys, ...listing.answered])] : [], fungi: latest.fungi ? [...new Set([...latest.seen.fungi, ...listing.answered])] : [] } });
   if (firstError) throw firstError;
@@ -233,11 +252,9 @@ async function emailFailure(db: DatabaseSync, agent: AgentName, p: OpenPr, descr
 
 export function agentsView(db: DatabaseSync) {
   db.exec(SCHEMA);
-  const rows = db.prepare("SELECT * FROM agent_checks WHERE state != 'skipped' ORDER BY checked_at DESC LIMIT 400").all() as any[];
-  const totals = (agent: string) => ({
-    checked: rows.filter((r) => r.agent === agent).length,
-    failed: rows.filter((r) => r.agent === agent && r.state === "failed").length,
-  });
+  const totals = (agent: string) => db.prepare("SELECT count(*) AS checked, COALESCE(sum(state IN ('failed', 'closed')), 0) AS failed FROM agent_checks WHERE agent = ? AND state != 'skipped'").get(agent) as { checked: number; failed: number };
+  // Each PR's latest commit per agent: a failure that a later commit fixed is over.
+  const rows = db.prepare(`SELECT * FROM agent_checks a WHERE state IN ('passed', 'failed') AND checked_at = (SELECT max(checked_at) FROM agent_checks b WHERE b.repo = a.repo AND b.number = a.number AND b.agent = a.agent AND b.state != 'skipped') ORDER BY checked_at DESC LIMIT 200`).all() as any[];
   return {
     settings: loadAgentSettings(db),
     totals: { keys: totals("keys"), fungi: totals("fungi") },

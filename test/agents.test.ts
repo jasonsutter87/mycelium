@@ -215,3 +215,72 @@ test("the check is set first and comments are capped, so a failed comment can't 
     assert.equal(open.statuses.at(-1).state, "failure");
   } finally { r.cleanup(); }
 });
+
+// ---------------------------------------------------------------- what the third real review found
+
+test("taking a secret file out isn't flagged, test fixtures aren't, and snake_case isn't a key", () => {
+  assert.deepEqual(scanPatch("diff --git a/.env b/.env\ndeleted file mode 100644\n--- a/.env\n+++ /dev/null\n@@ -1 +0,0 @@\n-A=1\n"), []);
+  assert.deepEqual(scanPatch("diff --git a/test/fixtures/.env b/test/fixtures/.env\nnew file mode 100644\n"), []);
+  assert.equal(scanLine("re_authenticate_user_session_now()"), null);
+  assert.equal(scanLine("re_" + "AbCdEf123456_ghIJklMNop"), "Resend API key");
+});
+
+test("the key watcher sees keys from a merge and in text git thinks is binary", async () => {
+  const r = repo();
+  try {
+    const g = (...a: string[]) => execFileSync("git", a, { cwd: r.dir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    g("checkout", "-q", "-b", "pr");
+    r.commit({ "a.ts": "export const a = 2;\n" });
+    g("checkout", "-q", "main");
+    r.commit({ "a.ts": "export const a = 3;\n" });
+    const base = g("rev-parse", "HEAD");
+    g("checkout", "-q", "pr");
+    try { g("merge", "-q", "main"); } catch { /* the conflict is the point */ }
+    writeFileSync(join(r.dir, "a.ts"), `export const k = "${GH}";\n`);
+    g("add", "-A"); g("commit", "-qm", "merge");
+    const merged = g("rev-parse", "HEAD");
+    assert.equal((await checkKeys(r.dir, { baseSha: base, sha: merged })).length, 1);
+    const bin = r.commit({ "b.txt": `\0${GH}\n` });
+    assert.ok((await checkKeys(r.dir, { baseSha: merged, sha: bin })).some((h) => h.file === "b.txt"));
+  } finally { r.cleanup(); }
+});
+
+test("fungi doesn't pass files it never read, and doesn't cry wolf on normal changes", async () => {
+  const r = repo();
+  try {
+    const run = async (baseSha: string, sha: string, found: any[] = []) => checkDependencies(r.dir, { baseSha, sha }, async (list) => found.length ? found : (list.length ? [] : []));
+    const req = r.commit({ "requirements.txt": "Django==2.0\n" });
+    const asked: string[] = [];
+    await checkDependencies(r.dir, { baseSha: r.base, sha: req }, async (list) => { asked.push(...list.map((p) => `${p.ecosystem}:${p.name}`)); return []; });
+    assert.ok(asked.some((a) => a.startsWith("PyPI:") && a.toLowerCase().includes("django")));
+    const pom = r.commit({ "pom.xml": "<project/>\n" });
+    assert.deepEqual((await run(req, pom)).uncheckable, ["pom.xml"]);
+    const toml = r.commit({ "Cargo.toml": "[package]\n" });
+    assert.deepEqual((await run(pom, toml)).uncheckable, ["Cargo.toml"]);
+    execFileSync("mkdir", ["-p", join(r.dir, "packages/a")]);
+    const mono = r.commit({ "packages/a/package.json": "{}", "package-lock.json": lock({ old: "1.0.0", shared: "2.0.0", added: "1.0.0" }) });
+    assert.deepEqual((await run(toml, mono)).uncheckable, [], "a lockfile above it counts");
+    const go = r.commit({ "go.mod": "module x\n", "go.sum": "" });
+    assert.deepEqual((await run(mono, go)).uncheckable, [], "go.sum with its go.mod");
+  } finally { r.cleanup(); }
+});
+
+test("an advisory with no usable severity fails, and a fixed or closed PR leaves the flagged list", async () => {
+  const r = repo();
+  try {
+    const db = openDb(":memory:");
+    saveAgentSettings(db, { fungi: true });
+    await pollAgents(db, ["o/r"], { github: fake([]).github, repoPath: () => r.dir, baseUrl: null });
+    const bad = r.commit({ "package-lock.json": lock({ fresh: "1.0.0" }) });
+    withOrigin(r, bad);
+    const unknown = async () => [{ ecosystem: "npm", name: "fresh", version: "1.0.0", vulnId: "GHSA-1", severity: "UNKNOWN", summary: "x", fixed: null }];
+    const open = [pr(r, bad)];
+    const gh = fake(open);
+    assert.deepEqual(await pollAgents(db, ["o/r"], { github: gh.github, repoPath: () => r.dir, baseUrl: null, check: unknown }), { checked: 1, failed: 1 });
+    assert.equal(agentsView(db).problems.length, 1);
+    open.length = 0;
+    await pollAgents(db, ["o/r"], { github: gh.github, repoPath: () => r.dir, baseUrl: null, check: unknown });
+    assert.equal(agentsView(db).problems.length, 0, "the PR closed");
+    assert.equal(agentsView(db).totals.fungi.failed, 1, "but it still counts as flagged");
+  } finally { r.cleanup(); }
+});

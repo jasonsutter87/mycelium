@@ -69,7 +69,7 @@ async function sync(dir?: string) {
   // Fungi's nightly job: open fix PRs for what's fixable. Never merges, and a fix already in an open PR isn't repeated.
   const { loadAgentSettings } = await import("./agents.ts");
   if (loadAgentSettings(db).fungiAutoFix) {
-    flags.add("--apply"); flags.add("--no-refresh");
+    flags.add("--apply"); flags.add("--no-refresh"); flags.add("--respect-closed");
     if (!flagValue("--min")) values.set("--min", "high");
     await fixAll().catch((e) => console.log(c.yellow(`fungi: couldn't open fix PRs: ${(e as Error).message}`)));
   }
@@ -91,7 +91,7 @@ async function keysCmd() {
     return console.log(`Installed ${hook}`);
   }
   if (!flags.has("--staged")) return fail("Usage: mycelium keys --staged | --install-hook");
-  const hits = scanPatch(run("diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color", "-U0"));
+  const hits = scanPatch(run("-c", "core.quotePath=false", "diff", "--cached", "--text", "--no-ext-diff", "--no-textconv", "--no-color", "-U0"));
   if (!hits.length) return;
   console.error(`${c.red("Commit stopped: possible API key.")}\n${describeHits(hits)}\n\nRemove it, or add mycelium:allow-key to the line if it's a test value.`);
   process.exitCode = 1;
@@ -491,6 +491,12 @@ async function fixAll() {
     } catch (e) {
       rows.push({ project: name, status: "failed", autoFixable: 0, fixed: [], prs: [], failed: [], manual: 0, skippedNotes: [], branch: null, error: (e as Error).message });
       continue;
+    }
+    // A fix PR someone closed unmerged was a decision: the nightly job doesn't ask again until a newer fix exists.
+    if (flags.has("--respect-closed")) {
+      const closed = new Set((db.prepare("SELECT fixes FROM pr_history WHERE project = ? AND state = 'CLOSED'").all(name) as { fixes: string }[])
+        .flatMap((r) => (JSON.parse(r.fixes) as { name: string; to: string | null }[]).map((f) => `${f.name}@${f.to}`)));
+      plan = { ...plan, fixes: plan.fixes.filter((f) => !closed.has(`${f.name}@${f.to}`)) };
     }
     const auto = plan.fixes.filter((f) => f.strategy !== "manual" && (allowMajor || !f.breaking));
     const manual = plan.fixes.length - auto.length;

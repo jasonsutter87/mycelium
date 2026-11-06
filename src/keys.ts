@@ -12,7 +12,7 @@ export const KEY_PATTERNS: { kind: string; re: RegExp }[] = [
   { kind: "Stripe key", re: /\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\b/ },
   { kind: "Stripe test key", re: /\b(?:sk|rk)_test_[A-Za-z0-9]{16,}\b/ },
   { kind: "Stripe webhook secret", re: /\bwhsec_[A-Za-z0-9]{24,}\b/ },
-  { kind: "Resend API key", re: /\bre_[A-Za-z0-9_]{20,}\b/ },
+  { kind: "Resend API key", re: /\bre_(?=[a-z0-9_]*[A-Z])[A-Za-z0-9_]{20,}\b/ }, // the capital letter tells a key from a snake_case name
   { kind: "AWS access key", re: /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/ },
   { kind: "Slack token", re: /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/ },
   { kind: "Slack webhook", re: /https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/]{20,}/ },
@@ -29,16 +29,16 @@ export const KEY_PATTERNS: { kind: string; re: RegExp }[] = [
 /** Blanks every known key format. For text about to leave this machine. */
 export const redactKeys = (text: string): string =>
   KEY_PATTERNS.reduce((t, { re }) => t.replace(new RegExp(re.source, "g"), "[REDACTED]"),
-    // A whole key block, only when it really ends nearby. A lone BEGIN line must never swallow what follows it: that would let
-    // one comment hide the rest of a diff from the reviewer. Then package manager auth lines, which have no recognisable format.
-    text.replace(/-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----[\s\S]{0,12000}?-----END (?:[A-Z]+ )*PRIVATE KEY-----/g, "[REDACTED]")
-      .replace(/^(\s*[-+ ]?\s*\S*(?:_authToken|_auth|_password)\s*=\s*).+$/gm, "$1[REDACTED]"));
+    // A whole key block, only if everything between the markers really is base64. Markers around anything else must not hide it
+    // from the reviewer, and a lone BEGIN line only loses itself. Then npm-style auth lines, which have no recognisable format.
+    text.replace(/-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----(?:(?:\\n|\r?\n[-+ ]?[ \t]*)[A-Za-z0-9+/=]{1,100})+(?:\\n|\r?\n[-+ ]?[ \t]*)-----END (?:[A-Z]+ )*PRIVATE KEY-----/g, "[REDACTED]")
+      .replace(/^([-+ ]?\s*(?:\/\/\S+:)?(?:_authToken|_auth|_password)\s*=\s*).+$/gm, "$1[REDACTED]"));
 
 // Documentation values and placeholders. `mycelium:allow-key` on the line is the way out for a test fixture.
 const PLACEHOLDER = /EXAMPLE|x{6,}|X{6,}|0{8,}|your[-_]?(?:api[-_]?)?key|placeholder|<[a-z_-]+>/i;
 const ALLOW = "mycelium:allow-key";
 const SECRET_FILE = /(^|\/)(\.env(\.[\w-]+)?|\.envrc|[\w.-]+\.env|id_(rsa|dsa|ecdsa|ed25519)|\.pypirc|\.netrc|\.git-credentials)$|\.(pem|p12|pfx|jks|keystore|tfvars|tfstate)$/;
-const SAFE_FILE = /\.(example|sample|template|dist|defaults?)$/;
+const SAFE_FILE = /\.(example|sample|template|dist|defaults?)$|(^|\/)(tests?|__tests__|fixtures|__fixtures__|testdata)\//;
 
 export const scanLine = (line: string): string | null => {
   if (line.includes(ALLOW)) return null;
@@ -58,8 +58,13 @@ export function scanPatch(patch: string): KeyHit[] {
   const seen = new Set<string>();
   let commit: string | null = null, file = "", line = 0;
   let oldLeft = 0, newLeft = 0; // lines still to come in this hunk. Inside one, anything is content, even a line that looks like a header
+  let named: string | null = null; // from the last diff header: reported once we know it isn't a deletion
   const secretName = (path: string) => {
     if (SECRET_FILE.test(path) && !SAFE_FILE.test(path)) add({ kind: "file that holds secrets", file: path, line: 0, commit });
+  };
+  const flushName = () => {
+    if (named) secretName(named);
+    named = null;
   };
   const add = (hit: KeyHit) => {
     const key = `${hit.kind}|${hit.file}|${hit.line}`;
@@ -76,12 +81,13 @@ export function scanPatch(patch: string): KeyHit[] {
       else if (!raw.startsWith("\\")) { oldLeft--; newLeft--; line++; } // a context line, for patches made with context
       continue;
     }
-    if (raw.startsWith("commit:")) { commit = raw.slice(7).trim(); continue; }
+    if (raw.startsWith("commit:")) { flushName(); commit = raw.slice(7).trim(); continue; }
+    if (raw.startsWith("deleted file mode")) { named = null; continue; } // taking a secret file out is the fix, not the problem
     if (raw.startsWith("diff --git ")) {
+      flushName();
       file = "";
       // Binary files, empty files and pure renames never get a +++ line: this header is all there is.
-      const same = /^diff --git a\/(.+) b\/\1$/.exec(raw);
-      if (same) secretName(same[1]);
+      named = /^diff --git a\/(.+) b\/\1$/.exec(raw)?.[1] ?? null;
       continue;
     }
     if (raw.startsWith("rename to ") || raw.startsWith("copy to ")) { secretName(raw.replace(/^(rename|copy) to /, "")); continue; }
@@ -97,6 +103,7 @@ export function scanPatch(patch: string): KeyHit[] {
       line = Number(hunk[2]);
     }
   }
+  flushName();
   return hits;
 }
 

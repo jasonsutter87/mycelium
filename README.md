@@ -238,7 +238,7 @@ dependency bots and forks. They only read git objects and never run a PR's code.
 - **Key watcher** (`Mycelium keys`) looks for known API key formats and secret files in every commit of a PR, so a key added and then deleted is still caught.
   It never shows the value. A key found here is already on GitHub, so replace it. To stop one before it's committed: `mycelium keys --install-hook`.
 - **Fungi** (`Mycelium fungi`) checks packages a PR's lockfile changes add against OSV, and fails on high, critical or malicious. Vulnerabilities that were already there
-  stay with Findings. It reads npm, pnpm, yarn, Cargo, NuGet, Python and Go lockfiles. For others, or a `package.json` with no lockfile, the check says what it couldn't check. A lockfile that won't parse fails the check. With nightly fixes on, each `mycelium sync` also opens fix PRs for high and critical production findings, leaving out major upgrades.
+  stay with Findings. It reads npm, pnpm, yarn, Cargo, NuGet, Python, Go and Gradle dependency files. For others, or a `package.json` with no lockfile, the check says what it couldn't check. A lockfile that won't parse fails the check, and so does an advisory with no usable severity. With nightly fixes on, each `mycelium sync` also opens fix PRs for high and critical production findings, leaving out major upgrades.
 
 ## Commands
 

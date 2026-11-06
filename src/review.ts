@@ -100,7 +100,7 @@ export function saveReviewSettings(db: DatabaseSync, input: Partial<ReviewSettin
 // ---------------------------------------------------------------- keeping secrets out
 
 const SENSITIVE_PATH = /(^|\/)(\.env(\.[^/]*)?|\.envrc|[^/]*\.env|\.pypirc|\.netrc|\.git-credentials|id_(rsa|dsa|ecdsa|ed25519)|credentials(\.(json|ya?ml|toml|ini|txt|csv))?|secrets?\.(json|ya?ml|toml))$|\.(pem|key|p12|pfx|jks|keystore|tfvars|tfstate)$/i;
-const SAFE_EXAMPLE = /\.(example|sample|template|dist|defaults?)$/i;
+const SAFE_EXAMPLE = /\.(example|sample|template|dist|defaults?|ts|tsx|js|jsx|mjs|cjs|py|rb|go|rs|java|cs|php|sh|md)$/i; // examples and source code, like .env.ts
 const LOCKFILE = /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lock|Cargo\.lock|poetry\.lock|uv\.lock|Gemfile\.lock|composer\.lock|go\.sum|packages\.lock\.json|gradle\.lockfile)$/;
 export const isSensitivePath = (path: string) => SENSITIVE_PATH.test(path) && !SAFE_EXAMPLE.test(path);
 export const redactSecrets = redactKeys;
@@ -109,10 +109,11 @@ export const redactSecrets = redactKeys;
 export function prepareDiff(raw: string): { diff: string; omitted: string[]; tooLarge: boolean } {
   const omitted: string[] = [];
   const kept = raw.split(/^(?=diff --git )/m).filter(Boolean).filter((section) => {
-    const path = /^diff --git a\/.* b\/(.*)$/m.exec(section)?.[1] ?? "";
-    const from = /^(?:rename|copy) from (.*)$/m.exec(section)?.[1] ?? "";
-    // Paths git couldn't print plainly are held back too: better an extra note than a secret sent by accident.
-    if (!path || section.startsWith('diff --git "') || isSensitivePath(path) || isSensitivePath(from)) return omitted.push(`${path || "a file with an unusual name"} (may hold secrets)`), false;
+    const header = section.split("\n", 1)[0];
+    // git quotes unusual names. They're still judged by name, so an odd name can't be used to dodge either way.
+    const path = /^diff --git a\/.* b\/(.*)$/.exec(header)?.[1] ?? /"b\/(.*)"$/.exec(header)?.[1] ?? /"a\/.*" "?b\/(.*?)"?$/.exec(header)?.[1] ?? "";
+    const from = /^(?:rename|copy) from (.*)$/m.exec(section)?.[1]?.replace(/^"|"$/g, "") ?? "";
+    if (isSensitivePath(path.replace(/"$/, "")) || isSensitivePath(from)) return omitted.push(`${path.replace(/"$/, "")} (may hold secrets)`), false;
     if (LOCKFILE.test(path) && section.length > LOCKFILE_DIFF_CHARS) return omitted.push(`${path} (large lockfile)`), false;
     return true;
   });
@@ -277,7 +278,9 @@ export function parseClaudeCodeOutput(stdout: string): ReviewResult {
   if (accountError(out?.api_error_status ?? 0, said) || /usage limit|limit reached|hit your limit|not logged in|please run \/login|invalid api key/i.test(out?.is_error ? said : "")) {
     throw new EngineTrouble(out?.api_error_status === 429 || /limit/i.test(said) ? "Your Claude plan's usage limit was reached. Reviews continue when it resets." : out?.api_error_status === 401 || out?.api_error_status === 403 || /log/i.test(said) ? "Claude Code on this server isn't logged in. Run claude there to log in." : `Anthropic returned an error (${out?.api_error_status ?? "no status"}).`);
   }
-  if (out?.is_error || out?.subtype !== "success") throw new ReviewFailed("The review didn't finish.");
+  if (/prompt is too long|too many tokens/i.test(said) || /^error_max/.test(String(out?.subtype))) throw new ReviewFailed("The review didn't finish: this PR was too big for it.");
+  // Anything else unexplained could just be the network, so it's a normal failed attempt and gets retried.
+  if (out?.is_error || out?.subtype !== "success") throw new Error("Claude Code reported an error.");
   const checked = ReviewSchema.safeParse(out.structured_output);
   if (!checked.success) throw new ReviewFailed("The review didn't come back in the expected format.");
   return checked.data;
@@ -545,8 +548,14 @@ const reviewedLastDay = (db: DatabaseSync, now: number) =>
   (db.prepare("SELECT count(*) AS n FROM review_runs WHERE at > ?").get(new Date(now - 86_400_000).toISOString()) as { n: number }).n;
 
 /** Private refs and no FETCH_HEAD: a pull running in the same clone at the same moment must not see any of this. */
-export const fetchPrObjects = (repo: string, number: number, baseRef: string) =>
-  git(repo, ["fetch", "-q", "--no-write-fetch-head", "origin", `+refs/pull/${number}/head:refs/mycelium/pr/${number}`, `+refs/heads/${baseRef}:refs/mycelium/base/${number}`]);
+export function fetchPrObjects(repo: string, number: number, baseRef: string): Promise<string> {
+  const run = () => git(repo, ["fetch", "-q", "--no-write-fetch-head", "origin", `+refs/pull/${number}/head:refs/mycelium/pr/${number}`, `+refs/heads/${baseRef}:refs/mycelium/base/${number}`]);
+  // One at a time per clone: the reviewer and the rule-based agents both fetch a new PR at the same moment.
+  const next = (fetching.get(repo) ?? Promise.resolve("")).then(run, run);
+  fetching.set(repo, next);
+  return next;
+}
+const fetching = new Map<string, Promise<string>>();
 
 export interface ReviewDeps {
   github: GithubPort;
@@ -581,7 +590,7 @@ export async function reviewOne(db: DatabaseSync, row: Row, deps: ReviewDeps): P
   const target = deps.baseUrl?.startsWith("https://") ? deps.baseUrl : null;
   const attempts = row.attempts + 1;
   setRow(db, row, { state: "running", attempts });
-  let runId: number | null = null;
+  let runId: number | null = null, saved = false;
   try {
     await deps.github.setStatus(row.repo, row.sha, "pending", "Reviewing", target);
     await fetchPrObjects(repo, row.number, row.base_ref);
@@ -597,12 +606,12 @@ export async function reviewOne(db: DatabaseSync, row: Row, deps: ReviewDeps): P
     const full = withheldFindings(result, omitted);
     // Saved before anything goes to GitHub, so trouble posting it never means paying for the same review again.
     setRow(db, row, { state: verdictOf(full.findings), summary: neutralise(full.summary), findings: JSON.stringify(full.findings), note: omitted.length ? `Not reviewed: ${omitted.join(", ")}` : null, cost_usd: costUsd, reviewed_at: new Date().toISOString(), published: 0 });
+    saved = true;
     await publishReview(db, db.prepare("SELECT * FROM reviews WHERE repo = ? AND number = ? AND sha = ?").get(row.repo, row.number, row.sha) as unknown as Row, deps);
   } catch (e) {
     const note = noteFor(e);
     deps.log?.(`review of ${row.repo}#${row.number} failed: ${note}`);
-    const finished = (db.prepare("SELECT published FROM reviews WHERE repo = ? AND number = ? AND sha = ?").get(row.repo, row.number, row.sha) as { published: number }).published === 0;
-    if (finished) return; // the verdict is saved: the next poll retries posting it
+    if (saved) return; // the verdict is saved: the next poll retries posting it
     if (apiTrouble(e)) {
       setRow(db, row, { state: "queued", attempts: row.attempts, note });
       if (runId !== null) db.prepare("DELETE FROM review_runs WHERE rowid = ?").run(runId); // an outage or a plan limit isn't a review
@@ -622,7 +631,7 @@ export function withheldFindings(result: ReviewResult, omitted: string[]): Revie
   const secret = omitted.filter((o) => o.endsWith("(may hold secrets)")).map((o) => o.replace(/ \(may hold secrets\)$/, ""));
   if (!secret.length) return result;
   return { ...result, findings: [...result.findings, ...secret.map((file): ReviewFinding => ({
-    severity: "medium", category: "not-reviewed", file: file === "a file with an unusual name" ? "" : file, line: 0,
+    severity: "medium", category: "not-reviewed", file, line: 0,
     title: `Changed file wasn't reviewed: ${file}`,
     detail: "This file may hold secrets, so it wasn't sent to the reviewer, and nothing has checked this change.",
     suggestion: "Have a person read this file's change. If it holds real secrets, take it out of the PR and replace them.",
@@ -712,7 +721,7 @@ export const resetInterrupted = (db: DatabaseSync) => void db.prepare("UPDATE re
 export function requeueReview(db: DatabaseSync, repo: string, number: number) {
   const row = db.prepare("SELECT sha FROM reviews WHERE repo = ? AND number = ? ORDER BY created_at DESC LIMIT 1").get(repo, number) as { sha: string } | undefined;
   if (!row) throw new Error("That PR hasn't been seen yet.");
-  db.prepare("UPDATE reviews SET state = 'queued', attempts = 0, note = NULL WHERE repo = ? AND number = ? AND sha = ? AND state != 'running'").run(repo, number, row.sha);
+  db.prepare("UPDATE reviews SET state = 'queued', attempts = 0, note = NULL, published = 1 WHERE repo = ? AND number = ? AND sha = ? AND state != 'running'").run(repo, number, row.sha);
 }
 
 export function reviewsView(db: DatabaseSync, opts: { managed: boolean; engine: EngineKind | null; lastError: string | null; lastPollAt: string | null }) {
