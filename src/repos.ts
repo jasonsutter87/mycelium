@@ -168,8 +168,8 @@ export function saveHiddenAccounts(db: DatabaseSync, accounts: unknown): string[
 
 // ---------------------------------------------------------------- which agents run on which repo
 
-export type RepoAgent = "review" | "keys" | "fungi" | "crimson" | "a11y";
-export const REPO_AGENTS: RepoAgent[] = ["review", "keys", "fungi", "crimson", "a11y"];
+export type RepoAgent = "review" | "keys" | "fungi" | "janitor" | "crimson" | "a11y";
+export const REPO_AGENTS: RepoAgent[] = ["review", "keys", "fungi", "janitor", "crimson", "a11y"];
 
 /** Only what someone changed is stored. Anything else follows `newRepos`, so repos watched later get a deliberate answer too. */
 export interface RepoChoices { newRepos: boolean; repos: Record<string, Partial<Record<RepoAgent, boolean>>> }

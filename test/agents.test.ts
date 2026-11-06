@@ -519,3 +519,25 @@ test("the AI lenses and the rule-based agents poll separately (only: rules | ai)
     assert.ok(!gh2.statuses.some((s: any) => s.context === "Mycelium keys"), "keys wasn't re-run");
   } finally { r.cleanup(); }
 });
+
+
+test("janitor flags an expired @deprecate block a PR changed, but never blocks (advisory)", async () => {
+  const r = repo();
+  try {
+    const db = openDb(":memory:");
+    saveAgentSettings(db, { janitor: true });
+    const cur = JSON.parse((db.prepare("SELECT value FROM settings WHERE key='agents'").get() as any).value);
+    db.prepare("UPDATE settings SET value=? WHERE key='agents'").run(JSON.stringify({ ...cur, seen: { ...cur.seen, janitor: ["o/r"] } }));
+    const sha = r.commit({ "a.ts": "// @deprecate 01-15-2020 reason: old helper\nexport const a = 2;\n" });
+    withOrigin(r, sha);
+    const gh = fake([pr(r, sha, { baseSha: r.base })]);
+    await pollAgents(db, ["o/r"], { github: gh.github, repoPath: () => r.dir, baseUrl: null });
+    const st = gh.statuses.find((s: any) => s.context === "Mycelium janitor");
+    assert.equal(st.state, "success", "advisory: it never fails the check");
+    assert.match(st.description, /expired deprecation/);
+    assert.ok(gh.comments.some((c: any) => /01-15-2020/.test(c.body) && /old helper/.test(c.body)));
+    const row = db.prepare("SELECT state, details FROM agent_checks WHERE agent='janitor'").get() as any;
+    assert.equal(row.state, "passed");
+    assert.equal(JSON.parse(row.details)[0].file, "a.ts");
+  } finally { r.cleanup(); }
+});

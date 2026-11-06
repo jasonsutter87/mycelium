@@ -695,6 +695,8 @@ function renderReviews() {
         ? p.details.map((h) => `<div class="small"><b>${esc(h.kind)}</b> <span class="mono muted">${esc(h.file)}${h.line ? `:${h.line}` : ""}</span></div>`).join("")
         : p.agent === "fungi"
         ? p.details.map((v) => `<div class="small"><span class="sev ${esc(v.severity)}">${esc(v.vulnId.startsWith("MAL-") ? "malicious" : v.severity.toLowerCase())}</span> <b>${esc(v.name)}</b> <span class="mono muted">${esc(v.version)}</span> ${v.fixed ? `<span class="muted">fixed in ${esc(v.fixed)}</span>` : ""}</div>`).join("")
+        : p.agent === "janitor"
+        ? p.details.map((d) => `<div class="small"><span class="mono muted">${esc(d.file)}:${d.line}</span> ${esc(d.date ? `removal ${d.date}` : "no date")}${d.reason ? ` — ${esc(d.reason)}` : ""}</div>`).join("")
         : p.details.map((f) => `<div class="small"><span class="sev ${esc(FINDING_SEV[f.severity] || f.severity)}">${esc(f.severity)}</span> <b>${esc(f.title)}</b>${f.file ? ` <span class="mono muted">${esc(f.file)}${f.line > 0 ? `:${f.line}` : ""}</span>` : ""}${f.detail ? `<div class="small muted">${esc(f.detail)}</div>` : ""}</div>`).join("");
       return `<div class="pgrid">
         <section class="pcard">
@@ -708,6 +710,11 @@ function renderReviews() {
           <label class="row"><input type="checkbox" id="gFungi" ${ag.settings.fungi ? "checked" : ""} ${d.managed ? "" : "disabled"}> <b>Check PRs for new vulnerable packages</b></label>
           <label class="row"><input type="checkbox" id="gFix" ${ag.settings.fungiAutoFix ? "checked" : ""} ${d.managed ? "" : "disabled"}> <span>Every night, open fix PRs for high and critical findings</span></label>
           <p class="small muted">A PR only fails for what it adds. Nightly fixes skip major upgrades and dev dependencies. Free, with no AI. ${ag.totals.fungi.checked} checked, ${ag.totals.fungi.failed} flagged.</p>
+        </section>
+        <section class="pcard">
+          <h3>🧹 Janitor</h3>
+          <label class="row"><input type="checkbox" id="gJanitor" ${ag.settings.janitor ? "checked" : ""} ${d.managed ? "" : "disabled"}> <b>Flag expired deprecated code</b></label>
+          <p class="small muted">Finds <span class="mono">@deprecate</span> blocks whose removal date has passed in a PR's changed files. Advisory — it never fails a check. Free, no AI. ${ag.totals.janitor.checked} checked, ${ag.totals.janitor.failed} flagged.</p>
         </section>
         <section class="pcard">
           <h3>🟥 Crimson</h3>
@@ -735,7 +742,7 @@ function renderReviews() {
     <div class="filters rfilters"><div class="chips" role="group" aria-label="Filter reviews">${chips.map(([id, label, c]) => `<button data-rfilter="${id}" class="${state.reviewFilter === id ? "on" : ""}">${label}<i>${c}</i></button>`).join("")}</div></div>
     ${shown.length ? `<ul class="plain rlist">${shown.map(row).join("")}</ul>` : `<div class="empty">${d.reviews.length ? "No reviews match this filter." : on ? "No PRs yet. New ones show up here within a couple of minutes." : "Turn reviews on, and new PRs show up here."}</div>`}
   </div>`;
-  [["gKeys", "keys"], ["gFungi", "fungi"], ["gFix", "fungiAutoFix"], ["gCrimson", "crimson"], ["gA11y", "a11y"]].forEach(([id, field]) => {
+  [["gKeys", "keys"], ["gFungi", "fungi"], ["gFix", "fungiAutoFix"], ["gJanitor", "janitor"], ["gCrimson", "crimson"], ["gA11y", "a11y"]].forEach(([id, field]) => {
     $(id).onchange = async (e) => {
       try { state.tabs.reviews = await api("/api/agents", { [field]: e.target.checked }); }
       catch (err) { state.reviewMsg = { text: err.message, err: true }; }
@@ -765,7 +772,7 @@ function renderReviews() {
 
 // ---- which agents run on which repo
 
-const SCOPE_AGENTS = [["review", "Reviewer"], ["keys", "Key watcher"], ["fungi", "Fungi"], ["crimson", "Crimson"], ["a11y", "a11y"]];
+const SCOPE_AGENTS = [["review", "Reviewer"], ["keys", "Key watcher"], ["fungi", "Fungi"], ["janitor", "Janitor"], ["crimson", "Crimson"], ["a11y", "a11y"]];
 
 function repoScopeRows(d) {
   const q = state.repoScopeQ.trim().toLowerCase();
@@ -812,7 +819,7 @@ function wireRepoScope(d) {
 // Reviews take minutes and finish on their own, so this page keeps itself current, unless someone's mid-edit in its settings.
 setInterval(async () => {
   if (state.view !== "reviews" || !state.tabs.reviews || document.hidden) return;
-  if (["rLimit", "rOn", "rEmail", "gKeys", "gFungi", "gFix", "gCrimson", "gA11y", "rsQ", "rsNew"].includes(document.activeElement?.id) || document.activeElement?.dataset?.sslug) return;
+  if (["rLimit", "rOn", "rEmail", "gKeys", "gFungi", "gFix", "gJanitor", "gCrimson", "gA11y", "rsQ", "rsNew"].includes(document.activeElement?.id) || document.activeElement?.dataset?.sslug) return;
   try {
     const next = await api("/api/reviews");
     if (state.view === "reviews") { state.tabs.reviews = next; renderReviews(); }

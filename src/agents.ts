@@ -15,27 +15,29 @@ import { agentOnFor, loadRepoChoices } from "./repos.ts";
 import { aiBudgetLeft, dropAiRun, EngineTrouble, fetchPrObjects, INCOMPLETE_REVIEW, neutralise, prepareDiff, recordAiRun, ReviewFailed, type GithubPort, type OpenPr, type ReviewEngine, type ReviewFinding, type ReviewResult } from "./review.ts";
 import { AI_LENSES, aiLens, type AiLens } from "./lenses.ts";
 import { parseLockText } from "./scan.ts";
+import { expiredDeprecations, type Deprecation } from "./janitor.ts";
 
 const execFileP = promisify(execFile);
 const git = async (repo: string, args: string[]) => (await execFileP("git", args, { cwd: repo, encoding: "utf8", timeout: 180_000, maxBuffer: 1 << 28 })).stdout;
 // AI agents, like the reviewer, skip forks and dependency bots: untrusted or low-value, and each one spends the plan.
 const DEPENDENCY_BOT = /^(dependabot|renovate|github-actions)(\[bot\])?$/i;
 
-export type AgentName = "keys" | "fungi" | "crimson" | "a11y";
-export const RULE_AGENTS: AgentName[] = ["keys", "fungi"];
+export type AgentName = "keys" | "fungi" | "janitor" | "crimson" | "a11y";
+export const RULE_AGENTS: AgentName[] = ["keys", "fungi", "janitor"];
 const AI_AGENT_IDS = AI_LENSES.map((l) => l.id) as AgentName[];
 export const ALL_AGENTS: AgentName[] = [...RULE_AGENTS, ...AI_AGENT_IDS];
-export const AGENT_CONTEXT: Record<AgentName, string> = { keys: "Mycelium keys", fungi: "Mycelium fungi", ...Object.fromEntries(AI_LENSES.map((l) => [l.id, l.context])) } as Record<AgentName, string>;
+export const AGENT_CONTEXT: Record<AgentName, string> = { keys: "Mycelium keys", fungi: "Mycelium fungi", janitor: "Mycelium janitor", ...Object.fromEntries(AI_LENSES.map((l) => [l.id, l.context])) } as Record<AgentName, string>;
 
 export interface AgentSettings {
   keys: boolean;
   fungi: boolean;
   fungiAutoFix: boolean; // after the nightly check, open fix PRs for high and critical production findings
+  janitor: boolean; // flags @deprecate blocks past their removal date, advisory only
   crimson: boolean; // red-team AI lens: is this change trying to do something harmful on purpose
   a11y: boolean; // accessibility AI lens, advisory only
   seen: Record<AgentName, string[]>; // repos that have answered since each agent was turned on. PRs open at that first answer wait until they change
 }
-export const DEFAULT_AGENTS: AgentSettings = { keys: false, fungi: false, fungiAutoFix: false, crimson: false, a11y: false, seen: { keys: [], fungi: [], crimson: [], a11y: [] } };
+export const DEFAULT_AGENTS: AgentSettings = { keys: false, fungi: false, fungiAutoFix: false, janitor: false, crimson: false, a11y: false, seen: { keys: [], fungi: [], janitor: [], crimson: [], a11y: [] } };
 
 export const loadAgentSettings = (db: DatabaseSync): AgentSettings => {
   const row = db.prepare("SELECT value FROM settings WHERE key = 'agents'").get() as { value: string } | undefined;
@@ -174,6 +176,38 @@ export function fungiComment(r: FungiResult): string {
   return `<!-- mycelium-fungi -->\n## 🍄 Mycelium fungi: ${title}\n\n${table}${unread}${notChecked}<sub>Only what this PR adds. Upgrade these on this branch and push. The check runs again on the new commit.</sub>`;
 }
 
+// ---------------------------------------------------------------- janitor (deprecated-code cleanup)
+
+export interface JanitorResult { expired: (Deprecation & { file: string })[] }
+
+/** Expired @deprecate markers in the files this PR changed. Detection only; code-janitor does the removal. */
+export async function checkDeprecations(repo: string, p: Pick<OpenPr, "baseSha" | "sha">): Promise<JanitorResult> {
+  const forkPoint = (await git(repo, ["merge-base", p.baseSha, p.sha])).trim();
+  const changed = (await git(repo, ["-c", "core.quotePath=false", "diff", "--name-only", "--no-renames", `${forkPoint}...${p.sha}`])).split("\n").filter(Boolean);
+  const expired: (Deprecation & { file: string })[] = [];
+  for (const f of changed.slice(0, 500)) {
+    let text: string;
+    try {
+      await git(repo, ["cat-file", "-e", `${p.sha}:${f}`]);
+      text = await git(repo, ["show", `${p.sha}:${f}`]);
+    } catch {
+      continue; // not in this commit (deleted), or unreadable
+    }
+    if (text.length > 2_000_000 || text.includes("\u0000")) continue; // skip huge or binary files
+    for (const d of expiredDeprecations(text)) expired.push({ ...d, file: f });
+  }
+  return { expired };
+}
+
+export function janitorComment(repo: string, sha: string, expired: JanitorResult["expired"]): string {
+  const rows = expired.slice(0, MAX_ROWS).map((d) => {
+    const place = `${plain(d.file)}:${d.line}`;
+    const link = `https://github.com/${repo}/blob/${sha}/${d.file.split("/").map(encodeURIComponent).join("/")}#L${d.line}`;
+    return `- [\`${place}\`](${link}) — ${d.date ? `marked for removal ${d.date}` : "no date (removed on the next run)"}${d.reason ? `: ${plain(d.reason)}` : ""}`;
+  });
+  return `<!-- mycelium-janitor -->\n## 🧹 Mycelium janitor: ${expired.length} expired deprecation${expired.length === 1 ? "" : "s"} (advisory)\n\n${rows.join("\n")}${expired.length > MAX_ROWS ? `\n\n_And ${expired.length - MAX_ROWS} more._` : ""}\n\nRun code-janitor to remove ${expired.length === 1 ? "it" : "them"}. This check never blocks a merge.`;
+}
+
 // ---------------------------------------------------------------- the poll
 
 const RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
@@ -283,6 +317,12 @@ export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentD
           note = gaps.length ? `Couldn't check ${gaps.join(", ")}` : null;
           description = blocking.length ? `Adds ${blocking.length} vulnerable package version${blocking.length === 1 ? "" : "s"}` : r.unreadable.length ? `Couldn't read ${r.unreadable.length} lockfile${r.unreadable.length === 1 ? "" : "s"}` : r.uncheckable.length ? `Couldn't check ${r.uncheckable.length} dependency file${r.uncheckable.length === 1 ? "" : "s"}` : r.added.length ? "Only lower-severity advisories added" : "No new vulnerable packages";
           body = r.added.length || gaps.length ? fungiComment(r) : previous ? "<!-- mycelium-fungi -->\n## 🍄 Mycelium fungi: no new vulnerable packages in the latest commit" : null;
+        } else if (agent === "janitor") {
+          const jr = await checkDeprecations(repo, p);
+          bad = false; // advisory: it reports, it never fails the check
+          details = jr.expired;
+          description = jr.expired.length ? `${jr.expired.length} expired deprecation${jr.expired.length === 1 ? "" : "s"} to clean up` : "No expired deprecations";
+          body = jr.expired.length ? janitorComment(p.repo, p.sha, jr.expired) : previous ? "<!-- mycelium-janitor -->\n## 🧹 Mycelium janitor: nothing expired in the latest commit" : null;
         } else {
           // An AI lens (Crimson, a11y). It spends the plan, so: skip forks and bots, stop at the daily limit,
           // cap retries per commit, pause on engine trouble, and never let a stopped or failed run read as a pass.
@@ -410,7 +450,7 @@ export function agentsView(db: DatabaseSync) {
   const rows = all.filter((r) => agentOnFor(choices, r.repo, r.agent)); // turned off for a repo means off this list too
   return {
     settings: loadAgentSettings(db),
-    totals: { keys: totals("keys"), fungi: totals("fungi"), crimson: totals("crimson"), a11y: totals("a11y") },
+    totals: { keys: totals("keys"), fungi: totals("fungi"), janitor: totals("janitor"), crimson: totals("crimson"), a11y: totals("a11y") },
     problems: rows.filter((r) => r.state === "failed").slice(0, 30).map((r) => ({ agent: r.agent, repo: r.repo, number: r.number, sha: r.sha, title: r.title, url: r.url, at: r.checked_at, details: JSON.parse(r.details), note: r.note })),
     gaps: rows.filter((r) => r.state === "passed" && r.note).slice(0, 10).map((r) => ({ repo: r.repo, number: r.number, title: r.title, url: r.url, note: r.note })),
   };

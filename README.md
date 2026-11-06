@@ -239,6 +239,7 @@ dependency bots and forks. They only read git objects and never run a PR's code.
   It never shows the value. A key found here is already on GitHub, so replace it. To stop one before it's committed: `mycelium keys --install-hook`.
 - **Fungi** (`Mycelium fungi`) checks packages a PR's lockfile changes add against OSV, and fails on high, critical or malicious. Vulnerabilities that were already there
   stay with Findings. It reads npm, pnpm, yarn, Cargo, NuGet, Python, Go and Gradle dependency files. For others, or a `package.json` with no lockfile, the check says what it couldn't check. A lockfile that won't parse fails the check, and so does an advisory with no usable severity. With nightly fixes on, each `mycelium sync` also opens fix PRs for high and critical production findings, leaving out major upgrades.
+- **Janitor** (`Mycelium janitor`) flags `@deprecate MM-DD-YYYY` blocks whose removal date has passed (or undated ones) in a PR's changed files, matching the [code-janitor](../code-janitor) format. Advisory — it posts its notes but never fails a check. Free, no AI.
 
 ### Crimson and Accessibility
 
@@ -321,6 +322,7 @@ src/
   agents.ts, keys.ts  key watcher and fungi: rule-based checks on every PR
   review-tools.ts     those read-only tools as an MCP server, when reviews run through Claude Code
   lenses.ts           the AI review "lenses": Crimson (red-team) and Accessibility, as data on the reviewer's pipeline
+  janitor.ts          finds expired @deprecate blocks (code-janitor's format), for the Janitor agent
   serve.ts, report.ts dashboard server + HTML
   mcp.ts              MCP tools
 agents/               Claude Code subagent definition
