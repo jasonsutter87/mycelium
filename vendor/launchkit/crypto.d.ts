@@ -1,0 +1,10 @@
+export function toHex(buf: ArrayBuffer): string;
+export function base64url(bytes: Uint8Array): string;
+export function randomToken(bytes?: number): string;
+export function randomId(): string;
+export function sha256(text: string): Promise<string>;
+export function hmac(secret: string, purpose: string, text: string): Promise<string>;
+export function safeEqual(a: unknown, b: unknown): boolean;
+export function sign(secret: string, purpose: string, value: string): Promise<string>;
+export function unsign(secret: string, purpose: string, signed: string): Promise<string | null>;
+export function requireSecret(secret: unknown, who: string): void;

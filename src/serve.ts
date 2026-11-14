@@ -65,7 +65,7 @@ function loadConfig() {
   const file = join(homedir(), ".mycelium", "config.json");
   const cfg = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : {};
   const e = process.env;
-  if (e.GATEKEEP_ISSUER) cfg.auth = { issuer: e.GATEKEEP_ISSUER, clientId: e.GATEKEEP_CLIENT_ID || "mycelium", allowedEmails: (e.GATEKEEP_ALLOWED_EMAILS || "").split(",").map((s) => s.trim()).filter(Boolean) };
+  if (e.GATEKEEP_ISSUER) cfg.auth = { issuer: e.GATEKEEP_ISSUER, clientId: e.GATEKEEP_CLIENT_ID || "mycelium", allowedEmails: (e.ALLOWED_EMAILS || e.GATEKEEP_ALLOWED_EMAILS || "").split(",").map((s) => s.trim()).filter(Boolean) };
   const repos = e.MYCELIUM_REPOS_DIR && e.MYCELIUM_REPOS_LIST ? { dir: e.MYCELIUM_REPOS_DIR, list: e.MYCELIUM_REPOS_LIST } : null;
   return { repos, auth: cfg.auth ?? null, baseUrl: (e.MYCELIUM_BASE_URL ?? cfg.baseUrl ?? null) as string | null, host: (e.MYCELIUM_HOST ?? cfg.host ?? "127.0.0.1") as string };
 }
@@ -85,7 +85,13 @@ export function serve(db: DatabaseSync, port: number) {
   // A loopback bind behind a tunnel or `tailscale serve` is still reachable from elsewhere, so the public URL counts too.
   const localUrl = /^http:\/\/([\w.-]*\.)?(localhost|127\.0\.0\.1)(:\d+)?\/?$/.test(baseUrl);
   if (!cfg.auth && (!local || !localUrl)) throw new Error(`Refusing to serve ${local ? baseUrl : cfg.host} without sign-in: anyone who can reach it could run fixes. Configure auth in ~/.mycelium/config.json.`);
-  const auth = cfg.auth ? createAuth(cfg.auth, baseUrl, join(homedir(), ".mycelium")) : null;
+  // The sign-in cookie signing key: AUTH_SECRET when set, else one generated on first run and kept beside the serve token.
+  let authSecret = process.env.AUTH_SECRET || setting("auth_secret");
+  if (cfg.auth && !authSecret) {
+    authSecret = randomBytes(32).toString("hex");
+    db.prepare("INSERT INTO settings (key, value) VALUES ('auth_secret', ?)").run(authSecret);
+  }
+  const auth = cfg.auth ? createAuth(cfg.auth, baseUrl, join(homedir(), ".mycelium"), authSecret!) : null;
   const hosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`, `mycelium.localhost:${port}`, new URL(baseUrl).host]);
 
   let busy: string | null = null; // one job at a time: they run package managers and git
@@ -313,12 +319,8 @@ export function serve(db: DatabaseSync, port: number) {
         res.writeHead(200, { "content-type": STATIC[p] + "; charset=utf-8", "cache-control": "no-cache", "x-content-type-options": "nosniff" });
         return res.end(readFileSync(join(PUBLIC, p.slice(1))));
       }
-      if (auth) {
-        if (p === "/auth/login") return await auth.login(req, res);
-        if (p === "/auth/callback") return await auth.callback(req, res);
-        if (p === "/auth/logout") return await auth.logout(req, res);
-      }
-      const user = auth ? auth.user(req) : null;
+      if (auth && p.startsWith("/auth/")) return await auth.handle(req, res);
+      const user = auth ? await auth.user(req) : null;
       if (auth && !user) {
         if (req.method === "GET" && p === "/login") return page("login.html", res);
         if (req.method === "GET" && p === "/") return void res.writeHead(302, { Location: "/login" }).end();
@@ -377,6 +379,7 @@ export function serve(db: DatabaseSync, port: number) {
         return send(res, 404, { error: "not found" });
       }
       if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+      if (auth && !auth.guard(req, res)) return;
       const body = await readBody(req);
       // Settings, not work: fine while a rescan runs.
       if (p === "/api/profile") return send(res, 200, { company: saveCompanyName(db, body.company) });

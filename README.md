@@ -96,6 +96,16 @@ Sign-in uses [Gatekeep](https://gatekeepauth.com). Register an app with redirect
 }
 ```
 
+Sign-in is launchkit's auth-gatekeep kit (`vendor/launchkit/`, vendored unchanged; its contract and threat model are in `vendor/launchkit/auth.CONTRACT.md`). Environment variables override the config file:
+
+| Variable | What |
+|---|---|
+| `GATEKEEP_ISSUER`, `GATEKEEP_CLIENT_ID` | The Gatekeep issuer and the client id registered there (`mycelium`) |
+| `ALLOWED_EMAILS` | Comma-separated emails that may sign in (`GATEKEEP_ALLOWED_EMAILS` still works) |
+| `AUTH_SECRET` | 32+ characters; signs the session cookies (`openssl rand -hex 32`). On a server put it in `~/.config/mycelium/env`. If unset, Mycelium generates one on first run and keeps it in its settings database, as it does for the serve token. Changing it signs everyone out |
+
+Sessions live in `~/.mycelium/auth.json`. Sign-out, and removing an email from the allowlist, take effect on the next request.
+
 Mycelium refuses to listen on anything but this computer unless sign-in is configured.
 
 ---
