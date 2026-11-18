@@ -76,8 +76,16 @@ export interface ReviewSettings {
   dailyLimit: number; // most reviews in any 24 hours: a safety net on the API bill
   emailSentBack: boolean; // GitHub doesn't notify you about comments on your own PRs, and here both come from one account
   seenRepos: string[]; // repos that have answered since this was turned on. A repo's PRs open at that first answer wait until they change
+  // Repos (owner/name) whose PRs from forks are reviewed too, by the reviewer and the AI agents. Off everywhere else:
+  // strangers shouldn't spend the plan. Opt a repo in when you want outside contributions pre-checked (an open-source
+  // project). The daily limit still caps spend, and everything in a PR stays untrusted data.
+  forkRepos?: string[];
 }
-export const DEFAULT_REVIEWS: ReviewSettings = { enabled: false, dailyLimit: 50, emailSentBack: true, seenRepos: [] };
+export const DEFAULT_REVIEWS: ReviewSettings = { enabled: false, dailyLimit: 50, emailSentBack: true, seenRepos: [], forkRepos: [] };
+
+/** Does this repo opt in to reviewing PRs from forks? */
+export const reviewsForks = (s: Pick<ReviewSettings, "forkRepos">, repo: string) =>
+  (s.forkRepos ?? []).some((r) => r.toLowerCase() === repo.toLowerCase());
 
 const getJson = <T>(db: DatabaseSync, key: string, fallback: T): T => {
   const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | undefined;
@@ -93,7 +101,10 @@ export function saveReviewSettings(db: DatabaseSync, input: Partial<ReviewSettin
   const dailyLimit = Number(input.dailyLimit ?? prev.dailyLimit);
   if (!Number.isInteger(dailyLimit) || dailyLimit < 1 || dailyLimit > 1000) throw new Error("The daily limit has to be a whole number from 1 to 1000.");
   const enabled = !!(input.enabled ?? prev.enabled);
-  const settings: ReviewSettings = { enabled, dailyLimit, emailSentBack: !!(input.emailSentBack ?? prev.emailSentBack), seenRepos: enabled && prev.enabled ? prev.seenRepos : [] };
+  const forkRepos = [...new Set((input.forkRepos ?? prev.forkRepos ?? []).map((r) => String(r).trim()).filter(Boolean))];
+  const bad = forkRepos.find((r) => !/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(r));
+  if (bad) throw new Error(`"${bad}" isn't a repo name like owner/name.`);
+  const settings: ReviewSettings = { enabled, dailyLimit, emailSentBack: !!(input.emailSentBack ?? prev.emailSentBack), seenRepos: enabled && prev.enabled ? prev.seenRepos : [], forkRepos };
   setJson(db, "reviews", settings);
   return settings;
 }
@@ -528,7 +539,7 @@ export function recordOpenPrs(db: DatabaseSync, listing: PrListing, now = new Da
   for (const p of listing.prs) {
     if (p.draft) continue;
     const baseline = !seen.has(p.repo);
-    const skipReason = p.fork ? "From a fork, so it isn't reviewed automatically."
+    const skipReason = p.fork && !reviewsForks(settings, p.repo) ? "From a fork, so it isn't reviewed automatically."
       : DEPENDENCY_BOT.test(p.author ?? "") ? "From a dependency bot, so it isn't reviewed automatically."
       : baseline ? "Already open when reviews started on this repo." : null;
     const added = ins.run(p.repo, p.number, p.sha, p.baseSha, p.baseRef, p.title, p.body, p.url, p.author, skipReason ? "skipped" : "queued", skipReason, now).changes;

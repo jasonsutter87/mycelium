@@ -12,7 +12,7 @@ import { emailConfigured, loadAlertSettings, resendSender, type Sender } from ".
 import { scanPatch, type KeyHit } from "./keys.ts";
 import { checkPackages, severityRank, type PackageVuln } from "./osv.ts";
 import { agentOnFor, loadRepoChoices } from "./repos.ts";
-import { aiBudgetLeft, dropAiRun, EngineTrouble, fetchPrObjects, INCOMPLETE_REVIEW, neutralise, prepareDiff, recordAiRun, ReviewFailed, type GithubPort, type OpenPr, type ReviewEngine, type ReviewFinding, type ReviewResult } from "./review.ts";
+import { aiBudgetLeft, dropAiRun, EngineTrouble, fetchPrObjects, INCOMPLETE_REVIEW, loadReviewSettings, neutralise, prepareDiff, recordAiRun, reviewsForks, ReviewFailed, type GithubPort, type OpenPr, type ReviewEngine, type ReviewFinding, type ReviewResult } from "./review.ts";
 import { AI_LENSES, aiLens, type AiLens } from "./lenses.ts";
 import { parseLockText } from "./scan.ts";
 import { expiredDeprecations, type Deprecation } from "./janitor.ts";
@@ -327,7 +327,7 @@ export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentD
           // An AI lens (Crimson, a11y). It spends the plan, so: skip forks and bots, stop at the daily limit,
           // cap retries per commit, pause on engine trouble, and never let a stopped or failed run read as a pass.
           if (engineDown) continue; // the engine is in trouble this pass; try again next poll
-          if (p.fork || DEPENDENCY_BOT.test(p.author ?? "")) {
+          if ((p.fork && !reviewsForks(loadReviewSettings(db), p.repo)) || DEPENDENCY_BOT.test(p.author ?? "")) {
             put.run(p.repo, p.number, p.sha, agent, p.title, p.url, "skipped", "[]", "From a fork or a dependency bot, so the AI agents skip it.", null, now, 0, 1);
             continue;
           }
