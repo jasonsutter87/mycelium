@@ -633,3 +633,17 @@ test("a review stopped by a safety classifier fails closed, never a green check"
     assert.notEqual(gh.statuses.at(-1)!.state, "success");
   } finally { r.cleanup(); }
 });
+
+test("a repo can opt in to reviewing PRs from forks; every other repo still skips them", () => {
+  const db = openDb(":memory:");
+  live(db);
+  saveReviewSettings(db, { forkRepos: ["O/R"] });
+  const other = (over: Partial<OpenPr>) => pr({ repo: "x/y", url: "https://github.com/x/y/pull/9", ...over });
+  recordOpenPrs(db, { prs: [], answered: ["o/r", "x/y"], partial: [] });
+  recordOpenPrs(db, { prs: [pr({ number: 2, sha: "mine-fork", fork: true }), other({ number: 9, sha: "their-fork", fork: true })], answered: ["o/r", "x/y"], partial: [] });
+  assert.equal(stateOf(db, "mine-fork").state, "queued", "an opted-in repo reviews a contributor's fork PR (names match case-insensitively)");
+  assert.equal(stateOf(db, "their-fork").state, "skipped");
+  assert.match(stateOf(db, "their-fork").note, /fork/);
+  assert.throws(() => saveReviewSettings(db, { forkRepos: ["not a repo"] }), /owner\/name/);
+  assert.deepEqual(saveReviewSettings(db, {}).forkRepos, ["O/R"], "kept when other settings change");
+});

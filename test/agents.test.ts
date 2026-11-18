@@ -10,7 +10,7 @@ import { saveRepoChoices } from "../src/repos.ts";
 import { describeHits, redactKeys, scanLine, scanPatch } from "../src/keys.ts";
 import type { GithubPort, OpenPr, ReviewEngine } from "../src/review.ts";
 import { loadAgentSettings } from "../src/agents.ts";
-import { EngineTrouble, ReviewFailed } from "../src/review.ts";
+import { EngineTrouble, ReviewFailed, saveReviewSettings } from "../src/review.ts";
 
 // Assembled at run time, so this file doesn't trip the very check it tests.
 const GH = "ghp" + "_" + "Ab1".repeat(12);
@@ -540,4 +540,25 @@ test("janitor flags an expired @deprecate block a PR changed, but never blocks (
     assert.equal(row.state, "passed");
     assert.equal(JSON.parse(row.details)[0].file, "a.ts");
   } finally { r.cleanup(); }
+});
+
+test("AI lenses review fork PRs on a repo that opts in", async () => {
+  const r = repo();
+  try {
+    const db = openDb(":memory:");
+    let called = 0;
+    const engine: ReviewEngine = async () => { called++; return { result: { summary: "", findings: [] }, costUsd: null }; };
+    saveAgentSettings(db, { crimson: true });
+    saveReviewSettings(db, { forkRepos: ["o/r"] });
+    const first = r.commit({ "a.ts": "export const a = 2;\n" });
+    withOrigin(r, first);
+    await pollAgents(db, ["o/r"], { github: fake([pr(r, first)]).github, repoPath: () => r.dir, baseUrl: null, engine }); // baseline
+    const next = r.commit({ "a.ts": "export const a = 3;\n" });
+    execFileSync("git", ["update-ref", "refs/pull/1/head", next], { cwd: r.dir, stdio: "ignore" });
+    const gh = fake([pr(r, next, { baseSha: first, author: "contributor", fork: true })]);
+    await pollAgents(db, ["o/r"], { github: gh.github, repoPath: () => r.dir, baseUrl: null, engine });
+    assert.ok(called > 0, "the lens ran on a contributor's fork PR");
+  } finally {
+    r.cleanup();
+  }
 });
