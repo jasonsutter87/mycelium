@@ -562,3 +562,30 @@ test("AI lenses review fork PRs on a repo that opts in", async () => {
     r.cleanup();
   }
 });
+
+test("strict repos: a low a11y or Crimson note fails the check; elsewhere it stays a note", async () => {
+  const lowNote = { severity: "low" as const, category: "a11y", file: "a.ts", line: 1, title: "A small note", detail: "d", suggestion: "" };
+  for (const strict of [true, false]) {
+    const r = repo();
+    try {
+      const db = openDb(":memory:");
+      const engine: ReviewEngine = async () => ({ result: { summary: "One small note.", findings: [lowNote] }, costUsd: null });
+      saveAgentSettings(db, { a11y: true, crimson: true });
+      if (strict) saveReviewSettings(db, { strictRepos: ["o/r"] });
+      const first = r.commit({ "a.ts": "export const a = 2;\n" });
+      withOrigin(r, first);
+      await pollAgents(db, ["o/r"], { github: fake([pr(r, first)]).github, repoPath: () => r.dir, baseUrl: null, engine }); // baseline
+      const next = r.commit({ "a.ts": "export const a = 3;\n" });
+      execFileSync("git", ["update-ref", "refs/pull/1/head", next], { cwd: r.dir, stdio: "ignore" });
+      const gh = fake([pr(r, next, { baseSha: first, author: "me" })]);
+      await pollAgents(db, ["o/r"], { github: gh.github, repoPath: () => r.dir, baseUrl: null, engine });
+      for (const ctx of ["Mycelium a11y", "Mycelium crimson"]) {
+        const st = gh.statuses.filter((s) => s.context === ctx).at(-1);
+        assert.equal(st?.state, strict ? "failure" : "success", `${ctx} with strict=${strict}`);
+      }
+      if (strict) assert.ok(gh.comments.some((c: any) => /strict mode/.test(JSON.stringify(c))), "the comment says why it blocks");
+    } finally {
+      r.cleanup();
+    }
+  }
+});

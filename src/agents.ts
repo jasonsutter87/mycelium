@@ -12,7 +12,7 @@ import { emailConfigured, loadAlertSettings, resendSender, type Sender } from ".
 import { scanPatch, type KeyHit } from "./keys.ts";
 import { checkPackages, severityRank, type PackageVuln } from "./osv.ts";
 import { agentOnFor, loadRepoChoices } from "./repos.ts";
-import { aiBudgetLeft, dropAiRun, EngineTrouble, fetchPrObjects, INCOMPLETE_REVIEW, loadReviewSettings, neutralise, prepareDiff, recordAiRun, reviewsForks, ReviewFailed, type GithubPort, type OpenPr, type ReviewEngine, type ReviewFinding, type ReviewResult } from "./review.ts";
+import { aiBudgetLeft, dropAiRun, EngineTrouble, fetchPrObjects, INCOMPLETE_REVIEW, isStrict, loadReviewSettings, neutralise, prepareDiff, recordAiRun, reviewsForks, ReviewFailed, type GithubPort, type OpenPr, type ReviewEngine, type ReviewFinding, type ReviewResult } from "./review.ts";
 import { AI_LENSES, aiLens, type AiLens } from "./lenses.ts";
 import { parseLockText } from "./scan.ts";
 import { expiredDeprecations, type Deprecation } from "./janitor.ts";
@@ -214,13 +214,15 @@ const RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 }
 const COMMENT_CHARS = 60_000; // GitHub refuses comments over 65,536
 
 /** The PR comment for one AI lens, worst finding first, trimmed to fit. Everything from the model is neutralised. */
-export function lensComment(lens: AiLens, repo: string, sha: string, result: ReviewResult, withheld = ""): string {
+export function lensComment(lens: AiLens, repo: string, sha: string, result: ReviewResult, withheld = "", strict = false): string {
   const ordered = [...result.findings].sort((a, b) => RANK[a.severity] - RANK[b.severity]);
   const sections = ordered.map((f) => `### ${f.severity.toUpperCase()}: ${neutralise(f.title).replace(/\s+/g, " ")}${f.file ? ` \u00b7 \`${neutralise(f.file).replace(/[\`\]\[]/g, "")}${f.line > 0 ? `:${f.line}` : ""}\`` : ""}\n\n${neutralise(f.detail)}${f.suggestion ? `\n\n**Fix:** ${neutralise(f.suggestion)}` : ""}`);
   let body = "", dropped = 0;
   for (const sec of sections) { if (body.length + sec.length > COMMENT_CHARS) dropped++; else body += (body ? "\n\n" : "") + sec; }
   if (dropped) body += `\n\n_${dropped} more on the Mycelium dashboard._`;
-  const head = lens.advisory
+  const head = strict
+    ? `## ${lens.emoji} Mycelium ${lens.id}: ${result.findings.length ? `sent back (strict mode: every finding blocks on this repo)` : "nothing to flag"}`
+    : lens.advisory
     ? `## ${lens.emoji} Mycelium ${lens.id}: ${lens.foundLabel(result.findings.length)} (advisory, never blocks a merge)`
     : `## ${lens.emoji} Mycelium ${lens.id}: ${result.findings.some(lens.blocks) ? "sent back" : "notes"}`;
   return `<!-- mycelium-${lens.id} -->\n${head}\n\n${neutralise(result.summary).slice(0, 2000)}\n\n${body}${withheld}\n\n<sub>Reviewed \`${sha.slice(0, 7)}\`. An AI review can miss things, and Mycelium never merges on its own.</sub>`;
@@ -232,29 +234,31 @@ export function lensComment(lens: AiLens, repo: string, sha: string, result: Rev
 interface LensOutcome { bad: boolean; description: string; details: ReviewFinding[]; body: string | null; note: string | null }
 
 /** Runs one AI lens on a PR's diff. Uses the same fetch, diff prep, and engine as the reviewer. */
-async function runAiLens(engine: ReviewEngine, lens: AiLens, repoPath: string, p: OpenPr, previousComment: boolean): Promise<LensOutcome> {
+async function runAiLens(engine: ReviewEngine, lens: AiLens, repoPath: string, p: OpenPr, previousComment: boolean, strict = false): Promise<LensOutcome> {
+  // strict mode: the lens blocks like a non-advisory one, and every finding blocks
+  const advisory = lens.advisory && !strict;
   const head = (extra: string) => `<!-- mycelium-${lens.id} -->\n## ${lens.emoji} Mycelium ${lens.id}: ${extra}`;
   const foot = "\n\n<sub>An AI review can miss things, and Mycelium never merges on its own.</sub>";
   await fetchPrObjects(repoPath, p.number, p.baseRef);
   const raw = await git(repoPath, ["-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames", `${p.baseSha}...${p.sha}`]);
   const { diff, omitted, tooLarge } = prepareDiff(raw);
   if (tooLarge) {
-    const body = head(`diff too large to review automatically${lens.advisory ? ", so it wasn't checked" : " — a person should check this PR"}`) + foot;
-    return { bad: !lens.advisory, description: lens.advisory ? "Too large to review — not checked" : "Too large to review — needs a human", details: [], body, note: "Diff too large to review automatically." };
+    const body = head(`diff too large to review automatically${advisory ? ", so it wasn't checked" : " — a person should check this PR"}`) + foot;
+    return { bad: !advisory, description: advisory ? "Too large to review — not checked" : "Too large to review — needs a human", details: [], body, note: "Diff too large to review automatically." };
   }
   const { result } = await engine({ repo: p.repo, number: p.number, title: p.title, body: p.body, author: p.author, baseRef: p.baseRef, diff, omitted }, repoPath, p.sha, lens.system);
   if (INCOMPLETE_REVIEW.test(result.summary)) {
     const body = head("couldn't finish this review") + `\n\n${neutralise(result.summary).slice(0, 1000)}\n\n<sub>An unfinished review isn't a pass. A person should look at this PR before merging.</sub>`;
-    return { bad: !lens.advisory, description: lens.advisory ? "Couldn't finish — needs a human" : "Couldn't finish the review — needs a human", details: [], body, note: "The review didn't finish." };
+    return { bad: !advisory, description: advisory ? "Couldn't finish — needs a human" : "Couldn't finish the review — needs a human", details: [], body, note: "The review didn't finish." };
   }
-  const blocking = lens.advisory ? [] : result.findings.filter(lens.blocks);
+  const blocking = advisory ? [] : strict ? result.findings : result.findings.filter(lens.blocks);
   const bad = blocking.length > 0;
   const description = bad ? lens.foundLabel(blocking.length)
-    : result.findings.length ? (lens.advisory ? lens.foundLabel(result.findings.length) : `${result.findings.length} note${result.findings.length === 1 ? "" : "s"} for a person to check`)
+    : result.findings.length ? (advisory ? lens.foundLabel(result.findings.length) : `${result.findings.length} note${result.findings.length === 1 ? "" : "s"} for a person to check`)
     : lens.passLabel;
   const notRead = omitted.length ? `Not read: ${omitted.join(", ")}` : null;
   const withheld = notRead ? `\n\n**Not reviewed:** ${neutralise(omitted.join(", "))} — a person should read ${omitted.length === 1 ? "it" : "these"}.` : "";
-  const body = result.findings.length ? lensComment(lens, p.repo, p.sha, result, withheld)
+  const body = result.findings.length ? lensComment(lens, p.repo, p.sha, result, withheld, strict)
     : withheld ? head(description) + withheld + foot
     : previousComment ? head("nothing to flag in the latest commit") : null;
   return { bad, description, details: result.findings, body, note: notRead };
@@ -341,7 +345,7 @@ export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentD
           const runId = recordAiRun(db);
           let out: LensOutcome;
           try {
-            out = await runAiLens(deps.engine!, lens, repo, p, !!previous);
+            out = await runAiLens(deps.engine!, lens, repo, p, !!previous, isStrict(loadReviewSettings(db), p.repo));
           } catch (e) {
             const line = String((e as any)?.stderr || (e as Error)?.message).split("\n")[0].slice(0, 200);
             if (e instanceof EngineTrouble) { dropAiRun(db, runId); engineDown = true; firstError ??= e; continue; } // account/outage: refund, pause
@@ -352,7 +356,8 @@ export async function pollAgents(db: DatabaseSync, repos: string[], deps: AgentD
               continue;
             }
             // Out of attempts, or a review that can't complete: fail closed for a blocking lens.
-            out = { bad: !lens.advisory, description: lens.advisory ? "Couldn't review — needs a human" : "Couldn't review — a person should check it", details: [],
+            const blocks = !lens.advisory || isStrict(loadReviewSettings(db), p.repo);
+            out = { bad: blocks, description: !blocks ? "Couldn't review — needs a human" : "Couldn't review — a person should check it", details: [],
               body: `<!-- mycelium-${lens.id} -->\n## ${lens.emoji} Mycelium ${lens.id}: couldn't review this PR\n\n${line}\n\n<sub>An unfinished review isn't a pass. A person should look before merging.</sub>`, note: `Couldn't review: ${line}` };
           }
           let commentId = previous?.comment_id ?? null, postBody = out.body, noteOut = out.note;

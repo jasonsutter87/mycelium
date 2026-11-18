@@ -80,8 +80,15 @@ export interface ReviewSettings {
   // strangers shouldn't spend the plan. Opt a repo in when you want outside contributions pre-checked (an open-source
   // project). The daily limit still caps spend, and everything in a PR stays untrusted data.
   forkRepos?: string[];
+  // Repos (owner/name) in strict mode: any finding at all, Critical to Low, fails the review, Crimson and a11y checks,
+  // so a required check blocks the merge until the PR is clean. Elsewhere only Critical and High send a PR back.
+  strictRepos?: string[];
 }
-export const DEFAULT_REVIEWS: ReviewSettings = { enabled: false, dailyLimit: 50, emailSentBack: true, seenRepos: [], forkRepos: [] };
+export const DEFAULT_REVIEWS: ReviewSettings = { enabled: false, dailyLimit: 50, emailSentBack: true, seenRepos: [], forkRepos: [], strictRepos: [] };
+
+const inList = (list: string[] | undefined, repo: string) => (list ?? []).some((r) => r.toLowerCase() === repo.toLowerCase());
+/** Is this repo in strict mode (every finding blocks)? */
+export const isStrict = (s: Pick<ReviewSettings, "strictRepos">, repo: string) => inList(s.strictRepos, repo);
 
 /** Does this repo opt in to reviewing PRs from forks? */
 export const reviewsForks = (s: Pick<ReviewSettings, "forkRepos">, repo: string) =>
@@ -101,10 +108,12 @@ export function saveReviewSettings(db: DatabaseSync, input: Partial<ReviewSettin
   const dailyLimit = Number(input.dailyLimit ?? prev.dailyLimit);
   if (!Number.isInteger(dailyLimit) || dailyLimit < 1 || dailyLimit > 1000) throw new Error("The daily limit has to be a whole number from 1 to 1000.");
   const enabled = !!(input.enabled ?? prev.enabled);
-  const forkRepos = [...new Set((input.forkRepos ?? prev.forkRepos ?? []).map((r) => String(r).trim()).filter(Boolean))];
-  const bad = forkRepos.find((r) => !/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(r));
+  const repoList = (v: unknown[]) => [...new Set(v.map((r) => String(r).trim()).filter(Boolean))];
+  const forkRepos = repoList(input.forkRepos ?? prev.forkRepos ?? []);
+  const strictRepos = repoList(input.strictRepos ?? prev.strictRepos ?? []);
+  const bad = [...forkRepos, ...strictRepos].find((r) => !/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(r));
   if (bad) throw new Error(`"${bad}" isn't a repo name like owner/name.`);
-  const settings: ReviewSettings = { enabled, dailyLimit, emailSentBack: !!(input.emailSentBack ?? prev.emailSentBack), seenRepos: enabled && prev.enabled ? prev.seenRepos : [], forkRepos };
+  const settings: ReviewSettings = { enabled, dailyLimit, emailSentBack: !!(input.emailSentBack ?? prev.emailSentBack), seenRepos: enabled && prev.enabled ? prev.seenRepos : [], forkRepos, strictRepos };
   setJson(db, "reviews", settings);
   return settings;
 }
@@ -386,8 +395,9 @@ export async function runReviewAgent(client: ReviewClient, input: ReviewInput, t
 // THE REVIEW itself, not the PR content ("a worker was stopped by SIGTERM" is the code, and must not match).
 export const INCOMPLETE_REVIEW = /\b(this|the) (review|assessment|analysis)\b[^.]{0,90}(stopped|halted|cut off|interrupted|incomplete|did ?n.t (finish|complete)|could ?n.t (finish|complete)|not complete)|safety classifier (stopped|halted|interrupted|cut|ended|prevented)|stopped by (a |the )?safety|no findings (were|are) recorded|assessment of [^.]{0,40} withheld/i;
 
-export const verdictOf = (findings: ReviewFinding[]): "passed" | "sent_back" =>
-  findings.some((f) => f.severity === "critical" || f.severity === "high") ? "sent_back" : "passed";
+/** Critical and High send a PR back; in strict mode, any finding does. */
+export const verdictOf = (findings: ReviewFinding[], strict = false): "passed" | "sent_back" =>
+  findings.some((f) => strict || f.severity === "critical" || f.severity === "high") ? "sent_back" : "passed";
 
 // ---------------------------------------------------------------- what goes back to GitHub
 
@@ -409,8 +419,8 @@ export function neutralise(s: string): string {
 const RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
 const validRepoPath = (p: string) => !!p && !p.startsWith("/") && !p.split("/").includes("..") && /^[\w./ @+()-]+$/.test(p);
 
-export function buildComment(repo: string, sha: string, result: ReviewResult, omitted: string[] = []): string {
-  const verdict = verdictOf(result.findings);
+export function buildComment(repo: string, sha: string, result: ReviewResult, omitted: string[] = [], strict = false): string {
+  const verdict = verdictOf(result.findings, strict);
   const place = (f: ReviewFinding) => {
     if (!validRepoPath(f.file)) return "";
     const path = f.file.split("/").map(encodeURIComponent).join("/");
@@ -433,8 +443,8 @@ export function buildComment(repo: string, sha: string, result: ReviewResult, om
   return `${MARKER}\n${head}\n\n${neutralise(result.summary).slice(0, 2000)}\n\n${body}${body ? "\n\n" : ""}${notSeen}<sub>Reviewed \`${sha.slice(0, 7)}\`. An AI review can miss things, and Mycelium never merges on its own.</sub>`;
 }
 
-export const statusDescription = (verdict: "passed" | "sent_back", findings: ReviewFinding[], omitted: string[] = []) => {
-  const blockers = findings.filter((f) => f.severity === "critical" || f.severity === "high").length;
+export const statusDescription = (verdict: "passed" | "sent_back", findings: ReviewFinding[], omitted: string[] = [], strict = false) => {
+  const blockers = findings.filter((f) => strict || f.severity === "critical" || f.severity === "high").length;
   return verdict === "passed" ? (omitted.length ? `Ready for a person to merge, ${omitted.length} file${omitted.length === 1 ? "" : "s"} not reviewed` : "Ready for a person to merge") : `Sent back: ${blockers} issue${blockers === 1 ? "" : "s"} to fix`;
 };
 
@@ -629,7 +639,7 @@ export async function reviewOne(db: DatabaseSync, row: Row, deps: ReviewDeps): P
     if (!result.findings.length && INCOMPLETE_REVIEW.test(result.summary)) throw new ReviewFailed("The review was stopped before it finished, so it isn't a pass.");
     const full = withheldFindings(result, omitted);
     // Saved before anything goes to GitHub, so trouble posting it never means paying for the same review again.
-    setRow(db, row, { state: verdictOf(full.findings), summary: neutralise(full.summary), findings: JSON.stringify(full.findings), note: omitted.length ? `Not reviewed: ${omitted.join(", ")}` : null, cost_usd: costUsd, reviewed_at: new Date().toISOString(), published: 0 });
+    setRow(db, row, { state: verdictOf(full.findings, isStrict(loadReviewSettings(db), row.repo)), summary: neutralise(full.summary), findings: JSON.stringify(full.findings), note: omitted.length ? `Not reviewed: ${omitted.join(", ")}` : null, cost_usd: costUsd, reviewed_at: new Date().toISOString(), published: 0 });
     saved = true;
     await publishReview(db, db.prepare("SELECT * FROM reviews WHERE repo = ? AND number = ? AND sha = ?").get(row.repo, row.number, row.sha) as unknown as Row, deps);
   } catch (e) {
@@ -668,11 +678,12 @@ async function publishReview(db: DatabaseSync, row: Row, deps: ReviewDeps) {
   const findings = JSON.parse(row.findings) as ReviewFinding[];
   const result = { summary: row.summary ?? "", findings };
   const omitted = row.note?.startsWith("Not reviewed: ") ? row.note.slice(14).split(", ") : [];
-  const verdict = verdictOf(findings);
+  const strict = isStrict(loadReviewSettings(db), row.repo);
+  const verdict = verdictOf(findings, strict);
   const previous = db.prepare("SELECT comment_id FROM reviews WHERE repo = ? AND number = ? AND comment_id IS NOT NULL ORDER BY created_at DESC LIMIT 1").get(row.repo, row.number) as { comment_id: number } | undefined;
-  const commentId = await deps.github.comment(row.repo, row.number, previous?.comment_id ?? null, buildComment(row.repo, row.sha, result, omitted));
+  const commentId = await deps.github.comment(row.repo, row.number, previous?.comment_id ?? null, buildComment(row.repo, row.sha, result, omitted, strict));
   setRow(db, row, { comment_id: commentId });
-  await deps.github.setStatus(row.repo, row.sha, verdict === "passed" ? "success" : "failure", statusDescription(verdict, findings, omitted), target);
+  await deps.github.setStatus(row.repo, row.sha, verdict === "passed" ? "success" : "failure", statusDescription(verdict, findings, omitted, strict), target);
   setRow(db, row, { published: 1 });
   if (verdict === "sent_back") await emailSentBack(db, row, findings, deps.send ?? resendSender, deps.log);
 }
