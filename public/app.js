@@ -743,6 +743,8 @@ function renderReviews() {
       <label class="row"><input type="checkbox" id="rEmail" ${draft.emailSentBack ? "checked" : ""}> <span>Email the alert list when a PR is sent back</span></label>
       <label class="col"><span>Also review PRs from forks on these repos (one <span class="mono">owner/name</span> per line), for open-source projects that take outside contributions:</span>
         <textarea class="field area" id="rForks" rows="2" placeholder="none" aria-label="Repos whose fork PRs are reviewed">${esc(Array.isArray(draft.forkRepos) ? draft.forkRepos.join("\n") : draft.forkRepos ?? "")}</textarea></label>
+      <label class="col"><span><b>Strict mode</b> on these repos: any finding, Critical to Low, fails the review, Crimson and accessibility checks, so a required check blocks the merge until the PR is clean:</span>
+        <textarea class="field area" id="rStrict" rows="2" placeholder="none" aria-label="Repos in strict mode">${esc(Array.isArray(draft.strictRepos) ? draft.strictRepos.join("\n") : draft.strictRepos ?? "")}</textarea></label>
       <p class="small muted">PRs already open when you turn this on or start watching a repo aren't reviewed until they change. PRs from forks (except on the repos listed above) and dependency bots like Dependabot are skipped, but you can still review one by hand. PR code goes to Anthropic (${esc(d.model)}${d.engine === "claude-code" ? ", through Claude Code on this server" : ""}), without files that may hold secrets. To block merging on a failed review, make the <span class="mono">Mycelium review</span> check required in GitHub's branch rules.</p>
       <div class="actions"><button class="btn primary" id="rSave">Save</button>${state.reviewMsg ? `<span class="small ${state.reviewMsg.err ? "warn-text" : "ok-text"}" role="status">${esc(state.reviewMsg.text)}</span>` : ""}</div>
     </section>
@@ -758,12 +760,12 @@ function renderReviews() {
     };
   });
   wireRepoScope(d);
-  const readReviewForm = () => ({ enabled: $("rOn").checked, dailyLimit: $("rLimit").value, emailSentBack: $("rEmail").checked, forkRepos: $("rForks").value });
-  ["rOn", "rLimit", "rEmail", "rForks"].forEach((id) => ($(id).oninput = () => { state.reviewDraft = readReviewForm(); }));
+  const readReviewForm = () => ({ enabled: $("rOn").checked, dailyLimit: $("rLimit").value, emailSentBack: $("rEmail").checked, forkRepos: $("rForks").value, strictRepos: $("rStrict").value });
+  ["rOn", "rLimit", "rEmail", "rForks", "rStrict"].forEach((id) => ($(id).oninput = () => { state.reviewDraft = readReviewForm(); }));
   $("rSave").onclick = async () => {
     try {
       const form = readReviewForm();
-      state.tabs.reviews = await api("/api/reviews", { ...form, dailyLimit: Number(form.dailyLimit), forkRepos: form.forkRepos.split(/[\s,]+/).filter(Boolean) });
+      state.tabs.reviews = await api("/api/reviews", { ...form, dailyLimit: Number(form.dailyLimit), forkRepos: form.forkRepos.split(/[\s,]+/).filter(Boolean), strictRepos: form.strictRepos.split(/[\s,]+/).filter(Boolean) });
       state.reviewDraft = null;
       state.reviewMsg = { text: `Saved. Reviews are ${state.tabs.reviews.settings.enabled ? "on" : "off"}.` };
     } catch (e) { state.reviewMsg = { text: e.message, err: true }; }

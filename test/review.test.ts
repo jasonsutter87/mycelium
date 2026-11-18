@@ -10,7 +10,7 @@ import { withoutServiceKeys } from "../src/net.ts";
 import { saveRepoChoices } from "../src/repos.ts";
 import {
   apiEngine, isSensitivePath, fetchPrObjects, statusDescription, withheldFindings, buildComment, buildPrompt, claudeCodeArgs, EngineTrouble, parseClaudeCodeOutput, ReviewFailed, neutralise, openPrsQuery, pollReviews, prepareDiff, recordOpenPrs, redactSecrets, requeueReview, resetInterrupted, reviewOne, runReviewAgent, runTool,
-  saveReviewSettings, reviewsView, verdictOf, type GithubPort, type OpenPr, type ReviewClient, type ReviewFinding, type ReviewInput,
+  saveReviewSettings, reviewsView, verdictOf, isStrict, type GithubPort, type OpenPr, type ReviewClient, type ReviewFinding, type ReviewInput,
 } from "../src/review.ts";
 
 const finding = (severity: ReviewFinding["severity"], over: Partial<ReviewFinding> = {}): ReviewFinding => ({ severity, category: "bug", file: "src/a.ts", line: 3, title: "It breaks", detail: "When x is null.", suggestion: "Check x.", ...over });
@@ -646,4 +646,17 @@ test("a repo can opt in to reviewing PRs from forks; every other repo still skip
   assert.match(stateOf(db, "their-fork").note, /fork/);
   assert.throws(() => saveReviewSettings(db, { forkRepos: ["not a repo"] }), /owner\/name/);
   assert.deepEqual(saveReviewSettings(db, {}).forkRepos, ["O/R"], "kept when other settings change");
+});
+
+test("strict repos send a PR back for any finding; other repos only for critical and high", () => {
+  const low = [{ severity: "low" as const, category: "x", file: "a", line: 1, title: "t", detail: "d", suggestion: "" }];
+  assert.equal(verdictOf(low), "passed");
+  assert.equal(verdictOf(low, true), "sent_back");
+  assert.equal(verdictOf([], true), "passed", "a clean review still passes");
+  assert.match(statusDescription("sent_back", low, [], true), /Sent back: 1 issue/);
+  const db = openDb(":memory:");
+  const s = saveReviewSettings(db, { strictRepos: ["jasonsutter87/sketchcraft"] });
+  assert.ok(isStrict(s, "JasonSutter87/SketchCraft"), "case-insensitive");
+  assert.ok(!isStrict(s, "jasonsutter87/other"));
+  assert.throws(() => saveReviewSettings(db, { strictRepos: ["nope"] }), /owner\/name/);
 });
