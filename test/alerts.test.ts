@@ -4,9 +4,9 @@ import { buildAlertEmail, emailError, loadAlertStatus, pickAlert, runAlerts, sav
 import { openDb } from "../src/db.ts";
 import type { Finding } from "../src/graph.ts";
 
-function seed(db: ReturnType<typeof openDb>, name: string, severity: string, vuln = `GHSA-${name}`, scope = "prod") {
-  const pr = db.prepare("SELECT id FROM projects WHERE name = 'app'").get() as { id: number } | undefined;
-  const projectId = pr?.id ?? Number(db.prepare("INSERT INTO projects (name, path, exposure, scanned_at) VALUES ('app', '/r/app', 'public-web', 'now')").run().lastInsertRowid);
+function seed(db: ReturnType<typeof openDb>, name: string, severity: string, vuln = `GHSA-${name}`, scope = "prod", project = "app") {
+  const pr = db.prepare("SELECT id FROM projects WHERE name = ?").get(project) as { id: number } | undefined;
+  const projectId = pr?.id ?? Number(db.prepare("INSERT INTO projects (name, path, exposure, scanned_at) VALUES (?, ?, 'public-web', 'now')").run(project, `/r/${project}`).lastInsertRowid);
   const comp = Number(db.prepare("INSERT INTO components (project_id, kind, path, ecosystem) VALUES (?, 'npm', ?, 'npm')").run(projectId, `${name}/package-lock.json`).lastInsertRowid);
   const pkg = Number(db.prepare("INSERT INTO packages (ecosystem, name, version) VALUES ('npm', ?, '1.0.0')").run(name).lastInsertRowid);
   db.prepare("INSERT INTO uses (component_id, package_id, direct, scope) VALUES (?, ?, 1, ?)").run(comp, pkg, scope);
@@ -107,4 +107,30 @@ test("email content is escaped, can't break the subject line, and links to the p
   assert.match(m.html, /https:\/\/m\.example\/#project=my%20app/);
   assert.match(m.subject, /^Mycelium: 1 critical in my app/);
   assert.match(buildAlertEmail([f], ["a@b.co"], null, "Acme").subject, /^\[Acme\] Mycelium/);
+});
+
+test("alerts can watch chosen projects only: others never trigger or appear in an email", async () => {
+  const db = openDb(":memory:");
+  seed(db, "old-mine", "CRITICAL", undefined, "prod", "sketchcraft");
+  seed(db, "theirs-old", "CRITICAL", undefined, "prod", "other");
+  const r = saveAlertSettings(db, { enabled: true, recipients: ["a@b.co"], projects: [" sketchcraft ", "sketchcraft"] });
+  assert.deepEqual(r.settings.projects, ["sketchcraft"], "trimmed and de-duplicated");
+  assert.equal(r.baselined, 1, "only the watched project's backlog is baselined");
+  const box = inbox();
+  seed(db, "theirs-new", "CRITICAL", undefined, "prod", "other");
+  assert.deepEqual(await runAlerts(db, null, box.send), { sent: 0 }, "a new critical elsewhere sends nothing");
+  seed(db, "mine-new", "CRITICAL", undefined, "prod", "sketchcraft");
+  assert.equal((await runAlerts(db, null, box.send)).sent, 1);
+  assert.match(box.sent[0].text, /mine-new/);
+  assert.doesNotMatch(box.sent[0].text, /theirs-/);
+  assert.match(box.sent[0].subject, /sketchcraft/);
+});
+
+test("an empty project list keeps alerts about every project, as before", async () => {
+  const db = openDb(":memory:");
+  saveAlertSettings(db, { enabled: true, recipients: ["a@b.co"] });
+  const box = inbox();
+  seed(db, "x", "CRITICAL", undefined, "prod", "one");
+  seed(db, "y", "CRITICAL", undefined, "prod", "two");
+  assert.equal((await runAlerts(db, null, box.send)).sent, 2);
 });
