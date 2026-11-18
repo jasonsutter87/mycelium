@@ -579,7 +579,7 @@ function renderProfile() {
 function renderAlerts() {
   const d = state.tabs.alerts;
   if (!d) return ($("canvas").innerHTML = `<div class="empty"><span class="spin"></span>Loading alerts</div>`);
-  if (!state.alertDraft) state.alertDraft = { ...d.settings, recipients: d.settings.recipients.join("\n"), highOn: d.settings.highThreshold > 0, highN: d.settings.highThreshold || 3 };
+  if (!state.alertDraft) state.alertDraft = { ...d.settings, recipients: d.settings.recipients.join("\n"), projects: (d.settings.projects || []).join("\n"), highOn: d.settings.highThreshold > 0, highN: d.settings.highThreshold || 3 };
   const a = state.alertDraft;
   const on = d.settings.enabled;
   const st = d.status;
@@ -611,21 +611,27 @@ function renderAlerts() {
         <label class="row"><input type="checkbox" id="aHigh" ${a.highOn ? "checked" : ""}> <span><input class="field num-in" id="aN" type="number" min="1" max="1000" value="${esc(a.highN)}" aria-label="Number of new highs" ${a.highOn ? "" : "disabled"}> or more new <span class="sev HIGH">high</span> are waiting</span></label>
         <p class="small muted">Highs below that number keep counting until they reach it. A malicious package always counts as critical. You get one email per check, and accepted risks are left out.</p>
       </section>
+      <section class="pcard">
+        <h3>About which projects</h3>
+        <textarea class="field area" id="aProj" rows="3" placeholder="Every project" aria-label="Project names, one per line">${esc(a.projects)}</textarea>
+        <p class="small muted">One project name per line, as on the Projects page. Leave it empty to hear about every project. Changing the list treats what's already open in the new projects as known.</p>
+      </section>
     </div>
     <div class="actions"><button class="btn primary" id="aSave">Save</button><button class="btn" id="aTest" ${d.configured ? "" : "disabled"}>Send a test email</button>${state.alertMsg ? `<span class="small ${state.alertMsg.err ? "warn-text" : "ok-text"}" role="status">${esc(state.alertMsg.text)}</span>` : ""}</div>
   </div>`;
   $("aBack").onclick = () => { state.view = "profile"; loadTab(); renderAll(); };
   $("aWaiting").onclick = () => { state.view = "findings"; state.sevFilter = "ALL"; loadTab(); renderAll(); };
-  const read = () => { a.enabled = $("aOn").checked; a.recipients = $("aTo").value; a.critical = $("aCrit").checked; a.highOn = $("aHigh").checked; a.highN = $("aN").value; };
+  const read = () => { a.enabled = $("aOn").checked; a.recipients = $("aTo").value; a.critical = $("aCrit").checked; a.highOn = $("aHigh").checked; a.highN = $("aN").value; a.projects = $("aProj").value; };
   const addresses = () => a.recipients.split(/[\s,;]+/).filter(Boolean);
   ["aOn", "aCrit"].forEach((id) => ($(id).onchange = read));
   $("aTo").oninput = read;
+  $("aProj").oninput = read;
   $("aN").oninput = read;
   $("aHigh").onchange = () => { read(); $("aN").disabled = !a.highOn; };
   $("aSave").onclick = async () => {
     read();
     try {
-      const out = await api("/api/alerts", { enabled: a.enabled, recipients: addresses(), critical: a.critical, highThreshold: a.highOn ? Number(a.highN) : 0 });
+      const out = await api("/api/alerts", { enabled: a.enabled, recipients: addresses(), critical: a.critical, highThreshold: a.highOn ? Number(a.highN) : 0, projects: a.projects.split(/\n+/).map((s) => s.trim()).filter(Boolean) });
       state.tabs.alerts = out.view; state.alertDraft = null;
       state.alertMsg = { text: out.baselined ? `Alerts on. ${out.baselined} open findings count as already known.` : "Saved." };
     } catch (e) { state.alertMsg = { text: e.message, err: true }; }

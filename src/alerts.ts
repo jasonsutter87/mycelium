@@ -14,6 +14,7 @@ export interface AlertSettings {
   recipients: string[];
   critical: boolean; // email on any new critical
   highThreshold: number; // email once this many new highs are waiting; 0 turns highs off
+  projects?: string[]; // only findings in these projects (by name); missing or empty: every project
 }
 
 export interface AlertStatus {
@@ -31,7 +32,7 @@ export interface Email {
 }
 export type Sender = (mail: Email) => Promise<void>;
 
-export const DEFAULT_ALERTS: AlertSettings = { enabled: false, recipients: [], critical: true, highThreshold: 3 };
+export const DEFAULT_ALERTS: AlertSettings = { enabled: false, recipients: [], critical: true, highThreshold: 3, projects: [] };
 
 const getJson = <T>(db: DatabaseSync, key: string, fallback: T): T => {
   const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | undefined;
@@ -46,9 +47,19 @@ export const loadAlertStatus = (db: DatabaseSync) => getJson<AlertStatus>(db, "a
 const keyOf = (f: Finding) => `${f.ecosystem}|${f.name}@${f.version}|${f.vulnId}`;
 const isCritical = (f: Finding) => f.severity === "CRITICAL" || f.vulnId.startsWith("MAL-"); // a malicious package is always urgent
 
-function waiting(db: DatabaseSync): { critical: Finding[]; high: Finding[] } {
+/** Only the projects alerts are about (all of them when the list is empty); a finding's other projects are left out of the email. */
+export function inProjects(list: Finding[], projects: string[]): Finding[] {
+  if (!projects.length) return list;
+  const want = new Set(projects);
+  return list.flatMap((f) => {
+    const hits = f.hits.filter((h) => want.has(h.project));
+    return hits.length ? [{ ...f, hits }] : [];
+  });
+}
+
+function waiting(db: DatabaseSync, projects: string[] = []): { critical: Finding[]; high: Finding[] } {
   const sent = new Set((db.prepare("SELECT key FROM alerted").all() as { key: string }[]).map((r) => r.key));
-  const fresh = findings(db).filter((f) => !sent.has(keyOf(f)));
+  const fresh = inProjects(findings(db), projects).filter((f) => !sent.has(keyOf(f)));
   return { critical: fresh.filter(isCritical), high: fresh.filter((f) => !isCritical(f) && f.severity === "HIGH") };
 }
 
@@ -66,11 +77,15 @@ export function saveAlertSettings(db: DatabaseSync, input: Partial<AlertSettings
   if (bad) throw new Error(`"${bad}" doesn't look like an email address.`);
   const highThreshold = Number(input.highThreshold ?? prev.highThreshold);
   if (!Number.isInteger(highThreshold) || highThreshold < 0 || highThreshold > 1000) throw new Error("The number of highs has to be a whole number, 0 or more.");
-  const settings: AlertSettings = { enabled: !!(input.enabled ?? prev.enabled), recipients, critical: !!(input.critical ?? prev.critical), highThreshold };
+  const projects = [...new Set((input.projects ?? prev.projects ?? []).map((p) => String(p).trim()).filter(Boolean))];
+  if (projects.length > 500) throw new Error("That's too many projects for one alert list.");
+  const settings: AlertSettings = { enabled: !!(input.enabled ?? prev.enabled), recipients, critical: !!(input.critical ?? prev.critical), highThreshold, projects };
   if (settings.enabled && !recipients.length) throw new Error("Add at least one email address to turn alerts on.");
   let baselined = 0;
-  if (settings.enabled && !prev.enabled) {
-    const { critical, high } = waiting(db);
+  // what's already open in the watched projects becomes the baseline when alerts turn on or the project list changes
+  const watchChanged = JSON.stringify([...projects].sort()) !== JSON.stringify([...(prev.projects ?? [])].sort());
+  if (settings.enabled && (!prev.enabled || watchChanged)) {
+    const { critical, high } = waiting(db, projects);
     markAlerted(db, [...critical, ...high]);
     baselined = critical.length + high.length;
   }
@@ -153,7 +168,7 @@ export function emailError(status: number, body: string): string {
 export async function runAlerts(db: DatabaseSync, baseUrl: string | null, send: Sender = resendSender): Promise<{ sent: number; error?: string }> {
   const s = loadAlertSettings(db);
   if (!s.enabled || !s.recipients.length) return { sent: 0 };
-  const list = pickAlert(s, waiting(db));
+  const list = pickAlert(s, waiting(db, s.projects ?? []));
   if (!list.length) return { sent: 0 };
   const status = loadAlertStatus(db);
   try {
@@ -180,6 +195,6 @@ export async function sendTestEmail(db: DatabaseSync, baseUrl: string | null, re
 
 /** For the Alerts page: what's waiting, and why it hasn't gone out. */
 export function alertsView(db: DatabaseSync) {
-  const { critical, high } = waiting(db);
+  const { critical, high } = waiting(db, loadAlertSettings(db).projects ?? []);
   return { settings: loadAlertSettings(db), status: loadAlertStatus(db), configured: emailConfigured(), from: emailFrom(), waiting: { critical: critical.length, high: high.length } };
 }
